@@ -1,0 +1,1702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Public Webcam Discovery Map</title>
+
+  <!-- Leaflet core -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+  <!-- MarkerCluster -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.min.js"></script>
+
+  <!-- Leaflet.heat -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --muted:     #8b949e;
+      --text:      #e6edf3;
+      --accent:    #58a6ff;
+      --blue-bg:   #1f6feb;
+      --green:     #3fb950;
+      --amber:     #e3b341;
+      --red:       #f85149;
+      --green-bg:  #1a4731;
+      --amber-bg:  #3d2f06;
+      --red-bg:    #3d1412;
+      --radius:    6px;
+    }
+
+    html, body {
+      height: 100%; overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+
+    /* ─── HEADER ─── */
+    #header {
+      height: 50px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+      padding: 0 14px; flex-shrink: 0;
+      position: relative; z-index: 1000;
+    }
+    #header-title {
+      font-size: 14px; font-weight: 700; color: var(--accent); white-space: nowrap;
+    }
+    #header-title span { color: var(--text); font-weight: 400; }
+
+    #file-status {
+      flex: 1; min-width: 0;
+      font-size: 12px; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #file-status strong { color: var(--text); }
+
+    .stat-pill {
+      display: flex; align-items: center; gap: 4px;
+      font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0;
+    }
+    .stat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .stat-pill strong { color: var(--text); }
+
+    #btn-load {
+      background: var(--blue-bg); color: #fff; border: none;
+      border-radius: var(--radius); padding: 5px 13px;
+      font-size: 12px; font-weight: 600; cursor: pointer;
+      white-space: nowrap; flex-shrink: 0; transition: background .15s;
+    }
+    #btn-load:hover { background: #388bfd; }
+    #file-input { display: none; }
+
+    /* ─── LAYOUT ─── */
+    #layout { display: flex; height: calc(100vh - 50px); }
+
+    /* ─── SIDEBAR ─── */
+    #sidebar {
+      width: 272px; background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden;
+    }
+    #sb-scroll {
+      flex: 1; overflow-y: auto; padding: 12px;
+      display: flex; flex-direction: column; gap: 15px;
+    }
+
+    .s-label {
+      font-size: 10px; font-weight: 700; letter-spacing: 1px;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 7px;
+    }
+
+    /* Search */
+    #search {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 6px 10px;
+      color: var(--text); font-size: 13px; outline: none; transition: border-color .2s;
+    }
+    #search:focus { border-color: var(--accent); }
+    #search::placeholder { color: #484f58; }
+
+    /* Chips */
+    .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
+    .chip {
+      background: #21262d; border: 1px solid var(--border);
+      border-radius: 20px; padding: 3px 10px;
+      font-size: 11px; color: var(--muted);
+      cursor: pointer; user-select: none;
+      transition: all .15s; white-space: nowrap;
+    }
+    .chip:hover                { border-color: var(--accent); color: var(--accent); }
+    .chip.on                   { background: var(--blue-bg); border-color: var(--blue-bg); color: #fff; }
+    .chip.on-live              { background: var(--green-bg); border-color: var(--green); color: var(--green); }
+    .chip.on-unknown           { background: var(--amber-bg); border-color: var(--amber); color: var(--amber); }
+    .chip.on-dead              { background: var(--red-bg);   border-color: var(--red);   color: var(--red); }
+
+    /* Toggles */
+    .toggle-row { display: flex; flex-direction: column; gap: 6px; }
+    .toggle-item {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 12px; color: var(--muted); cursor: pointer; padding: 2px 0;
+    }
+    .toggle-item:hover { color: var(--text); }
+    .tog {
+      width: 32px; height: 18px; background: var(--border);
+      border-radius: 9px; position: relative; transition: background .2s; flex-shrink: 0;
+    }
+    .tog::after {
+      content: ''; position: absolute; width: 12px; height: 12px;
+      border-radius: 50%; background: #fff; top: 3px; left: 3px;
+      transition: transform .2s;
+    }
+    .tog.on { background: var(--blue-bg); }
+    .tog.on::after { transform: translateX(14px); }
+
+    /* Legend */
+    .legend-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .legend-em { width: 16px; text-align: center; font-size: 12px; flex-shrink: 0; }
+    .tier-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; flex-shrink: 0; vertical-align: middle; }
+
+    /* Camera list */
+    #cam-list { display: flex; flex-direction: column; gap: 4px; }
+    .cam-row {
+      background: #21262d; border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 7px 9px;
+      cursor: pointer; transition: border-color .15s;
+    }
+    .cam-row:hover { border-color: var(--accent); }
+    .cam-name { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
+    .cam-meta { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted); }
+    .sbadge { font-size: 10px; padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
+    .sb-live    { background: var(--green-bg); color: var(--green); }
+    .sb-unknown { background: var(--amber-bg); color: var(--amber); }
+    .sb-dead    { background: var(--red-bg);   color: var(--red); }
+    #no-results { text-align: center; font-size: 12px; color: #484f58; padding: 16px 0; display: none; }
+    #more-msg   { text-align: center; font-size: 11px; color: #484f58; padding: 8px 0; display: none; }
+
+    /* ─── MAP ─── */
+    #map { flex: 1; background: var(--bg); }
+
+    /* ─── POPUPS ─── */
+    .leaflet-popup-content-wrapper {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.6); color: var(--text);
+    }
+    .leaflet-popup-tip { background: var(--surface); }
+    .leaflet-popup-content { margin: 12px 14px; min-width: 260px; max-width: 350px; }
+    .p-title { font-size: 13px; font-weight: 700; margin-bottom: 3px; line-height: 1.35; }
+    .p-city  { font-size: 11px; color: var(--muted); margin-bottom: 9px; }
+    .p-grid  { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 11px; margin-bottom: 10px; }
+    .p-k { color: var(--muted); }
+    .p-v { color: var(--text); word-break: break-all; }
+    .p-watch {
+      display: block; text-align: center; background: var(--blue-bg); color: #fff;
+      text-decoration: none; padding: 6px; border-radius: 5px;
+      font-size: 12px; font-weight: 600; transition: background .15s; margin-bottom: 5px;
+    }
+    .p-watch:hover { background: #388bfd; }
+    .p-src  { font-size: 10px; color: #484f58; text-align: center; }
+    .p-note { font-size: 10px; color: #484f58; text-align: center; margin-top: 3px; }
+    .p-reflink { color: var(--accent); font-size: 10px; text-decoration: none; }
+    .p-reflink:hover { text-decoration: underline; }
+    .blocked-tip { background: #161b22 !important; border: 1px solid #f85149 !important; border-radius: 6px !important; color: var(--text) !important; }
+    .blocked-tip::before { border-top-color: #f85149 !important; }
+
+    /* ── Empty-state overlay ── */
+    #empty-state {
+      position: absolute;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(13,17,23,.82);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: all;
+    }
+    #empty-state.hidden { display: none; }
+    .es-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 14px;
+      padding: 40px 48px;
+      text-align: center;
+      max-width: 420px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.7);
+    }
+    .es-icon { font-size: 52px; margin-bottom: 16px; line-height: 1; }
+    .es-title {
+      font-size: 18px; font-weight: 700;
+      color: var(--text); margin-bottom: 10px;
+    }
+    .es-body {
+      font-size: 13px; color: var(--muted);
+      line-height: 1.65; margin-bottom: 24px;
+    }
+    .es-body code {
+      background: #0d1117; border: 1px solid #30363d;
+      border-radius: 4px; padding: 1px 6px;
+      font-family: 'Consolas', monospace; color: #e6edf3;
+      font-size: 12px;
+    }
+    .es-btn {
+      display: inline-block;
+      background: var(--blue-bg); color: #fff;
+      border: none; border-radius: 7px;
+      padding: 10px 26px; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: background .15s;
+    }
+    .es-btn:hover { background: #388bfd; }
+    .es-hint {
+      margin-top: 14px; font-size: 11px; color: #484f58;
+    }
+
+    /* drag-drop zone inside empty-state */
+    #es-drop-zone {
+      border: 2px dashed var(--border); border-radius: 10px;
+      padding: 20px 24px; margin-bottom: 16px;
+      transition: border-color .2s, background .2s; cursor: default;
+    }
+    #es-drop-zone.drag-over {
+      border-color: var(--accent); background: rgba(88,166,255,.06);
+    }
+    .es-drop-icon { font-size: 26px; margin-bottom: 6px; line-height: 1; }
+    .es-drop-label { font-size: 13px; color: var(--text); margin-bottom: 8px; }
+    .es-drop-hint  { font-size: 11px; color: #484f58; margin-bottom: 10px; }
+
+    /* divider */
+    .es-divider {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 10px; color: #484f58; text-transform: uppercase;
+      letter-spacing: .8px; margin-bottom: 12px;
+    }
+    .es-divider::before, .es-divider::after {
+      content: ''; flex: 1; height: 1px; background: var(--border);
+    }
+
+    /* server command block */
+    .es-cmd {
+      display: inline-block; background: #0d1117; border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 14px; font-family: 'Consolas', monospace;
+      font-size: 13px; color: #e6edf3; margin-bottom: 6px; word-break: break-all;
+    }
+    .es-copy-btn {
+      display: block; margin: 0 auto 4px; background: transparent;
+      border: 1px solid var(--border); border-radius: 5px;
+      color: var(--muted); font-size: 11px; padding: 4px 12px;
+      cursor: pointer; transition: all .15s;
+    }
+    .es-copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Feed preview in popup ── */
+    .p-preview {
+      width: 100%; margin-bottom: 9px;
+      border-radius: 5px; overflow: hidden;
+      background: #0a0a0a; line-height: 0;
+      border: 1px solid #30363d;
+      position: relative; cursor: pointer;
+    }
+    .p-preview img {
+      width: 100%; height: auto;
+      max-height: 185px; object-fit: cover; display: block;
+    }
+    .p-preview iframe {
+      width: 100%; height: 185px; border: none; display: block;
+    }
+    /* YouTube play overlay */
+    .p-yt-overlay {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.35); transition: background .15s;
+    }
+    .p-yt-overlay:hover { background: rgba(0,0,0,.18); }
+    .p-yt-btn {
+      width: 56px; height: 40px;
+      background: #ff0000; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 2px 10px rgba(0,0,0,.6);
+      transition: transform .15s;
+    }
+    .p-yt-overlay:hover .p-yt-btn { transform: scale(1.08); }
+    .p-yt-btn svg { width: 22px; height: 22px; fill: #fff; }
+    .p-preload {
+      padding: 28px 0; text-align: center;
+      font-size: 11px; color: #484f58; line-height: 1.4;
+    }
+    .p-refresh-ts {
+      font-size: 9px; color: #484f58;
+      text-align: right; padding: 1px 3px 5px;
+    }
+    /* YouTube watch + static refresh buttons */
+    .p-watch-yt {
+      display: flex; gap: 6px; margin-bottom: 5px;
+    }
+    .p-watch-yt a {
+      flex: 1; text-align: center; padding: 6px 4px;
+      border-radius: 5px; font-size: 12px; font-weight: 600;
+      text-decoration: none; transition: background .15s;
+    }
+    .p-btn-yt   { background: #ff0000; color: #fff; }
+    .p-btn-yt:hover { background: #cc0000; }
+    .p-btn-full { background: var(--blue-bg); color: #fff; }
+    .p-btn-full:hover { background: #388bfd; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    /* ─── TABLE VIEW BUTTON ─── */
+    #btn-table {
+      background: transparent; color: var(--muted); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 5px 13px;
+      font-size: 12px; font-weight: 600; cursor: pointer;
+      white-space: nowrap; flex-shrink: 0; transition: all .15s;
+    }
+    #btn-table:hover { border-color: var(--accent); color: var(--accent); }
+    #btn-table.active { background: var(--blue-bg); border-color: var(--blue-bg); color: #fff; }
+
+    /* ─── TABLE PANEL ─── */
+    #table-panel {
+      flex: 1; display: none; flex-direction: column; overflow: hidden; background: var(--bg);
+    }
+    #table-panel.active { display: flex; }
+
+    #tp-toolbar {
+      display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      flex-shrink: 0; flex-wrap: wrap;
+    }
+    #tp-search {
+      width: 240px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 6px 10px; color: var(--text);
+      font-size: 12px; outline: none; transition: border-color .2s;
+    }
+    #tp-search:focus { border-color: var(--accent); }
+    #tp-search::placeholder { color: #484f58; }
+
+    .tp-sel {
+      background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text); font-size: 12px; padding: 5px 8px; outline: none;
+      cursor: pointer; transition: border-color .2s;
+    }
+    .tp-sel:focus { border-color: var(--accent); }
+
+    #tp-count {
+      font-size: 12px; color: var(--muted); white-space: nowrap; flex-shrink: 0;
+    }
+    #tp-export {
+      margin-left: auto; background: transparent; border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--muted); font-size: 12px;
+      padding: 5px 12px; cursor: pointer; transition: all .15s; white-space: nowrap;
+    }
+    #tp-export:hover { border-color: var(--accent); color: var(--accent); }
+
+    #tp-wrap { flex: 1; overflow: auto; }
+
+    #tp-table {
+      width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px;
+    }
+    #tp-table thead {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--surface); border-bottom: 2px solid var(--border);
+    }
+    #tp-table th {
+      padding: 9px 12px; text-align: left; font-size: 10px; font-weight: 700;
+      letter-spacing: .6px; text-transform: uppercase; color: var(--muted);
+      white-space: nowrap; cursor: pointer; user-select: none;
+      border-right: 1px solid var(--border);
+    }
+    #tp-table th:last-child { border-right: none; cursor: default; }
+    #tp-table th:not(.no-sort):hover { color: var(--accent); }
+    #tp-table th.sort-asc::after  { content: ' ↑'; color: var(--accent); }
+    #tp-table th.sort-desc::after { content: ' ↓'; color: var(--accent); }
+    #tp-table th.no-sort { cursor: default; }
+    #tp-table th.no-sort:hover { color: var(--muted); }
+
+    #tp-table tbody tr { border-bottom: 1px solid #21262d; transition: background .1s; }
+    #tp-table tbody tr:hover { background: #161b22; }
+    #tp-table td {
+      padding: 7px 12px; vertical-align: middle; color: var(--text);
+      border-right: 1px solid #21262d;
+    }
+    #tp-table td:last-child { border-right: none; }
+
+    .tp-badge {
+      display: inline-block; padding: 2px 7px; border-radius: 10px;
+      font-size: 10px; font-weight: 600; white-space: nowrap;
+    }
+    .tp-live    { background: var(--green-bg); color: var(--green);  border: 1px solid var(--green); }
+    .tp-unknown { background: var(--amber-bg); color: var(--amber);  border: 1px solid var(--amber); }
+    .tp-dead    { background: var(--red-bg);   color: var(--red);    border: 1px solid var(--red); }
+    .tp-high    { background: #1a4731; color: #3fb950; border: 1px solid #2ea043; }
+    .tp-medium  { background: #3d2f06; color: #e3b341; border: 1px solid #9e6a03; }
+    .tp-low     { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+
+    .tp-label { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tp-src   { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+
+    .tp-link {
+      color: var(--accent); text-decoration: none; font-size: 11px; white-space: nowrap;
+    }
+    .tp-link:hover { text-decoration: underline; }
+
+    .tp-map-btn {
+      background: transparent; border: 1px solid var(--border); border-radius: 4px;
+      color: var(--muted); font-size: 11px; padding: 3px 8px; cursor: pointer;
+      transition: all .15s; white-space: nowrap;
+    }
+    .tp-map-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    #tp-empty {
+      padding: 60px; text-align: center; color: #484f58; font-size: 13px; display: none;
+    }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div id="header">
+  <div id="header-title">📹 <span>Public Webcam Discovery</span></div>
+
+  <div id="file-status">
+    📂 <strong id="active-file">loading…</strong>
+    &nbsp;—&nbsp;<span id="active-count">0</span> cameras
+  </div>
+
+  <div class="stat-pill">
+    <div class="stat-dot" style="background:var(--green)"></div>
+    Live: <strong id="n-live">0</strong>
+  </div>
+  <div class="stat-pill">
+    <div class="stat-dot" style="background:var(--amber)"></div>
+    Unknown: <strong id="n-unknown">0</strong>
+  </div>
+  <div class="stat-pill">
+    <div class="stat-dot" style="background:var(--red)"></div>
+    Dead: <strong id="n-dead">0</strong>
+  </div>
+
+  <button id="btn-table">📋 Table</button>
+  <button id="btn-load">📂 Load GeoJSON</button>
+  <input type="file" id="file-input" accept=".geojson,.json"/>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div id="layout">
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+    <div id="sb-scroll">
+
+      <!-- Search -->
+      <div>
+        <div class="s-label">Search</div>
+        <input id="search" type="text" placeholder="City, label, country, continent…"/>
+      </div>
+
+      <!-- Status filter -->
+      <div>
+        <div class="s-label">Status</div>
+        <div class="chip-row">
+          <span class="chip on-live on"    data-f="status" data-v="live">● Live</span>
+          <span class="chip on-unknown on" data-f="status" data-v="unknown">● Unknown</span>
+          <span class="chip on-dead"       data-f="status" data-v="dead">● Dead</span>
+        </div>
+      </div>
+
+      <!-- Confidence filter -->
+      <div>
+        <div class="s-label">Confidence</div>
+        <div class="chip-row">
+          <span class="chip on" data-f="score" data-v="high">High</span>
+          <span class="chip on" data-f="score" data-v="medium">Medium</span>
+          <span class="chip"    data-f="score" data-v="low">Low</span>
+        </div>
+      </div>
+
+      <!-- Feed type filter — built dynamically -->
+      <div>
+        <div class="s-label">Feed Type</div>
+        <div class="chip-row" id="feedtype-chips"></div>
+      </div>
+
+      <!-- Continent filter — built dynamically -->
+      <div>
+        <div class="s-label">Continent / Region</div>
+        <div class="chip-row" id="continent-chips"></div>
+      </div>
+
+      <!-- Quick view -->
+      <div>
+        <div class="s-label">Quick View</div>
+        <div class="chip-row">
+          <span class="chip" id="q-all">All</span>
+          <span class="chip" id="q-live-only">Live Only</span>
+          <span class="chip" id="q-hq">High Confidence</span>
+        </div>
+      </div>
+
+      <!-- Layer toggles -->
+      <div>
+        <div class="s-label">Layers</div>
+        <div class="toggle-row">
+          <div class="toggle-item" id="lbl-heat">
+            <span>Heatmap overlay</span>
+            <div class="tog" id="tog-heat"></div>
+          </div>
+          <div class="toggle-item" id="lbl-tier1">
+            <span><span class="tier-dot" style="background:#58a6ff"></span>Tier 1 cities</span>
+            <div class="tog" id="tog-tier1"></div>
+          </div>
+          <div class="toggle-item" id="lbl-tier2">
+            <span><span class="tier-dot" style="background:#f0a832"></span>Tier 2 cities</span>
+            <div class="tog" id="tog-tier2"></div>
+          </div>
+          <div class="toggle-item" id="lbl-tier3">
+            <span><span class="tier-dot" style="background:#3fb950"></span>Tier 3 destinations</span>
+            <div class="tog" id="tog-tier3"></div>
+          </div>
+          <div class="toggle-item" id="lbl-blocked">
+            <span><span class="tier-dot" style="background:#f85149"></span>Blocked sources</span>
+            <div class="tog" id="tog-blocked"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Legend -->
+      <div>
+        <div class="s-label">Status Legend</div>
+        <div class="legend-row"><div class="legend-dot" style="background:var(--green)"></div>Live</div>
+        <div class="legend-row"><div class="legend-dot" style="background:var(--amber)"></div>Unknown</div>
+        <div class="legend-row"><div class="legend-dot" style="background:var(--red)"></div>Dead / offline</div>
+        <div class="s-label" style="margin-top:10px">Feed Type Legend</div>
+        <div class="legend-row"><div class="legend-em">📹</div>MJPEG / HLS / direct stream</div>
+        <div class="legend-row"><div class="legend-em">🖥️</div>iframe embed / JS player</div>
+        <div class="legend-row"><div class="legend-em">📸</div>Static image refresh</div>
+        <div class="legend-row"><div class="legend-em">▶️</div>YouTube Live</div>
+        <div class="s-label" style="margin-top:10px">Coverage Tier Legend</div>
+        <div class="legend-row"><div class="legend-dot" style="background:#58a6ff;border-radius:3px"></div>Tier 1 — priority cities (39)</div>
+        <div class="legend-row"><div class="legend-dot" style="background:#f0a832;border-radius:3px"></div>Tier 2 — capitals &amp; ports (96)</div>
+        <div class="legend-row"><div class="legend-dot" style="background:#3fb950;border-radius:3px"></div>Tier 3 — tourist &amp; remote (50)</div>
+        <div class="legend-row"><div class="legend-em" style="color:#f85149;font-weight:900">✕</div>Blocked sources (22)</div>
+      </div>
+
+      <!-- Camera list -->
+      <div>
+        <div class="s-label">Cameras (<span id="vis-count">0</span>)</div>
+        <div id="cam-list"></div>
+        <div id="no-results">No cameras match your filters.</div>
+        <div id="more-msg"></div>
+      </div>
+
+    </div>
+  </div><!-- /sidebar -->
+
+  <!-- MAP -->
+  <div id="map"></div>
+
+  <!-- TABLE PANEL (replaces map area when active) -->
+  <div id="table-panel">
+    <div id="tp-toolbar">
+      <input id="tp-search" type="text" placeholder="🔍 Search rows…"/>
+      <select id="tp-status-sel" class="tp-sel">
+        <option value="">All Status</option>
+        <option value="live">● Live</option>
+        <option value="unknown">● Unknown</option>
+        <option value="dead">● Dead</option>
+      </select>
+      <select id="tp-feed-sel" class="tp-sel">
+        <option value="">All Feed Types</option>
+      </select>
+      <select id="tp-cont-sel" class="tp-sel">
+        <option value="">All Continents</option>
+      </select>
+      <span id="tp-count">0 cameras</span>
+      <button id="tp-export">⬇ Export CSV</button>
+    </div>
+    <div id="tp-wrap">
+      <table id="tp-table">
+        <thead>
+          <tr>
+            <th data-col="status">Status</th>
+            <th data-col="label">Label</th>
+            <th data-col="city">City</th>
+            <th data-col="region">Region</th>
+            <th data-col="country">Country</th>
+            <th data-col="continent">Continent</th>
+            <th data-col="feed_type">Feed Type</th>
+            <th data-col="legitimacy_score">Confidence</th>
+            <th data-col="last_verified">Verified</th>
+            <th data-col="source_directory">Source</th>
+            <th class="no-sort">Watch</th>
+            <th class="no-sort">↗ Map</th>
+          </tr>
+        </thead>
+        <tbody id="tp-body"></tbody>
+      </table>
+      <div id="tp-empty">No cameras match the current filters.</div>
+    </div>
+  </div>
+
+  <!-- Empty-state overlay: shown when no GeoJSON is loaded -->
+  <div id="empty-state">
+    <div class="es-card">
+      <div class="es-icon">🗺️</div>
+      <div class="es-title">Load camera data</div>
+
+      <!-- Option A: drag and drop (always works) -->
+      <div id="es-drop-zone">
+        <div class="es-drop-icon">⬇</div>
+        <div class="es-drop-label">Drop <code>camera.geojson</code> here</div>
+        <div class="es-drop-hint">or</div>
+        <button class="es-btn" id="es-load-btn">📂 Choose file…</button>
+      </div>
+
+      <!-- Option B: local server (auto-load) -->
+      <div class="es-divider">
+        <span>auto-load via local server</span>
+      </div>
+      <div class="es-body" style="margin-bottom:10px">
+        Browsers block direct file access when opened from disk.<br>
+        Serve the folder with one command to enable auto-load:
+      </div>
+      <div class="es-cmd" id="es-cmd-text">python3 -m http.server 8000</div>
+      <button class="es-copy-btn" id="es-copy-btn" title="Copy command">📋 Copy</button>
+      <div class="es-body" style="margin-top:8px;font-size:11px">
+        Then open <code>http://localhost:8000/map.html</code>
+      </div>
+
+      <div class="es-hint" style="margin-top:16px">Files stay on your device — nothing is uploaded.</div>
+    </div>
+  </div>
+
+</div><!-- /layout -->
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// Tier 1 city highlight layer — fixed coordinates, independent of loaded data
+// ═══════════════════════════════════════════════════════════════
+const TIER1_CITIES = [
+  {name:"New York",       lat:40.7128,  lng:-74.0060},
+  {name:"London",         lat:51.5074,  lng:-0.1278},
+  {name:"Tokyo",          lat:35.6762,  lng:139.6503},
+  {name:"Paris",          lat:48.8566,  lng:2.3522},
+  {name:"Sydney",         lat:-33.8688, lng:151.2093},
+  {name:"Dubai",          lat:25.2048,  lng:55.2708},
+  {name:"Singapore",      lat:1.3521,   lng:103.8198},
+  {name:"Hong Kong",      lat:22.3193,  lng:114.1694},
+  {name:"Los Angeles",    lat:34.0522,  lng:-118.2437},
+  {name:"Chicago",        lat:41.8781,  lng:-87.6298},
+  {name:"Toronto",        lat:43.6532,  lng:-79.3832},
+  {name:"Berlin",         lat:52.5200,  lng:13.4050},
+  {name:"Amsterdam",      lat:52.3676,  lng:4.9041},
+  {name:"Barcelona",      lat:41.3851,  lng:2.1734},
+  {name:"Rome",           lat:41.9028,  lng:12.4964},
+  {name:"Madrid",         lat:40.4168,  lng:-3.7038},
+  {name:"São Paulo",      lat:-23.5505, lng:-46.6333},
+  {name:"Mexico City",    lat:19.4326,  lng:-99.1332},
+  {name:"Seoul",          lat:37.5665,  lng:126.9780},
+  {name:"Mumbai",         lat:19.0760,  lng:72.8777},
+  {name:"Shanghai",       lat:31.2304,  lng:121.4737},
+  {name:"Beijing",        lat:39.9042,  lng:116.4074},
+  {name:"Istanbul",       lat:41.0082,  lng:28.9784},
+  {name:"Cairo",          lat:30.0444,  lng:31.2357},
+  {name:"Johannesburg",   lat:-26.2041, lng:28.0473},
+  {name:"Moscow",         lat:55.7558,  lng:37.6173},
+  {name:"Vienna",         lat:48.2082,  lng:16.3738},
+  {name:"Prague",         lat:50.0755,  lng:14.4378},
+  {name:"Budapest",       lat:47.4979,  lng:19.0402},
+  {name:"Warsaw",         lat:52.2297,  lng:21.0122},
+  {name:"Zurich",         lat:47.3769,  lng:8.5417},
+  {name:"Stockholm",      lat:59.3293,  lng:18.0686},
+  {name:"Oslo",           lat:59.9139,  lng:10.7522},
+  {name:"Copenhagen",     lat:55.6761,  lng:12.5683},
+  {name:"Helsinki",       lat:60.1699,  lng:24.9384},
+  {name:"Athens",         lat:37.9838,  lng:23.7275},
+  {name:"Lisbon",         lat:38.7223,  lng:-9.1393},
+  {name:"Brussels",       lat:50.8503,  lng:4.3517},
+  {name:"Dublin",         lat:53.3498,  lng:-6.2603},
+];
+
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 2 — remaining capitals, port cities, UNESCO hubs
+// Color: #f0a832  (amber)
+// ═══════════════════════════════════════════════════════════════
+const TIER2_CITIES = [
+  {name:"Nairobi",         lat:-1.2921,  lng:36.8219},
+  {name:"Lagos",           lat:6.5244,   lng:3.3792},
+  {name:"Accra",           lat:5.6037,   lng:-0.1870},
+  {name:"Dar es Salaam",   lat:-6.7924,  lng:39.2083},
+  {name:"Casablanca",      lat:33.5731,  lng:-7.5898},
+  {name:"Addis Ababa",     lat:9.0320,   lng:38.7469},
+  {name:"Kinshasa",        lat:-4.3217,  lng:15.3222},
+  {name:"Khartoum",        lat:15.5007,  lng:32.5599},
+  {name:"Tunis",           lat:36.8065,  lng:10.1815},
+  {name:"Algiers",         lat:36.7372,  lng:3.0865},
+  {name:"Cape Town",       lat:-33.9249, lng:18.4241},
+  {name:"Buenos Aires",    lat:-34.6037, lng:-58.3816},
+  {name:"Santiago",        lat:-33.4489, lng:-70.6693},
+  {name:"Bogotá",          lat:4.7110,   lng:-74.0721},
+  {name:"Lima",            lat:-12.0464, lng:-77.0428},
+  {name:"Caracas",         lat:10.4806,  lng:-66.9036},
+  {name:"Montevideo",      lat:-34.9011, lng:-56.1645},
+  {name:"Quito",           lat:-0.1807,  lng:-78.4678},
+  {name:"La Paz",          lat:-16.5000, lng:-68.1500},
+  {name:"Havana",          lat:23.1136,  lng:-82.3666},
+  {name:"Panama City",     lat:8.9936,   lng:-79.5197},
+  {name:"San José",        lat:9.9281,   lng:-84.0907},
+  {name:"Guadalajara",     lat:20.6597,  lng:-103.3496},
+  {name:"Miami",           lat:25.7617,  lng:-80.1918},
+  {name:"Vancouver",       lat:49.2827,  lng:-123.1207},
+  {name:"Montreal",        lat:45.5017,  lng:-73.5673},
+  {name:"Seattle",         lat:47.6062,  lng:-122.3321},
+  {name:"Boston",          lat:42.3601,  lng:-71.0589},
+  {name:"Houston",         lat:29.7604,  lng:-95.3698},
+  {name:"Washington DC",   lat:38.9072,  lng:-77.0369},
+  {name:"Atlanta",         lat:33.7490,  lng:-84.3880},
+  {name:"Auckland",        lat:-36.8485, lng:174.7633},
+  {name:"Melbourne",       lat:-37.8136, lng:144.9631},
+  {name:"Brisbane",        lat:-27.4698, lng:153.0251},
+  {name:"Kuala Lumpur",    lat:3.1390,   lng:101.6869},
+  {name:"Jakarta",         lat:-6.2088,  lng:106.8456},
+  {name:"Manila",          lat:14.5995,  lng:120.9842},
+  {name:"Bangkok",         lat:13.7563,  lng:100.5018},
+  {name:"Hanoi",           lat:21.0285,  lng:105.8542},
+  {name:"Ho Chi Minh",     lat:10.8231,  lng:106.6297},
+  {name:"Dhaka",           lat:23.8103,  lng:90.4125},
+  {name:"Karachi",         lat:24.8607,  lng:67.0011},
+  {name:"Lahore",          lat:31.5204,  lng:74.3587},
+  {name:"Colombo",         lat:6.9271,   lng:79.8612},
+  {name:"Kathmandu",       lat:27.7172,  lng:85.3240},
+  {name:"Riyadh",          lat:24.7136,  lng:46.6753},
+  {name:"Tehran",          lat:35.6892,  lng:51.3890},
+  {name:"Baghdad",         lat:33.3152,  lng:44.3661},
+  {name:"Beirut",          lat:33.8938,  lng:35.5018},
+  {name:"Tel Aviv",        lat:32.0853,  lng:34.7818},
+  {name:"Amman",           lat:31.9454,  lng:35.9284},
+  {name:"Doha",            lat:25.2854,  lng:51.5310},
+  {name:"Muscat",          lat:23.5880,  lng:58.3829},
+  {name:"Kabul",           lat:34.5553,  lng:69.2075},
+  {name:"Tashkent",        lat:41.2995,  lng:69.2401},
+  {name:"Bucharest",       lat:44.4268,  lng:26.1025},
+  {name:"Sofia",           lat:42.6977,  lng:23.3219},
+  {name:"Belgrade",        lat:44.7866,  lng:20.4489},
+  {name:"Zagreb",          lat:45.8150,  lng:15.9819},
+  {name:"Riga",            lat:56.9496,  lng:24.1052},
+  {name:"Tallinn",         lat:59.4370,  lng:24.7536},
+  {name:"Vilnius",         lat:54.6872,  lng:25.2797},
+  {name:"Kyiv",            lat:50.4501,  lng:30.5234},
+  {name:"Minsk",           lat:53.9045,  lng:27.5615},
+  {name:"Tbilisi",         lat:41.6938,  lng:44.8015},
+  {name:"Baku",            lat:40.4093,  lng:49.8671},
+  {name:"Yerevan",         lat:40.1872,  lng:44.5152},
+  {name:"Reykjavik",       lat:64.1265,  lng:-21.8174},
+  {name:"Valletta",        lat:35.8997,  lng:14.5147},
+  {name:"Nicosia",         lat:35.1856,  lng:33.3823},
+  {name:"Bratislava",      lat:48.1486,  lng:17.1077},
+  {name:"Ljubljana",       lat:46.0569,  lng:14.5058},
+  {name:"Sarajevo",        lat:43.8563,  lng:18.4131},
+  {name:"Tirana",          lat:41.3275,  lng:19.8187},
+  {name:"Skopje",          lat:41.9981,  lng:21.4254},
+  {name:"Chisinau",        lat:47.0105,  lng:28.8638},
+  {name:"Osaka",           lat:34.6937,  lng:135.5023},
+  {name:"Taipei",          lat:25.0330,  lng:121.5654},
+  {name:"Busan",           lat:35.1796,  lng:129.0756},
+  {name:"Venice",          lat:45.4408,  lng:12.3155},
+  {name:"Florence",        lat:43.7696,  lng:11.2558},
+  {name:"Naples",          lat:40.8518,  lng:14.2681},
+  {name:"Milan",           lat:45.4654,  lng:9.1859},
+  {name:"Hamburg",         lat:53.5753,  lng:10.0153},
+  {name:"Munich",          lat:48.1351,  lng:11.5820},
+  {name:"Frankfurt",       lat:50.1109,  lng:8.6821},
+  {name:"Lyon",            lat:45.7640,  lng:4.8357},
+  {name:"Marseille",       lat:43.2965,  lng:5.3698},
+  {name:"Zurich",          lat:47.3769,  lng:8.5417},
+  {name:"Geneva",          lat:46.2044,  lng:6.1432},
+  {name:"Rotterdam",       lat:51.9244,  lng:4.4777},
+  {name:"Antwerp",         lat:51.2194,  lng:4.4025},
+  {name:"Seville",         lat:37.3891,  lng:-5.9845},
+  {name:"Bilbao",          lat:43.2630,  lng:-2.9350},
+  {name:"Porto",           lat:41.1579,  lng:-8.6291},
+  {name:"Edinburgh",       lat:55.9533,  lng:-3.1883},
+  {name:"Manchester",      lat:53.4808,  lng:-2.2426},
+  {name:"Birmingham",      lat:52.4862,  lng:-1.8904},
+  {name:"Gothenburg",      lat:57.7089,  lng:11.9746},
+];
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 3 — opportunistic: notable tourist/traffic destinations
+// Color: #3fb950  (green)
+// ═══════════════════════════════════════════════════════════════
+const TIER3_CITIES = [
+  {name:"Queenstown",      lat:-45.0312, lng:168.6626},
+  {name:"Phuket",          lat:7.8804,   lng:98.3923},
+  {name:"Bali / Denpasar", lat:-8.6705,  lng:115.2126},
+  {name:"Chiang Mai",      lat:18.7883,  lng:98.9853},
+  {name:"Angkor Wat",      lat:13.4125,  lng:103.8670},
+  {name:"Ha Long Bay",     lat:20.9101,  lng:107.1839},
+  {name:"Kathmandu",       lat:27.7172,  lng:85.3240},
+  {name:"Machu Picchu",    lat:-13.1631, lng:-72.5450},
+  {name:"Patagonia / Punta Arenas", lat:-53.1638, lng:-70.9171},
+  {name:"Galápagos",       lat:-0.9537,  lng:-90.9656},
+  {name:"Marrakech",       lat:31.6295,  lng:-7.9811},
+  {name:"Zanzibar",        lat:-6.1630,  lng:39.2003},
+  {name:"Serengeti",       lat:-2.3333,  lng:34.8333},
+  {name:"Luxor",           lat:25.6872,  lng:32.6396},
+  {name:"Santorini",       lat:36.3932,  lng:25.4615},
+  {name:"Dubrovnik",       lat:42.6507,  lng:18.0944},
+  {name:"Innsbruck",       lat:47.2692,  lng:11.4041},
+  {name:"Zermatt",         lat:46.0207,  lng:7.7491},
+  {name:"Chamonix",        lat:45.9237,  lng:6.8694},
+  {name:"Davos",           lat:46.8032,  lng:9.8373},
+  {name:"St. Moritz",      lat:46.4980,  lng:9.8379},
+  {name:"Whistler",        lat:50.1163,  lng:-122.9574},
+  {name:"Aspen",           lat:39.1911,  lng:-106.8175},
+  {name:"Lake Tahoe",      lat:39.0968,  lng:-120.0324},
+  {name:"Yellowstone",     lat:44.4280,  lng:-110.5885},
+  {name:"Grand Canyon",    lat:36.1069,  lng:-112.1129},
+  {name:"Niagara Falls",   lat:43.0962,  lng:-79.0377},
+  {name:"Mont-Tremblant",  lat:46.1185,  lng:-74.5963},
+  {name:"Cancún",          lat:21.1619,  lng:-86.8515},
+  {name:"Playa del Carmen",lat:20.6296,  lng:-87.0739},
+  {name:"San Juan PR",     lat:18.4655,  lng:-66.1057},
+  {name:"Havana",          lat:23.1136,  lng:-82.3666},
+  {name:"Reykjavik",       lat:64.1265,  lng:-21.8174},
+  {name:"Faroe Islands",   lat:62.0000,  lng:-6.7900},
+  {name:"Lofoten",         lat:68.1500,  lng:14.3500},
+  {name:"Tromsø",          lat:69.6492,  lng:18.9553},
+  {name:"Svalbard",        lat:78.2232,  lng:15.6267},
+  {name:"Iceland Ring Rd", lat:64.9631,  lng:-19.0208},
+  {name:"Azores",          lat:37.7412,  lng:-25.6756},
+  {name:"Madeira",         lat:32.7607,  lng:-16.9595},
+  {name:"Canary Islands",  lat:28.2916,  lng:-16.6291},
+  {name:"Malta",           lat:35.8997,  lng:14.5147},
+  {name:"Cyprus",          lat:34.9250,  lng:33.6200},
+  {name:"Maldives",        lat:3.2028,   lng:73.2207},
+  {name:"Seychelles",      lat:-4.6796,  lng:55.4920},
+  {name:"Mauritius",       lat:-20.2759, lng:57.5703},
+  {name:"Fiji",            lat:-17.7134, lng:178.0650},
+  {name:"Tahiti",          lat:-17.6509, lng:-149.4260},
+  {name:"Palau",           lat:7.5150,   lng:134.5825},
+  {name:"Hawaii / Honolulu",lat:21.3069, lng:-157.8583},
+];
+
+// ═══════════════════════════════════════════════════════════════
+// Blocked sources — never crawl; marked with ✕ at company HQ
+// Color: #f85149  (red)
+// ═══════════════════════════════════════════════════════════════
+const BLOCKED_SOURCES = [
+  {name:"Shodan",          city:"Austin, TX",       lat:30.2672,  lng:-97.7431,  reason:"Internet scanner — exposes private/misconfigured devices"},
+  {name:"Censys",          city:"Ann Arbor, MI",    lat:42.2808,  lng:-83.7430,  reason:"Internet scanner — same class as Shodan"},
+  {name:"ZoomEye",         city:"Beijing",          lat:39.9042,  lng:116.4074,  reason:"Chinese internet scanner — no legitimate public-webcam use"},
+  {name:"FOFA",            city:"Beijing",          lat:39.9200,  lng:116.4100,  reason:"Chinese attack-surface mapping platform"},
+  {name:"BinaryEdge",      city:"Lisbon",           lat:38.7223,  lng:-9.1393,   reason:"Attack-surface intelligence — not a public webcam directory"},
+  {name:"Insecam.org",     city:"Unknown",          lat:51.5074,  lng:-0.1278,   reason:"Aggregates misconfigured/hacked private cameras"},
+  {name:"Opentopia",       city:"Unknown",          lat:48.8566,  lng:2.3522,    reason:"Same class as Insecam — unauthorized private feeds"},
+  {name:"Camhacker.com",   city:"Unknown",          lat:52.3676,  lng:4.9041,    reason:"Explicitly hacked camera aggregator"},
+  {name:"Ring (Amazon)",   city:"Santa Monica, CA", lat:34.0195,  lng:-118.4912, reason:"Private home security — never public"},
+  {name:"Nest (Google)",   city:"Mountain View, CA",lat:37.3861,  lng:-122.0839, reason:"Private home security — never public"},
+  {name:"Arlo",            city:"San Jose, CA",     lat:37.3382,  lng:-121.8863, reason:"Private home security — never public"},
+  {name:"Wyze",            city:"Kirkland, WA",     lat:47.6769,  lng:-122.2060, reason:"Private home security — never public"},
+  {name:"Verkada",         city:"San Mateo, CA",    lat:37.5630,  lng:-122.3255, reason:"Enterprise security cameras — private by design"},
+  {name:"Avigilon",        city:"Vancouver, BC",    lat:49.2827,  lng:-123.1207, reason:"Enterprise VMS — private surveillance"},
+  {name:"Genetec",         city:"Montreal, QC",     lat:45.5017,  lng:-73.5673,  reason:"Enterprise VMS — private surveillance"},
+  {name:"Milestone XProtect",city:"Brøndby, DK",   lat:55.6838,  lng:12.4345,   reason:"Enterprise VMS — private surveillance"},
+  {name:"Hikvision",       city:"Hangzhou",         lat:30.2741,  lng:120.1551,  reason:"Direct IP feeds — private/unauthenticated devices"},
+  {name:"Dahua",           city:"Hangzhou",         lat:30.2800,  lng:120.1600,  reason:"Direct IP feeds — private/unauthenticated devices"},
+  {name:"Axis",            city:"Lund, Sweden",     lat:55.7047,  lng:13.1910,   reason:"Direct IP feeds — private/unauthenticated devices"},
+  {name:"Reolink",         city:"Hong Kong",        lat:22.3193,  lng:114.1694,  reason:"Consumer security cameras — never public feeds"},
+  {name:"iSpy/Agent DVR",  city:"Auckland, NZ",     lat:-36.8485, lng:174.7633,  reason:"Self-hosted private DVR software"},
+  {name:"Patreon streams", city:"San Francisco, CA",lat:37.7749,  lng:-122.4194, reason:"Subscription-gated — not public"},
+];
+
+// ─── Helpers ───
+function feedEmoji(ft) {
+  if (!ft) return '📹';
+  const t = ft.toLowerCase();
+  if (t === 'youtube_live' || t.includes('youtube')) return '▶️';
+  if (t === 'static_refresh' || t.includes('static') || t.includes('refresh')) return '📸';
+  if (t.includes('hls') || t.includes('mjpeg')) return '📹';
+  if (t.includes('iframe') || t.includes('js_player')) return '🖥️';
+  return '📹';
+}
+function statusColor(s) {
+  return s === 'live' ? '#3fb950' : s === 'dead' ? '#f85149' : '#e3b341';
+}
+function scoreEmoji(s) {
+  return s === 'high' ? '✅' : s === 'medium' ? '⚠️' : '❓';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAP INIT
+// ═══════════════════════════════════════════════════════════════
+const map = L.map('map', {center:[20,10], zoom:3, zoomControl:true});
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution:'&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> &copy; <a href="https://carto.com">CARTO</a>',
+  subdomains:'abcd', maxZoom:19
+}).addTo(map);
+
+// Cluster group
+const clusters = L.markerClusterGroup({
+  maxClusterRadius: 45,
+  showCoverageOnHover: false,
+  spiderfyOnMaxZoom: true,
+  iconCreateFunction: c => {
+    const n = c.getChildCount();
+    const sz = n > 99 ? 42 : 34;
+    return L.divIcon({
+      html:`<div style="width:${sz}px;height:${sz}px;background:#1f6feb;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;border:2px solid #388bfd;box-shadow:0 2px 8px rgba(0,0,0,.5)">${n}</div>`,
+      className:'', iconSize:[sz,sz]
+    });
+  }
+}).addTo(map);
+
+// ─── Layer state ───
+let heatLayer     = null;
+let heatActive    = false;
+let tier1Circles  = [];
+let tier1Active   = false;
+let tier2Circles  = [];
+let tier2Active   = false;
+let tier3Circles  = [];
+let tier3Active   = false;
+let blockedMarkers= [];
+let blockedActive = false;
+
+// ═══════════════════════════════════════════════════════════════
+// FILTER STATE
+// ═══════════════════════════════════════════════════════════════
+let allFeatures = [];
+const F = {
+  status:    new Set(['live','unknown']),
+  score:     new Set(['high','medium']),
+  feedtype:  new Set(),
+  continent: new Set(),
+  search:    ''
+};
+
+// ═══════════════════════════════════════════════════════════════
+// RENDER
+// ═══════════════════════════════════════════════════════════════
+function filtered() {
+  return allFeatures.filter(f => {
+    const p = f.properties;
+    if (!F.status.has(p.status || 'unknown')) return false;
+    if (!F.score.has(p.legitimacy_score || 'medium')) return false;
+    if (F.feedtype.size  && !F.feedtype.has(p.feed_type || 'unknown')) return false;
+    if (F.continent.size && !F.continent.has(p.continent || 'Unknown')) return false;
+    if (F.search) {
+      const q = F.search.toLowerCase();
+      const h = `${p.label||''} ${p.city||''} ${p.country||''} ${p.continent||''}`.toLowerCase();
+      if (!h.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function render() {
+  const vis = filtered();
+
+  // ── Markers ──
+  clusters.clearLayers();
+  vis.forEach(f => clusters.addLayer(makeMarker(f)));
+
+  // ── Heatmap ──
+  if (heatActive) refreshHeat(vis);
+
+  // ── Tier circles ──
+  if (tier1Active) refreshTier1();
+  if (tier2Active) refreshTier2();
+  if (tier3Active) refreshTier3();
+  if (blockedActive) refreshBlocked();
+
+  // ── Stats ──
+  const live    = allFeatures.filter(f => f.properties.status === 'live').length;
+  const unknown = allFeatures.filter(f => (f.properties.status || 'unknown') === 'unknown').length;
+  const dead    = allFeatures.filter(f => f.properties.status === 'dead').length;
+  document.getElementById('n-live').textContent    = live;
+  document.getElementById('n-unknown').textContent = unknown;
+  document.getElementById('n-dead').textContent    = dead;
+  document.getElementById('active-count').textContent = allFeatures.length;
+  document.getElementById('vis-count').textContent = vis.length;
+
+  // ── Camera list ──
+  const list     = document.getElementById('cam-list');
+  const noRes    = document.getElementById('no-results');
+  const moreMsg  = document.getElementById('more-msg');
+  list.innerHTML = '';
+
+  if (!vis.length) {
+    noRes.style.display = 'block';
+    moreMsg.style.display = 'none';
+    return;
+  }
+  noRes.style.display = 'none';
+
+  vis.slice(0, 100).forEach(f => {
+    const p = f.properties;
+    const [lng, lat] = f.geometry.coordinates;
+    const d = document.createElement('div');
+    d.className = 'cam-row';
+    const sc = p.status === 'live' ? 'sb-live' : p.status === 'dead' ? 'sb-dead' : 'sb-unknown';
+    const sl = p.status === 'live' ? '● Live'  : p.status === 'dead' ? '● Dead'  : '● Unknown';
+    d.innerHTML = `
+      <div class="cam-name" title="${p.label||''}">${p.label||'Unknown'}</div>
+      <div class="cam-meta">
+        <span>${p.city||'?'}</span>
+        <span class="sbadge ${sc}">${sl}</span>
+      </div>`;
+    d.addEventListener('click', () => {
+      map.setView([lat, lng], 13);
+    });
+    list.appendChild(d);
+  });
+
+  if (vis.length > 100) {
+    moreMsg.style.display = 'block';
+    moreMsg.textContent = `+ ${vis.length - 100} more — zoom in or narrow filters`;
+  } else {
+    moreMsg.style.display = 'none';
+  }
+
+  // Keep table in sync if it's the active view
+  if (viewMode === 'table') renderTable();
+}
+
+// ─── expandYT: swap thumbnail for inline iframe on click ───
+function expandYT(uid, videoId) {
+  const wrap = document.getElementById(uid + '-wrap');
+  if (!wrap) return;
+  wrap.innerHTML =
+    `<iframe src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=1&rel=0"
+             allow="autoplay; fullscreen" allowfullscreen></iframe>`;
+}
+
+// ─── Build a single marker ───
+function makeMarker(f) {
+  const p = f.properties;
+  const [lng, lat] = f.geometry.coordinates;
+  const col  = statusColor(p.status || 'unknown');
+  const em   = feedEmoji(p.feed_type);
+  const se   = scoreEmoji(p.legitimacy_score);
+  const sHtml = p.status === 'live'
+    ? `<span style="color:#3fb950">● Live</span>`
+    : p.status === 'dead'
+    ? `<span style="color:#f85149">● Dead</span>`
+    : `<span style="color:#e3b341">● Unknown</span>`;
+
+  const icon = L.divIcon({
+    html: `<div style="position:relative;width:22px;height:22px">
+      <div style="width:14px;height:14px;border-radius:50%;background:${col};border:2px solid rgba(255,255,255,.22);box-shadow:0 0 7px ${col}99;position:absolute;top:4px;left:4px"></div>
+      <div style="position:absolute;top:-3px;right:-3px;font-size:10px;line-height:1;text-shadow:0 0 3px #000">${em}</div>
+    </div>`,
+    className: '', iconSize:[22,22], iconAnchor:[11,11], popupAnchor:[0,-13]
+  });
+
+  const uid = 'prev-' + ((p.id || '').replace(/[^a-z0-9]/gi, '') || Math.random().toString(36).slice(2, 8));
+
+  const isYT      = p.feed_type === 'youtube_live';
+  const isMJPEG   = p.feed_type === 'MJPEG' || (p.feed_type || '').toLowerCase() === 'mjpeg';
+  const isStatic  = p.feed_type === 'static_refresh' || isMJPEG;
+  // CLAUDE.md feed player priority: direct_stream_url first, fall back to stream_url
+  const imgSrc    = p.direct_stream_url || p.stream_url || '';
+
+  // ── YouTube: thumbnail + click-to-embed ──
+  const ytSVG = `<svg viewBox="0 0 68 48"><path d="M66.52 7.74c-.78-2.93-2.49-5.41-5.42-6.19C55.79.13 34 0 34 0S12.21.13 6.9 1.55c-2.93.78-4.63 3.26-5.42 6.19C.06 13.05 0 24 0 24s.06 10.95 1.48 16.26c.78 2.93 2.49 5.41 5.42 6.19C12.21 47.87 34 48 34 48s21.79-.13 27.1-1.55c2.93-.78 4.64-3.26 5.42-6.19C67.94 34.95 68 24 68 24s-.06-10.95-1.48-16.26z" fill="#f00"/><path d="M45 24 27 14v20" fill="#fff"/></svg>`;
+
+  const ytThumb   = `https://img.youtube.com/vi/${p.video_id}/hqdefault.jpg`;
+  const ytWatch   = `https://www.youtube.com/watch?v=${p.video_id}`;
+
+  const previewHtml = isYT
+    ? `<div class="p-preview" id="${uid}-wrap"
+           onclick="expandYT('${uid}','${p.video_id}')"
+           title="Click to play live stream">
+         <img src="${ytThumb}" alt="${p.label}" loading="lazy"
+              onerror="this.src='https://img.youtube.com/vi/${p.video_id}/mqdefault.jpg'"/>
+         <div class="p-yt-overlay">
+           <div class="p-yt-btn">${ytSVG}</div>
+         </div>
+       </div>`
+    : isStatic
+    ? `<div class="p-preview">
+         <img id="${uid}"
+              src="${imgSrc}?_t=${Date.now()}"
+              alt="${p.label}" loading="lazy"
+              onerror="this.parentNode.innerHTML='<div class=p-preload>⚠️ Feed currently unavailable</div>'"/>
+       </div>
+       <div id="${uid}-ts" class="p-refresh-ts">🔄 auto-refreshes every 30 s</div>`
+    : '';
+
+  const watchHtml = isYT
+    ? `<div class="p-watch-yt">
+         <a class="p-btn-full" href="${ytWatch}" target="_blank" rel="noopener">▶ Watch on YouTube</a>
+       </div>`
+    : `<a class="p-watch" href="${p.url || '#'}" target="_blank" rel="noopener noreferrer">🔗 Open Source Page</a>`;
+
+  const locationLine = [p.city, p.region, p.country].filter(Boolean).join(', ');
+  const sourceRefsHtml = (Array.isArray(p.source_refs) && p.source_refs.length)
+    ? `<div class="p-src" style="margin-top:3px">Refs: ${p.source_refs.map((r,i) =>
+        `<a class="p-reflink" href="${r}" target="_blank" rel="noopener">#${i+1}</a>`
+      ).join(' ')}</div>`
+    : '';
+  const directStreamHtml = (!isYT && !isStatic && p.direct_stream_url)
+    ? `<div class="p-src" style="margin-top:3px"><a class="p-reflink" href="${p.direct_stream_url}" target="_blank" rel="noopener">⬛ Direct stream URL</a></div>`
+    : '';
+
+  const marker = L.marker([lat, lng], {icon});
+  marker.bindPopup(`
+    <div class="p-title">${p.label || 'Unknown Camera'}</div>
+    <div class="p-city">📍 ${locationLine || '?'}</div>
+    ${previewHtml}
+    <div class="p-grid">
+      <span class="p-k">Status</span>       <span class="p-v">${sHtml}</span>
+      <span class="p-k">Feed Type</span>    <span class="p-v">${em} ${p.feed_type || 'unknown'}</span>
+      <span class="p-k">Confidence</span>   <span class="p-v">${se} ${p.legitimacy_score || 'unknown'}</span>
+      <span class="p-k">Continent</span>    <span class="p-v">${p.continent || '—'}</span>
+      <span class="p-k">JS Required</span>  <span class="p-v">${p.requires_js ? '⚠️ Yes' : '✓ No'}</span>
+      <span class="p-k">Geo Restricted</span><span class="p-v">${p.geo_restricted ? '⚠️ Yes' : '✓ No'}</span>
+      <span class="p-k">Verified</span>     <span class="p-v">${p.last_verified || '—'}</span>
+    </div>
+    ${watchHtml}
+    <div class="p-src">Source: ${p.source_directory || '—'}</div>
+    ${directStreamHtml}
+    ${sourceRefsHtml}
+    ${p.notes ? `<div class="p-note">📝 ${p.notes}</div>` : ''}
+  `, {maxWidth: 380, minWidth: 270});
+
+  // Auto-refresh static feeds every 30 s while popup is open
+  if (isStatic) {
+    let _iv = null;
+    marker.on('popupopen', () => {
+      _iv = setInterval(() => {
+        const img = document.getElementById(uid);
+        if (img) img.src = imgSrc + '?_t=' + Date.now();
+        const ts = document.getElementById(uid + '-ts');
+        if (ts) {
+          const t = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+          ts.textContent = '🔄 last refreshed ' + t;
+        }
+      }, 30000);
+    });
+    marker.on('popupclose', () => { clearInterval(_iv); _iv = null; });
+  }
+
+  return marker;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DYNAMIC CHIPS — built from loaded data
+// ═══════════════════════════════════════════════════════════════
+function buildDynamic(features) {
+  const feedTypes  = [...new Set(features.map(f => f.properties.feed_type || 'unknown'))].sort();
+  const continents = [...new Set(features.map(f => f.properties.continent || 'Unknown'))].sort();
+
+  F.feedtype  = new Set(feedTypes);
+  F.continent = new Set(continents);
+
+  // Feed type chips
+  const ftEl = document.getElementById('feedtype-chips');
+  ftEl.innerHTML = '';
+  feedTypes.forEach(ft => {
+    const c = chip(`${feedEmoji(ft)} ${ft}`, 'feedtype', ft, true);
+    ftEl.appendChild(c);
+  });
+
+  // Continent chips
+  const coEl = document.getElementById('continent-chips');
+  coEl.innerHTML = '';
+  continents.forEach(con => {
+    const c = chip(con, 'continent', con, true);
+    coEl.appendChild(c);
+  });
+}
+
+function chip(text, filterKey, value, active) {
+  const el = document.createElement('span');
+  el.className = 'chip' + (active ? ' on' : '');
+  el.dataset.f = filterKey;
+  el.dataset.v = value;
+  el.textContent = text;
+  el.addEventListener('click', () => toggleChip(el, filterKey, value));
+  return el;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CHIP TOGGLE
+// ═══════════════════════════════════════════════════════════════
+function toggleChip(el, key, value) {
+  const set = F[key];
+  if (set.has(value)) {
+    set.delete(value);
+    el.classList.remove('on','on-live','on-unknown','on-dead');
+  } else {
+    set.add(value);
+    if (key === 'status') {
+      const cls = value === 'live' ? 'on-live' : value === 'unknown' ? 'on-unknown' : 'on-dead';
+      el.classList.add('on', cls);
+    } else {
+      el.classList.add('on');
+    }
+  }
+  render();
+}
+
+// Wire static chips (status + confidence)
+document.querySelectorAll('.chip[data-f]').forEach(el => {
+  el.addEventListener('click', () => toggleChip(el, el.dataset.f, el.dataset.v));
+});
+
+// Search
+document.getElementById('search').addEventListener('input', e => {
+  F.search = e.target.value.trim();
+  render();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// QUICK VIEWS
+// ═══════════════════════════════════════════════════════════════
+function setQuick(statusSet, scoreSet) {
+  F.status   = new Set(statusSet);
+  F.score    = new Set(scoreSet);
+  // Reset feedtype + continent to "all" and clear search
+  const allFeedTypes  = [...new Set(allFeatures.map(f => f.properties.feed_type || 'unknown'))];
+  const allContinents = [...new Set(allFeatures.map(f => f.properties.continent || 'Unknown'))];
+  F.feedtype  = new Set(allFeedTypes);
+  F.continent = new Set(allContinents);
+  F.search    = '';
+  document.getElementById('search').value = '';
+  // Sync status chips
+  document.querySelectorAll('.chip[data-f="status"]').forEach(el => {
+    el.classList.remove('on','on-live','on-unknown','on-dead');
+    if (F.status.has(el.dataset.v)) {
+      const cls = el.dataset.v === 'live' ? 'on-live' : el.dataset.v === 'unknown' ? 'on-unknown' : 'on-dead';
+      el.classList.add('on', cls);
+    }
+  });
+  // Sync confidence chips
+  document.querySelectorAll('.chip[data-f="score"]').forEach(el => {
+    el.classList.toggle('on', F.score.has(el.dataset.v));
+  });
+  // Sync dynamic feedtype + continent chips (all on)
+  document.querySelectorAll('.chip[data-f="feedtype"]').forEach(el => {
+    el.classList.add('on');
+  });
+  document.querySelectorAll('.chip[data-f="continent"]').forEach(el => {
+    el.classList.add('on');
+  });
+  render();
+}
+document.getElementById('q-all').addEventListener('click',       () => setQuick(['live','unknown','dead'], ['high','medium','low']));
+document.getElementById('q-live-only').addEventListener('click', () => setQuick(['live'],                  ['high','medium','low']));
+document.getElementById('q-hq').addEventListener('click',        () => setQuick(['live','unknown'],         ['high']));
+
+// ═══════════════════════════════════════════════════════════════
+// LAYER TOGGLES
+// ═══════════════════════════════════════════════════════════════
+function refreshHeat(features) {
+  if (heatLayer) map.removeLayer(heatLayer);
+  const pts = features.map(f => {
+    const [lng, lat] = f.geometry.coordinates;
+    return [lat, lng, 0.6];
+  });
+  heatLayer = L.heatLayer(pts, {
+    radius: 28, blur: 22, maxZoom: 9,
+    gradient: {0.3:'#1f6feb', 0.6:'#e3b341', 1.0:'#f85149'}
+  });
+  map.addLayer(heatLayer);
+}
+
+// ─── Tier circle helpers ───
+function makeTierCircles(cities, color, radius, listVar) {
+  listVar.forEach(c => map.removeLayer(c));
+  listVar.length = 0;
+  cities.forEach(city => {
+    const c = L.circle([city.lat, city.lng], {
+      radius, color, weight:1.5,
+      opacity:0.55, fillColor:color, fillOpacity:0.08,
+      interactive: false
+    }).addTo(map);
+    listVar.push(c);
+  });
+}
+function clearLayer(listVar) {
+  listVar.forEach(c => map.removeLayer(c));
+  listVar.length = 0;
+}
+
+function refreshTier1()   { makeTierCircles(TIER1_CITIES,  '#58a6ff', 40000, tier1Circles); }
+function refreshTier2()   { makeTierCircles(TIER2_CITIES,  '#f0a832', 28000, tier2Circles); }
+function refreshTier3()   { makeTierCircles(TIER3_CITIES,  '#3fb950', 18000, tier3Circles); }
+
+function refreshBlocked() {
+  clearLayer(blockedMarkers);
+  BLOCKED_SOURCES.forEach(src => {
+    const icon = L.divIcon({
+      html: `<div title="${src.name}\n${src.reason}" style="
+        width:22px;height:22px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:16px;font-weight:900;color:#f85149;
+        text-shadow:0 0 4px rgba(0,0,0,.9),0 0 8px rgba(248,81,73,.6);
+        line-height:1;cursor:default;">✕</div>`,
+      className:'', iconSize:[22,22], iconAnchor:[11,11]
+    });
+    const m = L.marker([src.lat, src.lng], {icon, interactive:true});
+    m.bindTooltip(
+      `<strong style="color:#f85149">⛔ ${src.name}</strong><br>
+       <span style="font-size:11px;color:#8b949e">${src.city}</span><br>
+       <span style="font-size:11px">${src.reason}</span>`,
+      {direction:'top', offset:[0,-4], className:'blocked-tip'}
+    );
+    blockedMarkers.push(m);
+    m.addTo(map);
+  });
+}
+
+// ─── Toggle listeners ───
+document.getElementById('tog-heat').addEventListener('click', function() {
+  heatActive = this.classList.toggle('on');
+  if (heatActive) refreshHeat(filtered());
+  else if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+});
+
+document.getElementById('tog-tier1').addEventListener('click', function() {
+  tier1Active = this.classList.toggle('on');
+  if (tier1Active) refreshTier1(); else clearLayer(tier1Circles);
+});
+document.getElementById('tog-tier2').addEventListener('click', function() {
+  tier2Active = this.classList.toggle('on');
+  if (tier2Active) refreshTier2(); else clearLayer(tier2Circles);
+});
+document.getElementById('tog-tier3').addEventListener('click', function() {
+  tier3Active = this.classList.toggle('on');
+  if (tier3Active) refreshTier3(); else clearLayer(tier3Circles);
+});
+document.getElementById('tog-blocked').addEventListener('click', function() {
+  blockedActive = this.classList.toggle('on');
+  if (blockedActive) refreshBlocked(); else clearLayer(blockedMarkers);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GEOJSON LOADING
+// ═══════════════════════════════════════════════════════════════
+function loadGeoJSON(geojson, filename) {
+  if (!geojson || geojson.type !== 'FeatureCollection') {
+    alert('Invalid file: expected a GeoJSON FeatureCollection.');
+    return;
+  }
+
+  // Accept only valid Point features
+  allFeatures = (geojson.features || []).filter(f =>
+    f &&
+    f.geometry &&
+    f.geometry.type === 'Point' &&
+    Array.isArray(f.geometry.coordinates) &&
+    f.geometry.coordinates.length >= 2 &&
+    !isNaN(f.geometry.coordinates[0]) &&
+    !isNaN(f.geometry.coordinates[1])
+  );
+
+  // Update header
+  document.getElementById('active-file').textContent = filename;
+
+  // Rebuild dynamic chips from new data
+  buildDynamic(allFeatures);
+
+  // Reset all filters to show everything in the new dataset
+  F.status  = new Set(['live','unknown','dead']);
+  F.score   = new Set(['high','medium','low']);
+  F.search  = '';
+  document.getElementById('search').value = '';
+
+  document.querySelectorAll('.chip[data-f="status"]').forEach(el => {
+    const cls = el.dataset.v === 'live' ? 'on-live' : el.dataset.v === 'unknown' ? 'on-unknown' : 'on-dead';
+    el.classList.add('on', cls);
+  });
+  document.querySelectorAll('.chip[data-f="score"]').forEach(el => {
+    el.classList.add('on');
+  });
+
+  // Hide empty-state overlay now that data is loaded
+  document.getElementById('empty-state').classList.add('hidden');
+
+  render();
+}
+
+// ── File picker ──
+document.getElementById('btn-load').addEventListener('click', () => {
+  document.getElementById('file-input').click();
+});
+
+document.getElementById('file-input').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    e.target.value = ''; // reset here so re-select works, after file is already read
+    try {
+      const geojson = JSON.parse(ev.target.result);
+      loadGeoJSON(geojson, file.name);
+    } catch (err) {
+      console.error('GeoJSON parse error:', err);
+      alert('Could not parse the selected file as JSON.\nPlease choose a valid .geojson file.');
+    }
+  };
+  reader.onerror = () => {
+    alert('Could not read the selected file.');
+  };
+  reader.readAsText(file);
+});
+
+// Empty-state load button triggers the same file picker
+document.getElementById('es-load-btn').addEventListener('click', () => {
+  document.getElementById('file-input').click();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TABLE VIEW
+// ═══════════════════════════════════════════════════════════════
+let viewMode       = 'map';
+let tableSort      = { col: 'label', dir: 1 };
+let tableSearch    = '';
+let tableStatusF   = '';
+let tableFeedF     = '';
+let tableContF     = '';
+
+// Sort value extractors
+function tSortVal(p, col) {
+  if (col === 'status')           return ['live','unknown','dead'].indexOf(p.status || 'unknown');
+  if (col === 'legitimacy_score') return ['high','medium','low'].indexOf(p.legitimacy_score || 'low');
+  return (p[col] || '').toString().toLowerCase();
+}
+
+function tableRows() {
+  let rows = filtered();
+  // Table-level search (layered on top of sidebar filters)
+  if (tableSearch) {
+    const q = tableSearch.toLowerCase();
+    rows = rows.filter(f => {
+      const p = f.properties;
+      const hay = `${p.label||''} ${p.city||''} ${p.country||''} ${p.continent||''} ${p.source_directory||''}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }
+  if (tableStatusF) rows = rows.filter(f => (f.properties.status||'unknown') === tableStatusF);
+  if (tableFeedF)   rows = rows.filter(f => (f.properties.feed_type||'unknown') === tableFeedF);
+  if (tableContF)   rows = rows.filter(f => (f.properties.continent||'Unknown') === tableContF);
+  // Sort
+  rows.sort((a, b) => {
+    const va = tSortVal(a.properties, tableSort.col);
+    const vb = tSortVal(b.properties, tableSort.col);
+    return va < vb ? -tableSort.dir : va > vb ? tableSort.dir : 0;
+  });
+  return rows;
+}
+
+function rebuildTableDropdowns() {
+  const feedSel = document.getElementById('tp-feed-sel');
+  const contSel = document.getElementById('tp-cont-sel');
+  const feedTypes  = [...new Set(allFeatures.map(f => f.properties.feed_type  || 'unknown'))].sort();
+  const continents = [...new Set(allFeatures.map(f => f.properties.continent  || 'Unknown'))].sort();
+  if (feedSel.options.length - 1 !== feedTypes.length) {
+    feedSel.innerHTML = '<option value="">All Feed Types</option>';
+    feedTypes.forEach(ft => { const o = new Option(`${feedEmoji(ft)} ${ft}`, ft); feedSel.add(o); });
+  }
+  if (contSel.options.length - 1 !== continents.length) {
+    contSel.innerHTML = '<option value="">All Continents</option>';
+    continents.forEach(c  => { const o = new Option(c, c); contSel.add(o); });
+  }
+  feedSel.value = tableFeedF;
+  contSel.value = tableContF;
+  document.getElementById('tp-status-sel').value = tableStatusF;
+}
+
+function renderTable() {
+  if (viewMode !== 'table') return;
+  rebuildTableDropdowns();
+
+  const rows  = tableRows();
+  const tbody = document.getElementById('tp-body');
+  const empty = document.getElementById('tp-empty');
+  document.getElementById('tp-count').textContent = `${rows.length} camera${rows.length !== 1 ? 's' : ''}`;
+
+  // Sync sort indicators
+  document.querySelectorAll('#tp-table th[data-col]').forEach(th => {
+    th.classList.remove('sort-asc','sort-desc');
+    if (th.dataset.col === tableSort.col)
+      th.classList.add(tableSort.dir === 1 ? 'sort-asc' : 'sort-desc');
+  });
+
+  if (!rows.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+
+  const frag = document.createDocumentFragment();
+  rows.forEach(f => {
+    const p   = f.properties;
+    const [lng, lat] = f.geometry.coordinates;
+    const tr  = document.createElement('tr');
+
+    const sClass = p.status === 'live' ? 'tp-live' : p.status === 'dead' ? 'tp-dead' : 'tp-unknown';
+    const sLabel = p.status === 'live' ? '● Live'  : p.status === 'dead' ? '● Dead'  : '● Unknown';
+    const cClass = p.legitimacy_score === 'high' ? 'tp-high' : p.legitimacy_score === 'medium' ? 'tp-medium' : 'tp-low';
+    const ftE    = feedEmoji(p.feed_type);
+    const watchUrl = p.url || '#';
+
+    tr.innerHTML = `
+      <td><span class="tp-badge ${sClass}">${sLabel}</span></td>
+      <td class="tp-label" title="${(p.label||'').replace(/"/g,'&quot;')}">${p.label||'—'}</td>
+      <td>${p.city||'—'}</td>
+      <td style="color:var(--muted)">${p.region||'—'}</td>
+      <td>${p.country||'—'}</td>
+      <td>${p.continent||'—'}</td>
+      <td style="white-space:nowrap">${ftE} ${p.feed_type||'—'}</td>
+      <td><span class="tp-badge ${cClass}">${p.legitimacy_score||'—'}</span></td>
+      <td style="white-space:nowrap">${p.last_verified||'—'}</td>
+      <td class="tp-src" title="${(p.source_directory||'').replace(/"/g,'&quot;')}">${p.source_directory||'—'}</td>
+      <td><a class="tp-link" href="${watchUrl}" target="_blank" rel="noopener noreferrer">🔗 Watch</a></td>
+      <td><button class="tp-map-btn" data-lat="${lat}" data-lng="${lng}">📍 Map</button></td>`;
+    frag.appendChild(tr);
+  });
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+
+  // Map-fly buttons
+  tbody.querySelectorAll('.tp-map-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const la = parseFloat(btn.dataset.lat), lo = parseFloat(btn.dataset.lng);
+      switchToMap();
+      setTimeout(() => map.setView([la, lo], 14), 60);
+    });
+  });
+}
+
+function switchToMap() {
+  viewMode = 'map';
+  document.getElementById('map').style.display = '';
+  document.getElementById('table-panel').classList.remove('active');
+  document.getElementById('btn-table').classList.remove('active');
+  document.getElementById('btn-table').textContent = '📋 Table';
+}
+function switchToTable() {
+  viewMode = 'table';
+  document.getElementById('map').style.display = 'none';
+  document.getElementById('table-panel').classList.add('active');
+  document.getElementById('btn-table').classList.add('active');
+  document.getElementById('btn-table').textContent = '🗺️ Map';
+  renderTable();
+}
+
+document.getElementById('btn-table').addEventListener('click', () => {
+  if (viewMode === 'table') switchToMap(); else switchToTable();
+});
+
+// Table toolbar controls
+document.getElementById('tp-search').addEventListener('input', e => {
+  tableSearch = e.target.value;
+  renderTable();
+});
+document.getElementById('tp-status-sel').addEventListener('change', e => {
+  tableStatusF = e.target.value; renderTable();
+});
+document.getElementById('tp-feed-sel').addEventListener('change', e => {
+  tableFeedF = e.target.value; renderTable();
+});
+document.getElementById('tp-cont-sel').addEventListener('change', e => {
+  tableContF = e.target.value; renderTable();
+});
+
+// Column header sort
+document.querySelectorAll('#tp-table th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.col;
+    tableSort = tableSort.col === col
+      ? { col, dir: -tableSort.dir }
+      : { col, dir: 1 };
+    renderTable();
+  });
+});
+
+// CSV export
+document.getElementById('tp-export').addEventListener('click', () => {
+  const cols = ['id','label','city','region','country','continent','feed_type',
+                'legitimacy_score','status','last_verified','source_directory',
+                'url','stream_url','direct_stream_url','requires_js','geo_restricted','notes'];
+  const rows = tableRows();
+  const csv  = [
+    cols.join(','),
+    ...rows.map(f => cols.map(c => {
+      const v = (f.properties[c] || '').toString().replace(/"/g, '""');
+      return `"${v}"`;
+    }).join(','))
+  ].join('\n');
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([csv], {type: 'text/csv'})),
+    download: `webcams_${new Date().toISOString().slice(0,10)}.csv`
+  });
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DRAG-AND-DROP — works on file:// protocol, no server needed
+// ═══════════════════════════════════════════════════════════════
+(function() {
+  const dropZone = document.getElementById('es-drop-zone');
+  const layout   = document.getElementById('layout');
+
+  function handleDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (dropZone) dropZone.classList.remove('drag-over');
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        loadGeoJSON(JSON.parse(ev.target.result), file.name);
+      } catch(err) {
+        alert('Could not parse the dropped file as GeoJSON.\n' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // Highlight drop zone while dragging over it
+  if (dropZone) {
+    dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop',      handleDrop);
+  }
+  // Also accept drops anywhere on the layout (when data is already loaded)
+  layout.addEventListener('dragover',  e => e.preventDefault());
+  layout.addEventListener('drop',      handleDrop);
+})();
+
+// Copy-command button
+document.getElementById('es-copy-btn').addEventListener('click', () => {
+  const txt = document.getElementById('es-cmd-text').textContent;
+  navigator.clipboard.writeText(txt).then(() => {
+    const btn = document.getElementById('es-copy-btn');
+    btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.textContent = '📋 Copy'; }, 1800);
+  }).catch(() => {});
+});
+
+// ═══════════════════════════════════════════════════════════════
+// STARTUP — auto-load camera.geojson if served over HTTP(S)
+// When opened as a local file (file:// protocol) fetch is blocked
+// by the browser; the empty-state overlay guides the user instead.
+// ═══════════════════════════════════════════════════════════════
+(async () => {
+  if (window.location.protocol === 'file:') {
+    // Can't fetch local files — show empty state (already visible by default)
+    console.info('Opened via file:// — auto-load unavailable. Use the file picker, drag-and-drop, or serve via a local HTTP server.');
+    return;
+  }
+  try {
+    const res = await fetch('camera.geojson');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const gj = await res.json();
+    console.log('Auto-loaded camera.geojson from server.');
+    loadGeoJSON(gj, 'camera.geojson');
+  } catch (err) {
+    console.info(`camera.geojson not found (${err.message}) — showing empty state.`);
+  }
+})();
+</script>
+</body>
+</html>
