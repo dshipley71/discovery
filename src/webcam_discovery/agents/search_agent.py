@@ -1,43 +1,212 @@
 #!/usr/bin/env python3
 """
-search_agent.py — Executes multi-language structured queries to discover cameras not indexed in known directories.
+search_agent.py — Executes multi-language structured queries to discover cameras.
 Part of the Public Webcam Discovery System.
-
-Claude Code: implement this module following AGENTS.md and SKILLS.md.
-Read those files before generating code for this agent.
 """
 from __future__ import annotations
+
 import asyncio
 import argparse
+import json
+import re
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
 from loguru import logger
 
 from webcam_discovery.config import settings
-from webcam_discovery.schemas import CameraCandidate, CameraRecord
+from webcam_discovery.schemas import CameraCandidate
+from webcam_discovery.skills.search import QueryGenerationSkill, QueryGenerationInput
+
+
+# ── City lists by tier ────────────────────────────────────────────────────────
+
+TIER1_CITIES: list[str] = [
+    "New York City", "London", "Tokyo", "Paris", "Sydney", "Dubai", "Singapore",
+    "Hong Kong", "Los Angeles", "Chicago", "Toronto", "Berlin", "Amsterdam",
+    "Barcelona", "Rome", "Madrid", "São Paulo", "Mexico City", "Seoul", "Mumbai",
+    "Shanghai", "Beijing", "Istanbul", "Cairo", "Johannesburg", "Moscow",
+    "Vienna", "Prague", "Budapest", "Warsaw", "Zurich", "Stockholm", "Oslo",
+    "Copenhagen", "Helsinki", "Athens", "Lisbon", "Brussels", "Dublin",
+]
+
+TIER2_CITIES: list[str] = [
+    "Bangkok", "Kuala Lumpur", "Jakarta", "Manila", "Ho Chi Minh City",
+    "Taipei", "Osaka", "Kyoto", "Auckland", "Melbourne", "Brisbane",
+    "Vancouver", "Montreal", "São Paulo", "Buenos Aires", "Lima", "Bogota",
+    "Lagos", "Nairobi", "Cape Town", "Casablanca", "Tunis",
+    "Reykjavik", "Tallinn", "Riga", "Vilnius", "Ljubljana", "Zagreb",
+    "Sarajevo", "Skopje", "Tirana", "Baku", "Tbilisi", "Yerevan",
+    "Almaty", "Tashkent", "Bishkek", "Astana",
+    "Karachi", "Dhaka", "Colombo", "Kathmandu",
+    "Riyadh", "Doha", "Abu Dhabi", "Kuwait City", "Muscat", "Amman", "Beirut",
+    "Tel Aviv", "Baghdad", "Tehran",
+    "Accra", "Dakar", "Addis Ababa", "Dar es Salaam", "Kampala",
+]
+
+BLOCKED_DOMAINS: set[str] = {
+    "shodan.io",
+    "insecam.org",
+    "www.insecam.org",
+    "censys.io",
+    "zoomeye.org",
+    "fofa.info",
+}
+
+_CITY_TIERS: dict[int, list[str]] = {
+    1: TIER1_CITIES,
+    2: TIER1_CITIES + TIER2_CITIES,
+}
+
+
+def _domain_of(url: str) -> str:
+    """Extract domain from URL."""
+    return urlparse(url).netloc.lstrip("www.")
+
+
+def _is_blocked(url: str) -> bool:
+    """Check if URL belongs to a blocked domain."""
+    domain = _domain_of(url)
+    return domain in BLOCKED_DOMAINS or any(b in domain for b in BLOCKED_DOMAINS)
+
+
+async def _duckduckgo_search(client: httpx.AsyncClient, query: str) -> list[str]:
+    """
+    Execute a DuckDuckGo HTML search and return result URLs.
+
+    Uses DuckDuckGo's HTML endpoint (no API key required).
+    """
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    try:
+        resp = await client.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)",
+            "Accept": "text/html",
+        })
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        urls: list[str] = []
+        for a in soup.select("a.result__url, a.result__a, .result__url"):
+            href = a.get("href", "")
+            # DuckDuckGo wraps URLs in redirects
+            match = re.search(r"uddg=([^&]+)", href)
+            if match:
+                from urllib.parse import unquote
+                href = unquote(match.group(1))
+            if href.startswith("http") and not _is_blocked(href):
+                urls.append(href)
+        return urls
+    except Exception as exc:
+        logger.debug("DuckDuckGo search error for '{}': {}", query, exc)
+        return []
 
 
 class SearchAgent:
-    """Executes multi-language structured queries to discover cameras not indexed in known directories.
+    """Executes multi-language structured queries to discover cameras not in known directories."""
 
-    Claude Code: implement run() following the spec in AGENTS.md → SearchAgent section.
-    """
+    # Maximum queries to run per city to avoid rate limiting
+    MAX_QUERIES_PER_CITY = 3
+    # Concurrent search requests
+    CONCURRENCY = 5
 
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
         """
-        Executes multi-language structured queries to discover cameras not indexed in known directories.
+        Generate and execute search queries for each Tier-N city.
+
+        Args:
+            tier: City tier to search (1 = Tier 1 cities only).
 
         Returns:
-            list[CameraCandidate]
+            list[CameraCandidate] — camera candidates from search results.
         """
-        raise NotImplementedError(
-            "Claude Code: implement SearchAgent.run() — see AGENTS.md and SKILLS.md"
+        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
+        query_skill = QueryGenerationSkill()
+        candidates: list[CameraCandidate] = []
+
+        semaphore = asyncio.Semaphore(self.CONCURRENCY)
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=True,
+        ) as client:
+            tasks = [
+                self._search_city(client, city, query_skill, semaphore)
+                for city in cities
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for city, result in zip(cities, results):
+            if isinstance(result, Exception):
+                logger.warning("SearchAgent: error for city '{}': {}", city, result)
+            else:
+                candidates.extend(result)
+
+        # Deduplicate by URL
+        seen_urls: set[str] = set()
+        unique_candidates: list[CameraCandidate] = []
+        for c in candidates:
+            if c.url not in seen_urls:
+                seen_urls.add(c.url)
+                unique_candidates.append(c)
+
+        logger.info(
+            "SearchAgent: tier={} → {} unique candidates from {} cities",
+            tier, len(unique_candidates), len(cities),
         )
+        return unique_candidates
+
+    async def _search_city(
+        self,
+        client: httpx.AsyncClient,
+        city: str,
+        query_skill: QueryGenerationSkill,
+        semaphore: asyncio.Semaphore,
+    ) -> list[CameraCandidate]:
+        """Generate queries for one city and search DuckDuckGo."""
+        output = query_skill.run(QueryGenerationInput(city=city, language_codes=["en"]))
+        # Limit queries per city to avoid rate limiting
+        queries = output.queries[: self.MAX_QUERIES_PER_CITY]
+
+        city_candidates: list[CameraCandidate] = []
+        for query in queries:
+            async with semaphore:
+                urls = await _duckduckgo_search(client, query)
+                await asyncio.sleep(0.5)  # polite delay between requests
+
+            for url in urls:
+                if _is_blocked(url):
+                    continue
+                city_candidates.append(CameraCandidate(
+                    url=url,
+                    city=city,
+                    source_directory="search:" + _domain_of(url),
+                    source_refs=[f"query:{query}"],
+                    notes=f"search_query:{query[:80]}",
+                ))
+
+        logger.debug("SearchAgent: {} candidates for '{}'", len(city_candidates), city)
+        return city_candidates
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Executes multi-language structured queries to discover cameras not indexed in known directories.")
-    parser.add_argument("--tier", type=int, default=1)
+    """CLI entry point for search agent."""
+    parser = argparse.ArgumentParser(
+        description="Discover cameras via structured search queries."
+    )
+    parser.add_argument("--tier", type=int, default=1, help="City tier to search (default: 1)")
+    parser.add_argument(
+        "--output", type=Path,
+        default=settings.candidates_dir / "search_candidates.jsonl",
+        help="Output path for search_candidates.jsonl",
+    )
     args = parser.parse_args()
-    asyncio.run(SearchAgent().run(**vars(args)))
+
+    candidates = asyncio.run(SearchAgent().run(tier=args.tier))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text("\n".join(c.model_dump_json() for c in candidates))
+    logger.info("SearchAgent: {} candidates → {}", len(candidates), args.output)
 
 
 if __name__ == "__main__":
