@@ -1,0 +1,1 @@
+"""Webcam discovery skills library."""
