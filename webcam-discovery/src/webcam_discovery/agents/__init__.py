@@ -1,1 +1,0 @@
-"""Webcam discovery agents."""
