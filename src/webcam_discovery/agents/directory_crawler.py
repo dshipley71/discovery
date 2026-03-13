@@ -2,106 +2,264 @@
 """
 directory_crawler.py — Traverses public webcam directories and extracts camera candidates.
 Part of the Public Webcam Discovery System.
+
+Sources are loaded at runtime from SOURCES.md (project root). The file is the
+canonical allow/block registry; this module never hardcodes source lists.
+
+Pipeline output: candidates/candidates.jsonl — one CameraCandidate JSON per line,
+with `url` set to the most direct feed link found (direct stream > embed > page URL).
 """
 from __future__ import annotations
 
 import asyncio
 import argparse
-import json
+import re
 from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
 
 from loguru import logger
+from pydantic import BaseModel
 
 from webcam_discovery.config import settings
 from webcam_discovery.schemas import CameraCandidate
-from webcam_discovery.skills.traversal import DirectoryTraversalSkill, TraversalInput
+from webcam_discovery.skills.traversal import (
+    DirectoryTraversalSkill,
+    FeedExtractionSkill,
+    FeedExtractionInput,
+    TraversalInput,
+)
 from webcam_discovery.skills.validation import RobotsPolicySkill, RobotsPolicyInput
 
 
-# ── Source lists by tier ───────────────────────────────────────────────────────
+# ── SOURCES.md parser ─────────────────────────────────────────────────────────
 
-TIER1_SOURCES: list[str] = [
-    "https://www.webcamtaxi.com/en/",
-    "https://www.skylinewebcams.com/",
-    "https://www.earthcam.com/",
-    "https://windy.com/webcams",
-    "https://www.insecam.com/",  # only public/non-auth feeds
-]
+class SourcesRegistry:
+    """
+    Parses SOURCES.md and provides source URLs by tier and a set of blocked domains.
 
-TIER2_SOURCES: list[str] = [
-    "https://www.webcamgalore.com/",
-    "https://www.worldcam.eu/",
-    "https://camvista.com/",
-    "https://www.airportwebcams.net/",
-    "https://www.portwebcams.net/",
-]
+    Searches for SOURCES.md first in the current working directory, then relative
+    to this module file (project root). Falls back to an empty registry with a
+    warning if the file cannot be found.
+    """
 
-BLOCKED_SOURCES: set[str] = {
-    "shodan.io",
-    "insecam.org",
-    "www.insecam.org",
-}
+    _URL_RE        = re.compile(r'\|\s*(https?://[^\s|]+)\s*\|')
+    _TIER_RE       = re.compile(r'###\s+Tier\s+(\d+)', re.IGNORECASE)
+    _SECTION_RE    = re.compile(r'^##\s+Section\s+(\d+)[^\n]*\n', re.IGNORECASE | re.MULTILINE)
+    _BOLD_CELL_RE  = re.compile(r'^\|\s*\*\*([^*|]+)\*\*', re.MULTILINE)
+    _DOMAIN_RE     = re.compile(r'^[\w.-]+\.[a-zA-Z]{2,}$')
 
-_SOURCE_TIERS: dict[int, list[str]] = {
-    1: TIER1_SOURCES,
-    2: TIER1_SOURCES + TIER2_SOURCES,
-}
+    # Domains that must always be blocked regardless of SOURCES.md parse quality.
+    _ALWAYS_BLOCKED: frozenset[str] = frozenset({
+        "shodan.io",
+        "censys.io",
+        "insecam.org",
+        "insecam.com",
+        "opentopia.com",
+        "camhacker.com",
+        "zoomeye.org",
+        "fofa.info",
+        "binaryedge.io",
+        "greynoise.io",
+    })
 
+    def __init__(self, sources_path: Optional[Path] = None) -> None:
+        """
+        Initialise registry.
+
+        Args:
+            sources_path: Explicit path to SOURCES.md. Auto-discovered when None.
+        """
+        if sources_path is None:
+            for candidate in [
+                Path("SOURCES.md"),
+                Path(__file__).parents[3] / "SOURCES.md",
+            ]:
+                if candidate.exists():
+                    sources_path = candidate
+                    break
+
+        self._path = sources_path
+        self._tier_sources: dict[int, list[str]] = {}
+        self._blocked_domains: set[str] = set(self._ALWAYS_BLOCKED)
+
+        if self._path and self._path.exists():
+            self._parse()
+        else:
+            logger.warning(
+                "SourcesRegistry: SOURCES.md not found — source lists will be empty. "
+                "Run from the project root or pass sources_path explicitly."
+            )
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    def sources_for_tier(self, max_tier: int) -> list[str]:
+        """
+        Return deduplicated source URLs for tiers 1 through max_tier (inclusive).
+
+        Args:
+            max_tier: Highest tier to include (1 = Tier 1 only, 5 = all tiers).
+
+        Returns:
+            Ordered list of source URLs, higher-priority tiers first.
+        """
+        seen: set[str] = set()
+        result: list[str] = []
+        for tier in range(1, max_tier + 1):
+            for url in self._tier_sources.get(tier, []):
+                if url not in seen:
+                    seen.add(url)
+                    result.append(url)
+        return result
+
+    @property
+    def blocked_domains(self) -> frozenset[str]:
+        """Immutable set of domain strings that must never be crawled."""
+        return frozenset(self._blocked_domains)
+
+    def tier_counts(self) -> dict[int, int]:
+        """Return {tier: source_count} for diagnostics."""
+        return {t: len(v) for t, v in sorted(self._tier_sources.items())}
+
+    # ── Parsing helpers ───────────────────────────────────────────────────────
+
+    def _parse(self) -> None:
+        """Read and parse SOURCES.md into tier_sources and blocked_domains."""
+        text = self._path.read_text(encoding="utf-8")
+
+        # Split text at "## Section N" headings
+        parts = self._SECTION_RE.split(text)
+        # parts layout: [preamble, "1", section1_body, "2", section2_body, ...]
+        sections: dict[str, str] = {}
+        for i in range(1, len(parts), 2):
+            sections[parts[i].strip()] = parts[i + 1] if i + 1 < len(parts) else ""
+
+        if "1" in sections:
+            self._tier_sources = self._parse_tiers(sections["1"])
+        if "2" in sections:
+            self._blocked_domains.update(self._parse_blocked_domains(sections["2"]))
+
+        logger.info(
+            "SourcesRegistry: loaded tiers {} ({} total sources), {} blocked domains from {}",
+            dict(self.tier_counts()),
+            sum(self.tier_counts().values()),
+            len(self._blocked_domains),
+            self._path,
+        )
+
+    def _parse_tiers(self, content: str) -> dict[int, list[str]]:
+        """Extract {tier: [url, ...]} from Section 1 content."""
+        result: dict[int, list[str]] = {}
+        current_tier = 0
+        for line in content.splitlines():
+            tier_match = self._TIER_RE.search(line)
+            if tier_match:
+                current_tier = int(tier_match.group(1))
+                result.setdefault(current_tier, [])
+            elif current_tier > 0:
+                url_match = self._URL_RE.search(line)
+                if url_match:
+                    url = url_match.group(1).rstrip("/").rstrip(")").strip()
+                    if url not in result[current_tier]:
+                        result[current_tier].append(url)
+        return result
+
+    def _parse_blocked_domains(self, content: str) -> set[str]:
+        """Extract domain-like strings from bold source names in Section 2."""
+        blocked: set[str] = set()
+        for match in self._BOLD_CELL_RE.finditer(content):
+            name = match.group(1).strip().lower()
+            first_word = name.split()[0].rstrip(".,;")
+            if self._DOMAIN_RE.match(first_word):
+                blocked.add(first_word)
+        return blocked
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _domain_of(url: str) -> str:
-    """Extract domain from URL."""
-    from urllib.parse import urlparse
+    """Extract netloc from URL, stripping leading 'www.'."""
     return urlparse(url).netloc.lstrip("www.")
 
 
-class DirectoryAgent:
-    """Traverses public webcam directories and extracts camera candidates.
+# ── DirectoryAgent ────────────────────────────────────────────────────────────
 
-    Checks robots.txt before crawling each source.
-    Runs traversal on allowed sources in batches of 3.
-    Deduplicates results by URL.
+class DirectoryAgent:
+    """
+    Traverses all public webcam directories listed in SOURCES.md and produces
+    a list of CameraCandidate objects with the most direct feed URL available.
+
+    Execution steps
+    ---------------
+    1. Parse SOURCES.md via SourcesRegistry to get source URLs and blocked domains.
+    2. Filter blocked domains; check robots.txt for each remaining source.
+    3. Traverse each allowed source (batched) via DirectoryTraversalSkill.
+    4. Run FeedExtractionSkill on each candidate page to resolve direct stream URLs.
+    5. Deduplicate by URL and return.
     """
 
-    BATCH_SIZE = 3
+    BATCH_SIZE        = 3   # parallel traversal tasks
+    EXTRACT_CONCURRENCY = 10  # parallel feed-extraction requests
 
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
         """
-        Traverse webcam directories for the given tier and return candidates.
+        Traverse webcam directories up to the given tier and return candidates.
 
         Args:
-            tier: Source tier to crawl (1 = highest priority sources only).
+            tier: Maximum tier to crawl (1 = Tier 1 only, 5 = all tiers 1–5).
 
         Returns:
-            list[CameraCandidate] — deduplicated camera candidates.
+            Deduplicated list of CameraCandidate objects with resolved feed URLs.
         """
-        sources = _SOURCE_TIERS.get(tier, TIER1_SOURCES)
-        robots_skill = RobotsPolicySkill()
-        traversal_skill = DirectoryTraversalSkill()
+        registry = SourcesRegistry()
+        sources = registry.sources_for_tier(tier)
+        blocked = registry.blocked_domains
 
-        # Check robots.txt for each source
-        allowed_sources: list[str] = []
-        for source_url in sources:
-            domain = _domain_of(source_url)
-            if domain in BLOCKED_SOURCES:
+        if not sources:
+            logger.warning("DirectoryAgent: no sources loaded for tier={}", tier)
+            return []
+
+        logger.info(
+            "DirectoryAgent: tier={} → {} sources across {} tier(s)",
+            tier, len(sources), tier,
+        )
+
+        # ── Step 1: filter blocked domains ────────────────────────────────────
+        filtered: list[str] = []
+        for url in sources:
+            domain = _domain_of(url)
+            if any(domain == b or domain.endswith("." + b) for b in blocked):
                 logger.info("DirectoryAgent: skipping blocked source {}", domain)
-                continue
+            else:
+                filtered.append(url)
+
+        # ── Step 2: robots.txt checks ─────────────────────────────────────────
+        robots_skill = RobotsPolicySkill()
+        allowed_sources: list[str] = []
+        for source_url in filtered:
+            domain = _domain_of(source_url)
             try:
-                robots_result = await robots_skill.run(RobotsPolicyInput(domain=domain))
-                if robots_result.allowed:
+                result = await robots_skill.run(RobotsPolicyInput(domain=domain))
+                if result.allowed:
                     allowed_sources.append(source_url)
                     logger.debug("DirectoryAgent: robots.txt allows {}", domain)
                 else:
                     logger.info("DirectoryAgent: robots.txt disallows {} — skipping", domain)
             except Exception as exc:
                 logger.warning("DirectoryAgent: robots check error for {}: {}", domain, exc)
-                allowed_sources.append(source_url)  # default allow on error
+                allowed_sources.append(source_url)  # default-allow on error
 
-        logger.info("DirectoryAgent: {} of {} sources allowed by robots.txt", len(allowed_sources), len(sources))
+        logger.info(
+            "DirectoryAgent: {}/{} sources allowed after robots.txt checks",
+            len(allowed_sources), len(filtered),
+        )
 
-        # Traverse in batches of 3
-        all_candidates: list[CameraCandidate] = []
+        # ── Step 3: traverse directories ──────────────────────────────────────
+        traversal_skill = DirectoryTraversalSkill()
+        raw_candidates: list[CameraCandidate] = []
+
         for i in range(0, len(allowed_sources), self.BATCH_SIZE):
-            batch = allowed_sources[i:i + self.BATCH_SIZE]
+            batch = allowed_sources[i : i + self.BATCH_SIZE]
             tasks = [
                 traversal_skill.run(TraversalInput(base_url=url, max_depth=2))
                 for url in batch
@@ -109,44 +267,109 @@ class DirectoryAgent:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result, source_url in zip(results, batch):
                 if isinstance(result, Exception):
-                    logger.warning("DirectoryAgent: traversal error for {}: {}", source_url, result)
+                    logger.warning(
+                        "DirectoryAgent: traversal error for {}: {}", source_url, result
+                    )
                 else:
-                    all_candidates.extend(result.candidates)
+                    raw_candidates.extend(result.candidates)
                     logger.debug(
                         "DirectoryAgent: {} candidates from {}",
                         len(result.candidates), source_url,
                     )
 
-        # Deduplicate by URL
+        logger.info(
+            "DirectoryAgent: traversal complete — {} raw candidates before dedup",
+            len(raw_candidates),
+        )
+
+        # ── Step 4: resolve direct feed URLs via FeedExtractionSkill ──────────
+        resolved = await self._resolve_feed_urls(raw_candidates)
+
+        # ── Step 5: deduplicate by URL ────────────────────────────────────────
         seen_urls: set[str] = set()
-        unique_candidates: list[CameraCandidate] = []
-        for c in all_candidates:
+        unique: list[CameraCandidate] = []
+        for c in resolved:
             if c.url not in seen_urls:
                 seen_urls.add(c.url)
-                unique_candidates.append(c)
+                unique.append(c)
 
         logger.info(
-            "DirectoryAgent: tier={} → {} unique candidates from {} sources",
-            tier, len(unique_candidates), len(allowed_sources),
+            "DirectoryAgent: tier={} → {} unique candidates (from {} sources)",
+            tier, len(unique), len(allowed_sources),
         )
-        return unique_candidates
+        return unique
 
+    async def _resolve_feed_urls(
+        self, candidates: list[CameraCandidate]
+    ) -> list[CameraCandidate]:
+        """
+        Run FeedExtractionSkill on every candidate page to get the most direct
+        stream URL. Updates candidate.url in place; original page URL is
+        preserved in source_refs.
+
+        Uses a semaphore to cap concurrent HTTP requests at EXTRACT_CONCURRENCY.
+        """
+        skill = FeedExtractionSkill()
+        sem = asyncio.Semaphore(self.EXTRACT_CONCURRENCY)
+
+        async def _extract(candidate: CameraCandidate) -> CameraCandidate:
+            page_url = candidate.url
+            async with sem:
+                try:
+                    feed = await skill.run(FeedExtractionInput(page_url=page_url))
+                except Exception as exc:
+                    logger.warning(
+                        "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
+                    )
+                    return candidate
+
+            # Choose the most direct URL available
+            best_url = feed.direct_stream_url or feed.embed_url or page_url
+            if best_url != page_url:
+                logger.debug(
+                    "DirectoryAgent: resolved {} → {}", page_url, best_url
+                )
+                # Preserve original page URL in source_refs
+                refs = list(candidate.source_refs)
+                if page_url not in refs:
+                    refs.append(page_url)
+                return candidate.model_copy(update={"url": best_url, "source_refs": refs})
+            return candidate
+
+        resolved = await asyncio.gather(*[_extract(c) for c in candidates])
+        return list(resolved)
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
-    """CLI entry point for directory crawler."""
-    parser = argparse.ArgumentParser(description="Traverse webcam directories and extract candidates.")
-    parser.add_argument("--tier", type=int, default=1, help="Source tier to crawl (default: 1)")
+    """CLI entry point for the directory crawler (wcd-discover)."""
+    parser = argparse.ArgumentParser(
+        description="Traverse public webcam directories and write candidates.jsonl."
+    )
+    parser.add_argument(
+        "--tier", type=int, default=1,
+        help="Maximum source tier to crawl (1–5, default: 1). "
+             "Tier N includes all sources from tiers 1 through N.",
+    )
     parser.add_argument(
         "--output", type=Path,
         default=settings.candidates_dir / "candidates.jsonl",
-        help="Output path for candidates.jsonl",
+        help="Output path for candidates.jsonl (default: candidates/candidates.jsonl)",
     )
     args = parser.parse_args()
 
     candidates = asyncio.run(DirectoryAgent().run(tier=args.tier))
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text("\n".join(c.model_dump_json() for c in candidates))
-    logger.info("DirectoryAgent: {} candidates → {}", len(candidates), args.output)
+    args.output.write_text(
+        "\n".join(c.model_dump_json() for c in candidates),
+        encoding="utf-8",
+    )
+    logger.info(
+        "DirectoryAgent: wrote {} candidates → {}",
+        len(candidates), args.output,
+    )
 
 
 if __name__ == "__main__":
