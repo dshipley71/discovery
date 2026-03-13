@@ -26,7 +26,6 @@ These are high-yield aggregators with structured, city-indexed, open-access list
 | **EarthCam** | https://www.earthcam.com | Major landmarks globally; some feeds free without login | HLS, iframe |
 | **Roundshot** | https://www.roundshot.com/live | Panoramic city and mountain cams; public embeds | MJPEG, iframe |
 | **Panomax** | https://www.panomax.com | Alpine, city, and resort panoramas; free access | MJPEG, iframe |
-| **Webcam.nl** | https://www.webcam.nl | Netherlands + broader Europe; long-running directory | iframe, MJPEG |
 | **WorldCam** | https://worldcam.eu | Global city and landmark cams; no auth required | iframe, MJPEG |
 | **WorldStreamView** | https://worldstreamview.com | Global live stream directory; public access | HLS, iframe |
 | **WebCamera24** | https://webcamera24.com | Global webcam directory; city-indexed; no login | iframe, MJPEG |
@@ -49,9 +48,7 @@ High-yield for specific regions or camera types. Search after Tier 1 for relevan
 | **Webcam-Galore** | https://www.webcam-galore.com | Europe-wide | Large directory, mixed quality |
 | **MeteoBlue Webcams** | https://www.meteoblue.com/webcams | Global/Europe | Weather-context cams, open access |
 | **Feratel Webcams** | https://www.feratel.com | Alps/Central Europe | High-quality alpine and resort cams |
-| **Foto-Webcam DE** | https://www.foto-webcam.de | Germany | German city and landscape cams |
 | **Webcams.travel** | https://www.webcams.travel | Europe-focused | Tourism-oriented, city-indexed |
-| **foto-webcam.eu** | https://www.foto-webcam.eu | European focus; direct image/MJPEG feeds; no auth | static images |
 
 #### Oceania
 | Source | URL | Coverage | Notes |
@@ -238,6 +235,7 @@ These sources must never be searched, scraped, or used as a basis for catalog en
 | **Opentopia.com** | Same as Insecam — aggregates unintentionally exposed private cameras |
 | **Camhacker.com** | Exploits exposed private devices; excluded entirely |
 | **Any site that lists "hacked cameras"** | Entirely excluded regardless of phrasing |
+| **foto-webcam.eu** | https://www.foto-webcam.eu | image/MJPEG feeds |
 
 ---
 
