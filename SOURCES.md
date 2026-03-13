@@ -27,6 +27,14 @@ These are high-yield aggregators with structured, city-indexed, open-access list
 | **Roundshot** | https://www.roundshot.com/live | Panoramic city and mountain cams; public embeds | MJPEG, iframe |
 | **Panomax** | https://www.panomax.com | Alpine, city, and resort panoramas; free access | MJPEG, iframe |
 | **Webcam.nl** | https://www.webcam.nl | Netherlands + broader Europe; long-running directory | iframe, MJPEG |
+| **WorldCam** | https://worldcam.eu | Global city and landmark cams; no auth required | iframe, MJPEG |
+| **WorldStreamView** | https://worldstreamview.com | Global live stream directory; public access | HLS, iframe |
+| **WebCamera24** | https://webcamera24.com | Global webcam directory; city-indexed; no login | iframe, MJPEG |
+| **WorldCams.tv** | https://worldcams.tv | Global city, nature, and landmark cams; free access | HLS, iframe |
+| **IPLiveCams** | https://iplivecams.com | Global IP camera directory; publicly accessible feeds | MJPEG, HLS |
+| **LiveBeaches** | https://livebeaches.com | Global beach and coastal cams; no auth | HLS, iframe |
+| **Camscape** | https://camscape.com | Global webcam directory; city and nature cams | iframe, MJPEG |
+| **EarthTV** | https://earthtv.com | Global landmark and city cams; high-quality public feeds | HLS, iframe |
 
 ---
 
