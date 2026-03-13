@@ -11,10 +11,11 @@ Geo-enrichment  — concurrent.futures.ThreadPoolExecutor(settings.geo_thread_wo
                   via asyncio.run_in_executor; geopy calls are synchronous and
                   rate-limited per-domain (1 req/s), so threads allow multiple
                   lookups to run in parallel without blocking the event loop.
-Coordinates     — Optional; cameras without resolvable coordinates are included
-                  with latitude=None/longitude=None and notes="location_unknown".
-                  CatalogAgent may filter these from GeoJSON but they are
-                  preserved in validated.jsonl for future enrichment.
+Coordinates     — GeoEnrichmentSkill tries four strategies: city+country,
+                  label text, IP geolocation of hostname, country center.
+                  Cameras that survive all fallbacks with no coordinates are
+                  included with latitude=None/longitude=None and
+                  notes="location_unknown" for manual review.
 """
 from __future__ import annotations
 
@@ -74,7 +75,7 @@ class ValidationAgent:
     3. Filter by settings.min_legitimacy.
     4. Classify feed type via FeedTypeClassificationSkill (synchronous).
     5. Geo-enrich in parallel via ThreadPoolExecutor (synchronous geopy in threads).
-    6. Build CameraRecord; cameras without coordinates get latitude=None/longitude=None.
+    6. Build CameraRecord; cameras where all geo fallbacks fail get latitude=None/longitude=None.
     """
 
     async def run(
@@ -297,25 +298,28 @@ class ValidationAgent:
         a ThreadPoolExecutor.  Runs a fresh event loop per thread so that
         the async geopy interface works without touching the main loop.
 
-        Returns the GeoEnrichmentOutput or None if city is unknown / lookup fails.
-        """
-        city = candidate.city
-        if not city or city.lower() in ("unknown", ""):
-            return None
+        Geocoding fallback order (handled by GeoEnrichmentSkill):
+        1. city + country via Nominatim
+        2. label text via Nominatim
+        3. IP geolocation of the camera hostname via ip-api.com
+        4. country-center via Nominatim
 
+        Returns GeoEnrichmentOutput (may have None coords if all strategies fail).
+        """
         import asyncio as _asyncio
         loop = _asyncio.new_event_loop()
         try:
             return loop.run_until_complete(
                 skill.run(GeoEnrichmentInput(
-                    city=city,
+                    city=candidate.city,
                     country=candidate.country,
-                    label=candidate.label or city,
+                    label=candidate.label,
+                    url=candidate.url,
                 ))
             )
         except Exception as exc:
             logger.debug(
-                "ValidationAgent: geo lookup failed for city='{}': {}", city, exc
+                "ValidationAgent: geo lookup failed for '{}': {}", candidate.url, exc
             )
             return None
         finally:
