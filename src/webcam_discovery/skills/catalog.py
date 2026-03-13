@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+import socket
+
+import httpx
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from loguru import logger
@@ -259,9 +262,10 @@ class DeduplicationOutput(BaseModel):
 class GeoEnrichmentInput(BaseModel):
     """Input for geo enrichment skill."""
 
-    city: str
+    city: Optional[str] = None
     country: Optional[str] = None
     label: Optional[str] = None
+    url: Optional[str] = None  # camera URL; used as last-resort IP geolocation source
 
 
 class GeoEnrichmentOutput(BaseModel):
@@ -383,7 +387,18 @@ class DeduplicationSkill:
 # ── GeoEnrichmentSkill ─────────────────────────────────────────────────────────
 
 class GeoEnrichmentSkill:
-    """Attach geographic metadata to camera records lacking coordinates."""
+    """
+    Attach geographic metadata to camera records lacking coordinates.
+
+    Fallback chain (stops at first successful result):
+    1. City + country geocoding via Nominatim
+    2. Label text geocoding (may contain place names like "Eiffel Tower Paris")
+    3. IP geolocation of the camera hostname via ip-api.com
+    4. Country-center geocoding when only country is known
+    """
+
+    _IP_API_URL = "http://ip-api.com/json/{host}"
+    _IP_API_FIELDS = "status,lat,lon,country,regionName,city"
 
     def __init__(self) -> None:
         """Initialize geocoder with a polite user-agent."""
@@ -392,70 +407,151 @@ class GeoEnrichmentSkill:
 
     async def run(self, input: GeoEnrichmentInput) -> GeoEnrichmentOutput:
         """
-        Geocode city to lat/lon and enrich with region/country/continent.
+        Resolve coordinates via a multi-strategy fallback chain.
 
         Args:
-            input: GeoEnrichmentInput with city, optional country and label.
+            input: GeoEnrichmentInput with any combination of city, country, label, url.
 
         Returns:
-            GeoEnrichmentOutput with coordinates and geographic metadata.
+            GeoEnrichmentOutput with coordinates and geographic metadata, or empty
+            GeoEnrichmentOutput if all strategies fail.
         """
-        cache_key = f"{input.city}|{input.country or ''}"
-        if cache_key in self._cache:
-            result = self._cache[cache_key]
-            return result if result is not None else GeoEnrichmentOutput()
+        city = (input.city or "").strip()
+        country = (input.country or "").strip()
+        label = (input.label or "").strip()
 
-        query = f"{input.city}, {input.country}" if input.country else input.city
+        # Strategy 1: city + country
+        if city and city.lower() not in ("unknown", ""):
+            query = f"{city}, {country}" if country else city
+            result = await self._geocode_nominatim(query, cache_key=f"city:{city}|{country}")
+            if result.latitude is not None:
+                return result
+
+        # Strategy 2: label text (may encode a landmark or place name)
+        if label and label.lower() not in ("unknown", ""):
+            result = await self._geocode_nominatim(label, cache_key=f"label:{label}")
+            if result.latitude is not None:
+                return result
+
+        # Strategy 3: IP geolocation from camera URL hostname
+        if input.url:
+            result = await self._ip_geolocate(input.url)
+            if result.latitude is not None:
+                return result
+
+        # Strategy 4: country center
+        if country and country.lower() not in ("unknown", ""):
+            result = await self._geocode_nominatim(country, cache_key=f"country:{country}")
+            if result.latitude is not None:
+                return result
+
+        return GeoEnrichmentOutput()
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    async def _geocode_nominatim(
+        self, query: str, cache_key: Optional[str] = None
+    ) -> GeoEnrichmentOutput:
+        """Geocode a free-text query via Nominatim; results are cached."""
+        key = cache_key or query
+        if key in self._cache:
+            cached = self._cache[key]
+            return cached if cached is not None else GeoEnrichmentOutput()
 
         try:
-            # Run synchronous geopy call in a thread to avoid blocking the event loop
             loop = asyncio.get_event_loop()
             location = await loop.run_in_executor(
                 None,
-                lambda: self._geocoder.geocode(query, exactly_one=True, addressdetails=True, language="en"),
+                lambda: self._geocoder.geocode(
+                    query, exactly_one=True, addressdetails=True, language="en"
+                ),
             )
         except (GeocoderTimedOut, GeocoderUnavailable) as exc:
             logger.warning("GeoEnrichmentSkill geocoder error for '{}': {}", query, exc)
-            self._cache[cache_key] = None
+            self._cache[key] = None
             return GeoEnrichmentOutput()
         except Exception as exc:
             logger.warning("GeoEnrichmentSkill unexpected error for '{}': {}", query, exc)
-            self._cache[cache_key] = None
+            self._cache[key] = None
             return GeoEnrichmentOutput()
 
         if location is None:
-            logger.debug("GeoEnrichmentSkill: no result for '{}'", query)
-            self._cache[cache_key] = None
+            logger.debug("GeoEnrichmentSkill: no Nominatim result for '{}'", query)
+            self._cache[key] = None
             return GeoEnrichmentOutput()
 
         address = location.raw.get("address", {})
-        country = (
-            address.get("country")
-            or input.country
-            or ""
-        )
+        found_country = address.get("country") or ""
         region = (
             address.get("state")
             or address.get("region")
             or address.get("county")
             or None
         )
-        continent = _country_to_continent(country)
-
         result = GeoEnrichmentOutput(
             latitude=location.latitude,
             longitude=location.longitude,
-            country=country,
+            country=found_country,
             region=region,
-            continent=continent,
-            confidence="high" if country else "medium",
+            continent=_country_to_continent(found_country),
+            confidence="high" if found_country else "medium",
         )
-        self._cache[cache_key] = result
+        self._cache[key] = result
         logger.debug(
-            "GeoEnrichmentSkill: '{}' → ({:.4f}, {:.4f}) {}",
-            query, result.latitude, result.longitude, country,
+            "GeoEnrichmentSkill: Nominatim '{}' → ({:.4f}, {:.4f}) {}",
+            query, result.latitude, result.longitude, found_country,
         )
         return result
+
+    async def _ip_geolocate(self, url: str) -> GeoEnrichmentOutput:
+        """
+        Resolve camera hostname to approximate coordinates via ip-api.com.
+
+        ip-api.com accepts both IP addresses and hostnames, returns lat/lon for
+        the server's registered location — a good proxy for the camera location.
+        Confidence is set to 'low' since ISP routing may not match camera placement.
+        """
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            if not host:
+                return GeoEnrichmentOutput()
+
+            cache_key = f"ip:{host}"
+            if cache_key in self._cache:
+                cached = self._cache[cache_key]
+                return cached if cached is not None else GeoEnrichmentOutput()
+
+            api_url = self._IP_API_URL.format(host=host)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.get(api_url, params={"fields": self._IP_API_FIELDS})
+                data = resp.json()
+
+            if data.get("status") != "success":
+                logger.debug("GeoEnrichmentSkill: ip-api no result for '{}'", host)
+                self._cache[cache_key] = None
+                return GeoEnrichmentOutput()
+
+            country = data.get("country") or ""
+            result = GeoEnrichmentOutput(
+                latitude=data.get("lat"),
+                longitude=data.get("lon"),
+                country=country,
+                region=data.get("regionName") or None,
+                continent=_country_to_continent(country),
+                confidence="low",
+            )
+            self._cache[cache_key] = result
+            logger.debug(
+                "GeoEnrichmentSkill: IP geo '{}' → ({:.4f}, {:.4f}) {} [{}]",
+                host, result.latitude, result.longitude, country,
+                data.get("city", ""),
+            )
+            return result
+
+        except Exception as exc:
+            logger.debug("GeoEnrichmentSkill: IP geo failed for '{}': {}", url, exc)
+            return GeoEnrichmentOutput()
 
 
 # ── GeoJSONExportSkill ─────────────────────────────────────────────────────────

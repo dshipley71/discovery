@@ -2,12 +2,27 @@
 """
 validator.py — HTTP validation, feed classification, and legitimacy scoring.
 Part of the Public Webcam Discovery System.
+
+Performance model
+-----------------
+HTTP probing    — asyncio with Semaphore(settings.validation_concurrency).
+                  FeedValidationSkill handles its own semaphore internally.
+Geo-enrichment  — concurrent.futures.ThreadPoolExecutor(settings.geo_thread_workers)
+                  via asyncio.run_in_executor; geopy calls are synchronous and
+                  rate-limited per-domain (1 req/s), so threads allow multiple
+                  lookups to run in parallel without blocking the event loop.
+Coordinates     — GeoEnrichmentSkill tries four strategies: city+country,
+                  label text, IP geolocation of hostname, country center.
+                  Cameras that survive all fallbacks with no coordinates are
+                  included with latitude=None/longitude=None and
+                  notes="location_unknown" for manual review.
 """
 from __future__ import annotations
 
 import asyncio
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
@@ -27,32 +42,40 @@ from webcam_discovery.skills.validation import (
 from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput
 
 
-# Legitimacy score ordering (higher index = higher legitimacy)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 _LEGIT_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
-_MIN_LEGIT_DEFAULT = "medium"
 
 
-def _legit_meets_minimum(score: LegitimacyScore, minimum: str) -> bool:
+def _legit_ok(score: LegitimacyScore, minimum: str) -> bool:
     """Return True if score meets or exceeds the minimum threshold."""
-    return _LEGIT_ORDER.get(score, 0) >= _LEGIT_ORDER.get(minimum, 1)
+    return _LEGIT_ORDER.get(score, 0) >= _LEGIT_ORDER.get(minimum, 0)
 
 
 def _domain_of(url: str) -> str:
-    """Extract domain from URL."""
     return urlparse(url).netloc.lstrip("www.")
 
 
 def _make_slug(city: str, label: str) -> str:
-    """Generate a stable ID slug from city and label."""
-    raw = f"{city} {label}"
-    return slugify(raw, max_length=80, word_boundary=True, separator="-")
+    """Generate a stable ID slug from city + label."""
+    return slugify(f"{city} {label}", max_length=80, word_boundary=True, separator="-")
 
+
+# ── ValidationAgent ───────────────────────────────────────────────────────────
 
 class ValidationAgent:
     """
-    Validates CameraCandidate objects via HTTP HEAD/GET checks.
-    Classifies feed types and assigns legitimacy scores.
-    Rejects low-scoring records; flags medium records for review.
+    Validates CameraCandidate objects via HTTP checks, classifies feed types,
+    and optionally geo-enriches with lat/lon.
+
+    Processing steps
+    ----------------
+    1. Group by domain; check robots.txt concurrently (one task per domain).
+    2. Probe all allowed URLs via FeedValidationSkill (semaphore-limited async).
+    3. Filter by settings.min_legitimacy.
+    4. Classify feed type via FeedTypeClassificationSkill (synchronous).
+    5. Geo-enrich in parallel via ThreadPoolExecutor (synchronous geopy in threads).
+    6. Build CameraRecord; cameras where all geo fallbacks fail get latitude=None/longitude=None.
     """
 
     async def run(
@@ -61,16 +84,15 @@ class ValidationAgent:
         input_file: Optional[Path] = None,
     ) -> list[CameraRecord]:
         """
-        Validate candidates and return verified CameraRecord objects.
+        Validate candidates and return CameraRecord objects.
 
         Args:
-            candidates:  List of CameraCandidate objects from discovery agents.
-            input_file:  Optional JSONL file path (used when running as CLI).
+            candidates:  CameraCandidate list from discovery agents.
+            input_file:  Optional JSONL path; loaded when candidates is empty.
 
         Returns:
-            list[CameraRecord] — validated, scored records ready for CatalogAgent.
+            list[CameraRecord] ready for CatalogAgent.
         """
-        # Load from file if provided and candidates is empty
         if input_file and not candidates:
             candidates = [
                 CameraCandidate(**json.loads(line))
@@ -82,118 +104,127 @@ class ValidationAgent:
             logger.warning("ValidationAgent: no candidates to validate")
             return []
 
-        logger.info("ValidationAgent: validating {} candidates", len(candidates))
+        logger.info("ValidationAgent: {} candidates received", len(candidates))
 
+        # ── Step 1: robots.txt (per-domain, cached, concurrent) ───────────────
         robots_skill = RobotsPolicySkill()
-        feed_skill = FeedValidationSkill()
-        type_skill = FeedTypeClassificationSkill()
-        geo_skill = GeoEnrichmentSkill()
-
-        min_legit = settings.min_legitimacy
-
-        # Group candidates by domain for robots.txt check
-        domain_candidates: dict[str, list[CameraCandidate]] = {}
+        domain_map: dict[str, list[CameraCandidate]] = {}
         for c in candidates:
-            domain = _domain_of(c.url)
-            domain_candidates.setdefault(domain, []).append(c)
+            domain_map.setdefault(_domain_of(c.url), []).append(c)
 
-        # Check robots.txt per domain
-        allowed_candidates: list[CameraCandidate] = []
-        for domain, domain_cands in domain_candidates.items():
-            try:
-                robots_result = await robots_skill.run(RobotsPolicyInput(domain=domain))
-                if robots_result.allowed:
-                    allowed_candidates.extend(domain_cands)
-                else:
-                    logger.info(
-                        "ValidationAgent: robots.txt blocks {} — skipping {} candidates",
-                        domain, len(domain_cands),
-                    )
-            except Exception as exc:
-                logger.warning("ValidationAgent: robots check error for {}: {}", domain, exc)
-                allowed_candidates.extend(domain_cands)  # default allow on error
+        robots_tasks = [
+            self._check_robots(robots_skill, domain, cands)
+            for domain, cands in domain_map.items()
+        ]
+        allowed: list[CameraCandidate] = []
+        for batch in await asyncio.gather(*robots_tasks):
+            allowed.extend(batch)
 
         logger.info(
-            "ValidationAgent: {} candidates pass robots check (dropped {})",
-            len(allowed_candidates), len(candidates) - len(allowed_candidates),
+            "ValidationAgent: {}/{} candidates pass robots.txt (dropped {})",
+            len(allowed), len(candidates), len(candidates) - len(allowed),
         )
-
-        if not allowed_candidates:
+        if not allowed:
             return []
 
-        # Validate all URLs
-        urls = [c.url for c in allowed_candidates]
-        validation_results = await feed_skill.run(urls)
-        url_to_validation = {r.url: r for r in validation_results}
+        # ── Step 2: HTTP probe all allowed URLs ───────────────────────────────
+        feed_skill = FeedValidationSkill()
+        type_skill = FeedTypeClassificationSkill()
+        geo_skill  = GeoEnrichmentSkill()
 
-        # Build CameraRecord objects
-        records: list[CameraRecord] = []
-        for candidate in allowed_candidates:
-            v = url_to_validation.get(candidate.url)
+        logger.info(
+            "ValidationAgent: probing {} URLs "
+            "(concurrency={}, connect={}s, read={}s) …",
+            len(allowed),
+            settings.validation_concurrency,
+            settings.validation_timeout_connect,
+            settings.validation_timeout_read,
+        )
+        validation_results = await feed_skill.run([c.url for c in allowed])
+        url_to_val = {r.url: r for r in validation_results}
+
+        n_live    = sum(1 for r in validation_results if r.status == "live")
+        n_timeout = sum(1 for r in validation_results if r.fail_reason == "timeout")
+        n_dead    = sum(1 for r in validation_results if r.status == "dead")
+        logger.info(
+            "ValidationAgent: probe results — live={}, dead={}, timeout={}, other={}",
+            n_live, n_dead, n_timeout,
+            len(allowed) - n_live - n_dead - n_timeout,
+        )
+
+        # ── Step 3: filter by legitimacy ──────────────────────────────────────
+        min_legit = settings.min_legitimacy
+        to_enrich: list[tuple[CameraCandidate, object]] = []
+
+        for candidate in allowed:
+            v = url_to_val.get(candidate.url)
             if v is None:
                 continue
-
-            # Skip low legitimacy (unless minimum is "low")
-            if not _legit_meets_minimum(v.legitimacy_score, min_legit):
+            if not _legit_ok(v.legitimacy_score, min_legit):
                 logger.debug(
-                    "ValidationAgent: dropping '{}' — legitimacy={} < minimum={}",
+                    "ValidationAgent: drop {} — legit={} < min={}",
                     candidate.url, v.legitimacy_score, min_legit,
                 )
                 continue
+            to_enrich.append((candidate, v))
 
-            # Classify feed type
+        logger.info(
+            "ValidationAgent: {} candidates pass min_legitimacy='{}' filter",
+            len(to_enrich), min_legit,
+        )
+
+        # ── Step 4 & 5: classify + geo-enrich (threads for geo) ───────────────
+        loop = asyncio.get_event_loop()
+        records: list[CameraRecord] = []
+
+        with ThreadPoolExecutor(
+            max_workers=settings.geo_thread_workers,
+            thread_name_prefix="geo-worker",
+        ) as executor:
+            geo_futures = [
+                loop.run_in_executor(
+                    executor,
+                    self._geo_enrich_sync,
+                    geo_skill,
+                    candidate,
+                )
+                for candidate, _ in to_enrich
+            ]
+            geo_results = await asyncio.gather(*geo_futures, return_exceptions=True)
+
+        # ── Step 6: build CameraRecord objects ────────────────────────────────
+        for (candidate, v), geo in zip(to_enrich, geo_results):
             feed_type_result = type_skill.run(FeedTypeInput(
                 url=candidate.url,
                 content_type=v.content_type,
             ))
 
-            # Determine city, country, label with fallbacks
-            city = candidate.city or "Unknown"
+            city    = candidate.city    or "Unknown"
             country = candidate.country or "Unknown"
-            label = candidate.label or city
+            label   = candidate.label   or city
 
-            # Geo-enrich if missing coordinates
-            latitude: Optional[float] = None
+            latitude:  Optional[float] = None
             longitude: Optional[float] = None
-            continent = "Unknown"
-            region: Optional[str] = None
+            continent  = "Unknown"
+            region:  Optional[str] = None
 
-            if city and city != "Unknown":
-                try:
-                    geo = await geo_skill.run(GeoEnrichmentInput(
-                        city=city,
-                        country=candidate.country,
-                        label=label,
-                    ))
-                    if geo.latitude is not None and geo.longitude is not None:
-                        latitude = geo.latitude
-                        longitude = geo.longitude
-                        continent = geo.continent or "Unknown"
-                        region = geo.region
-                        if geo.country:
-                            country = geo.country
-                    else:
-                        logger.debug("ValidationAgent: no coordinates for '{}' in '{}'", label, city)
-                except Exception as exc:
-                    logger.warning("ValidationAgent: geo error for '{}': {}", city, exc)
+            if isinstance(geo, Exception):
+                logger.warning("ValidationAgent: geo error for '{}': {}", city, geo)
+            elif geo is not None:
+                latitude   = geo.latitude
+                longitude  = geo.longitude
+                continent  = geo.continent or "Unknown"
+                region     = geo.region
+                if geo.country:
+                    country = geo.country
 
-            # Skip records without coordinates
-            if latitude is None or longitude is None:
-                logger.debug(
-                    "ValidationAgent: skipping '{}' — no coordinates (city='{}')",
-                    candidate.url, city,
-                )
-                continue
+            record_id = _make_slug(city, label) or _make_slug("camera", candidate.url[-30:])
 
-            # Generate stable ID slug
-            record_id = _make_slug(city, label)
-            if not record_id:
-                record_id = _make_slug("camera", candidate.url[-30:])
-
-            # Notes for medium records
-            notes = candidate.notes
+            notes = candidate.notes or ""
             if v.legitimacy_score == "medium" and v.fail_reason:
-                notes = (notes or "") + f" review:{v.fail_reason}"
+                notes = f"{notes} review:{v.fail_reason}".strip()
+            if latitude is None:
+                notes = f"{notes} location_unknown".strip()
 
             try:
                 record = CameraRecord(
@@ -212,31 +243,103 @@ class ValidationAgent:
                     legitimacy_score=v.legitimacy_score,
                     status=v.status,
                     last_verified=None,
-                    notes=notes.strip() if notes else None,
+                    notes=notes or None,
                 )
                 records.append(record)
                 logger.debug(
-                    "ValidationAgent: accepted '{}' city='{}' status='{}' legit='{}'",
-                    label, city, v.status, v.legitimacy_score,
+                    "ValidationAgent: ✓ {} | feed={} | legit={} | coords={}",
+                    label,
+                    feed_type_result.feed_type,
+                    v.legitimacy_score,
+                    f"{latitude:.3f},{longitude:.3f}" if latitude is not None else "none",
                 )
             except Exception as exc:
-                logger.warning("ValidationAgent: record build error for '{}': {}", candidate.url, exc)
+                logger.warning(
+                    "ValidationAgent: record build error for '{}': {}", candidate.url, exc
+                )
 
+        located   = sum(1 for r in records if r.latitude is not None)
+        unlocated = len(records) - located
         logger.info(
-            "ValidationAgent: {} records validated from {} candidates",
-            len(records), len(allowed_candidates),
+            "ValidationAgent: {} validated records "
+            "({} with coords, {} without — included with location_unknown note)",
+            len(records), located, unlocated,
         )
         return records
 
+    # ── Concurrency helpers ───────────────────────────────────────────────────
+
+    async def _check_robots(
+        self,
+        skill: RobotsPolicySkill,
+        domain: str,
+        cands: list[CameraCandidate],
+    ) -> list[CameraCandidate]:
+        """Return the candidate list if robots.txt allows crawling this domain."""
+        try:
+            result = await skill.run(RobotsPolicyInput(domain=domain))
+            if result.allowed:
+                return cands
+            logger.info(
+                "ValidationAgent: robots.txt blocks {} ({} candidates dropped)",
+                domain, len(cands),
+            )
+            return []
+        except Exception as exc:
+            logger.warning("ValidationAgent: robots check error for {}: {}", domain, exc)
+            return cands  # default-allow on error
+
+    @staticmethod
+    def _geo_enrich_sync(
+        skill: GeoEnrichmentSkill, candidate: CameraCandidate
+    ):
+        """
+        Synchronous wrapper for GeoEnrichmentSkill, intended for use inside
+        a ThreadPoolExecutor.  Runs a fresh event loop per thread so that
+        the async geopy interface works without touching the main loop.
+
+        Geocoding fallback order (handled by GeoEnrichmentSkill):
+        1. city + country via Nominatim
+        2. label text via Nominatim
+        3. IP geolocation of the camera hostname via ip-api.com
+        4. country-center via Nominatim
+
+        Returns GeoEnrichmentOutput (may have None coords if all strategies fail).
+        """
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                skill.run(GeoEnrichmentInput(
+                    city=candidate.city,
+                    country=candidate.country,
+                    label=candidate.label,
+                    url=candidate.url,
+                ))
+            )
+        except Exception as exc:
+            logger.debug(
+                "ValidationAgent: geo lookup failed for '{}': {}", candidate.url, exc
+            )
+            return None
+        finally:
+            loop.close()
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
-    """CLI entry point for validator."""
+    """CLI entry point for validator (wcd-validate)."""
     parser = argparse.ArgumentParser(description="Validate camera candidates")
-    parser.add_argument("--input", type=Path, required=True,
-                        help="Path to candidates.jsonl from discovery agents")
-    parser.add_argument("--output", type=Path,
-                        default=settings.candidates_dir / "validated.jsonl",
-                        help="Output path for validated.jsonl")
+    parser.add_argument(
+        "--input", type=Path, required=True,
+        help="Path to candidates.jsonl from discovery agents",
+    )
+    parser.add_argument(
+        "--output", type=Path,
+        default=settings.candidates_dir / "validated.jsonl",
+        help="Output path for validated.jsonl",
+    )
     args = parser.parse_args()
 
     candidates = [
@@ -246,8 +349,11 @@ def main() -> None:
     ]
     records = asyncio.run(ValidationAgent().run(candidates=candidates))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text("\n".join(r.model_dump_json() for r in records))
-    logger.info("Validated {} records → {}", len(records), args.output)
+    args.output.write_text(
+        "\n".join(r.model_dump_json() for r in records),
+        encoding="utf-8",
+    )
+    logger.info("ValidationAgent: {} records → {}", len(records), args.output)
 
 
 if __name__ == "__main__":

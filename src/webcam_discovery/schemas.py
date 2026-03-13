@@ -55,8 +55,8 @@ class CameraRecord(BaseModel):
     region:             Optional[str]  = None
     country:            str
     continent:          str
-    latitude:           float
-    longitude:          float
+    latitude:           Optional[float] = None
+    longitude:          Optional[float] = None
     url:                str
     stream_url:         Optional[str]  = None
     direct_stream_url:  Optional[str]  = None
@@ -73,14 +73,14 @@ class CameraRecord(BaseModel):
 
     @field_validator("latitude")
     @classmethod
-    def lat_range(cls, v: float) -> float:
-        if not -90 <= v <= 90:
+    def lat_range(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not -90 <= v <= 90:
             raise ValueError(f"latitude {v} out of range [-90, 90]")
         return v
 
     @field_validator("longitude")
     @classmethod
-    def lon_range(cls, v: float) -> float:
-        if not -180 <= v <= 180:
+    def lon_range(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not -180 <= v <= 180:
             raise ValueError(f"longitude {v} out of range [-180, 180]")
         return v

@@ -22,8 +22,14 @@ class Settings(BaseSettings):
 
     # Pipeline behaviour
     max_concurrency: int   = 10
-    request_timeout: float = 5.0
-    min_legitimacy:  str   = "medium"   # "high" | "medium" | "low"
+    request_timeout: float = 20.0
+    min_legitimacy:  str   = "low"      # "high" | "medium" | "low"
+
+    # Validation tuning
+    validation_timeout_connect: float = 10.0   # seconds to open TCP connection
+    validation_timeout_read:    float = 25.0   # seconds to receive first response bytes
+    validation_concurrency:     int   = 50     # max simultaneous HTTP probe requests
+    geo_thread_workers:         int   = 20     # ThreadPoolExecutor size for geocoding
 
     # Maintenance schedule
     maintenance_cadence_days: int = 7
