@@ -73,12 +73,19 @@ _STREAM_VAR_RE = re.compile(
 )
 _DATA_CAM_RE = re.compile(r"""data-cam-url\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _DATA_STREAM_RE = re.compile(r"""data-stream\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
-_DATA_SRC_RE = re.compile(r"""data-src\s*=\s*['"]([^'"]+\.(?:m3u8|mjpg|mjpeg|mp4)[^'"]*)['"]""", re.IGNORECASE)
+_DATA_SRC_RE = re.compile(r"""data-src\s*=\s*['"]([^'"]+\.(?:m3u8|mjpg|mjpeg)[^'"]*)['"]""", re.IGNORECASE)
 
-_STREAM_EXTENSIONS = re.compile(r"\.(m3u8|mjpg|mjpeg|mp4)(\?|$)", re.IGNORECASE)
-_YOUTUBE_EMBED_RE = re.compile(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", re.IGNORECASE)
+_STREAM_EXTENSIONS = re.compile(r"\.(m3u8|mjpg|mjpeg)(\?|$)", re.IGNORECASE)
+_YOUTUBE_EMBED_RE  = re.compile(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", re.IGNORECASE)
 
 _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next|p=\d+)[^'"]*)['"]""", re.IGNORECASE)
+
+# Patterns for iframe live-video verification
+_LIVE_PLAYER_RE = re.compile(
+    r"(?:\.m3u8|multipart/x-mixed-replace|hls\.loadSource|jwplayer\s*\("
+    r"|(?<!\w)videojs\s*\(|Hls\.js|flowplayer\s*\(|data-setup\s*=)",
+    re.IGNORECASE,
+)
 
 
 def _extract_domain(url: str) -> str:
@@ -90,6 +97,26 @@ def _extract_domain(url: str) -> str:
 def _absolute(url: str, base: str) -> str:
     """Resolve a potentially-relative URL against base."""
     return urljoin(base, url)
+
+
+def _youtube_autoplay_url(url: str) -> str:
+    """
+    Add autoplay=1 and mute=1 to a YouTube embed URL.
+
+    autoplay=1 triggers immediate playback; mute=1 satisfies browser autoplay
+    policies that block unmuted autoplay.
+    """
+    parsed = urlparse(url)
+    params: dict[str, str] = {}
+    if parsed.query:
+        for part in parsed.query.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+    params["autoplay"] = "1"
+    params["mute"] = "1"
+    new_query = urlencode(params)
+    return urlunparse(parsed._replace(query=new_query))
 
 
 # ── DirectoryTraversalSkill ────────────────────────────────────────────────────
@@ -279,13 +306,18 @@ class FeedExtractionSkill:
 
     async def run(self, input: FeedExtractionInput) -> FeedExtractionOutput:
         """
-        Fetch a page and extract direct stream URL and feed type hint.
+        Fetch a page, extract stream/embed URLs, then verify non-YouTube iframes.
+
+        Generic iframe URLs are fetched and checked for live-player patterns or
+        direct stream URLs before being included as candidates.  This prevents
+        plain HTML pages (that happen to contain iframes) from flooding the
+        pipeline with non-camera links.
 
         Args:
             input: FeedExtractionInput with page_url.
 
         Returns:
-            FeedExtractionOutput with direct_stream_url, embed_url, feed_type_hint.
+            FeedExtractionOutput with verified stream/embed URLs.
         """
         url = input.page_url
         try:
@@ -298,6 +330,42 @@ class FeedExtractionSkill:
                 if response.status_code != 200:
                     return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
                 html = response.text
+
+                result = self._extract_from_html(html, url)
+
+                # Verify each embedded link:
+                #   - direct stream URLs (.m3u8 / .mjpeg) → always accept
+                #   - YouTube embeds (already normalised to autoplay) → always accept
+                #   - generic iframe URLs → fetch and check for live-player patterns
+                verified: list[str] = []
+                for link in result.embedded_links:
+                    if _STREAM_EXTENSIONS.search(link) or _YOUTUBE_EMBED_RE.search(link):
+                        verified.append(link)
+                    elif await self._iframe_has_live_video(client, link):
+                        verified.append(link)
+                    else:
+                        logger.debug(
+                            "FeedExtractionSkill: dropping non-live iframe {}", link
+                        )
+
+                if verified == result.embedded_links:
+                    return result  # nothing filtered — return unchanged
+
+                # Rebuild output with only verified links
+                direct_streams = [l for l in verified if _STREAM_EXTENSIONS.search(l)]
+                embed_list     = [l for l in verified if not _STREAM_EXTENSIONS.search(l)]
+                best_direct = direct_streams[0] if direct_streams else None
+                best_embed  = next(
+                    (u for u in embed_list if _YOUTUBE_EMBED_RE.search(u)),
+                    embed_list[0] if embed_list else None,
+                )
+                return FeedExtractionOutput(
+                    direct_stream_url=best_direct,
+                    embed_url=best_embed if best_embed else (url if not best_direct else None),
+                    feed_type_hint=self._guess_feed_type(best_direct or best_embed or ""),
+                    embedded_links=verified,
+                )
+
         except httpx.TimeoutException:
             logger.warning("FeedExtractionSkill timeout: {}", url)
             return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
@@ -305,7 +373,29 @@ class FeedExtractionSkill:
             logger.warning("FeedExtractionSkill error on {}: {}", url, exc)
             return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
 
-        return self._extract_from_html(html, url)
+    async def _iframe_has_live_video(
+        self, client: httpx.AsyncClient, url: str
+    ) -> bool:
+        """
+        Return True if the URL serves live-video player markup or a direct stream.
+
+        Fetches up to 32 KB of the response and checks for:
+        - Live-player JS patterns (HLS.js, JW Player, Video.js, flowplayer, data-setup)
+        - YouTube embed URLs in the page source
+        - Direct stream extensions (.m3u8, .mjpeg)
+        """
+        try:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return False
+            text = resp.text[:32_768]
+            return bool(
+                _LIVE_PLAYER_RE.search(text)
+                or _YOUTUBE_EMBED_RE.search(text)
+                or _STREAM_EXTENSIONS.search(text)
+            )
+        except Exception:
+            return False
 
     def _extract_from_html(self, html: str, base_url: str) -> FeedExtractionOutput:
         """
@@ -336,13 +426,17 @@ class FeedExtractionSkill:
             if src and _STREAM_EXTENSIONS.search(src):
                 _add_direct(src)
 
-        # 2. All iframes — YouTube or generic embed
+        # 2. All iframes — YouTube (with autoplay) or generic embed
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src", "")
             if not src:
                 continue
-            if _YOUTUBE_EMBED_RE.search(src):
-                _add_embed(src)
+            abs_src = _absolute(src, base_url)
+            if _YOUTUBE_EMBED_RE.search(abs_src):
+                # Normalise YouTube embeds to autoplay so playback starts immediately
+                autoplay_src = _youtube_autoplay_url(abs_src)
+                if autoplay_src not in embed_urls:
+                    embed_urls.append(autoplay_src)
             else:
                 _add_embed(src)
 
@@ -414,8 +508,6 @@ class FeedExtractionSkill:
             return "HLS"
         if ".mjpg" in lower or ".mjpeg" in lower:
             return "MJPEG"
-        if ".mp4" in lower:
-            return "HLS"
         if "youtube" in lower or "youtu.be" in lower:
             return "youtube_live"
         return "unknown"

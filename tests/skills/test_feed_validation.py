@@ -34,13 +34,15 @@ async def test_media_content_type_is_live():
 
 
 @pytest.mark.asyncio
-async def test_html_content_type_on_stream():
-    """HEAD returning text/html → status=live, legitimacy=medium (not hard-rejected)."""
+async def test_html_without_live_player_is_rejected():
+    """HTML page with no live-player patterns → status=dead, legitimacy=low."""
     url = "https://example.com/cam-page"
     with respx.mock:
-        respx.head(url).mock(
+        respx.get(url).mock(
             return_value=httpx.Response(
-                200, headers={"content-type": "text/html; charset=utf-8"}
+                200,
+                text="<html><body><p>Welcome to our webcam page</p></body></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
             )
         )
         skill = FeedValidationSkill()
@@ -49,8 +51,46 @@ async def test_html_content_type_on_stream():
     assert len(results) == 1
     r = results[0]
     assert r.url == url
+    assert r.legitimacy_score == "low"
+
+
+@pytest.mark.asyncio
+async def test_html_with_live_player_passes():
+    """HTML page containing HLS.js player code → legitimacy=high, status=live."""
+    url = "https://example.com/live-cam"
+    html = (
+        "<html><head><script src='hls.js'></script></head>"
+        "<body><script>var hls=new Hls(); hls.loadSource('stream.m3u8');</script></body></html>"
+    )
+    with respx.mock:
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200, text=html, headers={"content-type": "text/html"}
+            )
+        )
+        skill = FeedValidationSkill()
+        results = await skill.run([url])
+
+    assert len(results) == 1
+    r = results[0]
     assert r.status == "live"
-    assert r.legitimacy_score == "medium"
+    assert r.legitimacy_score == "high"
+
+
+@pytest.mark.asyncio
+async def test_mp4_url_is_rejected():
+    """MP4 URL → legitimacy=low, status=dead (static file, not live stream)."""
+    url = "https://example.com/recording.mp4"
+    with respx.mock:
+        # No HTTP mock needed — MP4 is rejected before any request is made
+        skill = FeedValidationSkill()
+        results = await skill.run([url])
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.legitimacy_score == "low"
+    assert r.status == "dead"
+    assert r.fail_reason == "not_live_stream"
 
 
 @pytest.mark.asyncio
@@ -58,7 +98,9 @@ async def test_404_is_dead():
     """HEAD returning 404 → status=dead."""
     url = "https://example.com/dead.mjpg"
     with respx.mock:
-        respx.head(url).mock(return_value=httpx.Response(404))
+        respx.head(url).mock(return_value=httpx.Response(
+            404, headers={"content-type": "text/html"}
+        ))
         skill = FeedValidationSkill()
         results = await skill.run([url])
 
@@ -87,9 +129,9 @@ async def test_timeout_is_unknown():
 
 @pytest.mark.asyncio
 async def test_youtube_nocookie_exempt():
-    """YouTube nocookie embed URL → status=live without content-type check (no HTTP call)."""
+    """YouTube nocookie embed URL → status=live, legitimacy=high (no HTTP call)."""
     url = "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?autoplay=1&mute=1"
-    # No HTTP mock needed — nocookie URLs are exempt from network checks
+    # No HTTP mock needed — YouTube URLs are exempt from network checks
     with respx.mock:
         skill = FeedValidationSkill()
         results = await skill.run([url])
@@ -98,6 +140,7 @@ async def test_youtube_nocookie_exempt():
     r = results[0]
     assert r.url == url
     assert r.status == "live"
+    assert r.legitimacy_score == "high"
 
 
 @pytest.mark.asyncio
@@ -117,14 +160,14 @@ async def test_401_is_dead():
 
 @pytest.mark.asyncio
 async def test_www_authenticate_header_low_legitimacy():
-    """WWW-Authenticate header present → legitimacy=low, status=dead."""
-    url = "https://example.com/protected-stream"
+    """WWW-Authenticate header on MJPEG HEAD → legitimacy=low, status=dead."""
+    url = "https://example.com/protected-cam.mjpg"
     with respx.mock:
         respx.head(url).mock(
             return_value=httpx.Response(
                 200,
                 headers={
-                    "content-type": "video/mp4",
+                    "content-type": "image/jpeg",
                     "www-authenticate": "Basic realm='cam'",
                 },
             )
@@ -150,7 +193,9 @@ async def test_multiple_urls():
         respx.head(urls[0]).mock(
             return_value=httpx.Response(200, headers={"content-type": "multipart/x-mixed-replace"})
         )
-        respx.head(urls[1]).mock(return_value=httpx.Response(404))
+        respx.head(urls[1]).mock(return_value=httpx.Response(
+            404, headers={"content-type": "text/html"}
+        ))
         respx.head(urls[2]).mock(side_effect=httpx.TimeoutException("timeout"))
 
         skill = FeedValidationSkill()
@@ -164,13 +209,16 @@ async def test_multiple_urls():
 
 
 @pytest.mark.asyncio
-async def test_hls_content_type_is_live_high():
-    """HLS content-type → status=live, legitimacy=high."""
+async def test_hls_magic_bytes_is_live_high():
+    """HLS playlist with #EXTM3U magic bytes → status=live, legitimacy=high."""
     url = "https://example.com/stream.m3u8"
+    playlist = b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:5\n"
     with respx.mock:
-        respx.head(url).mock(
+        respx.get(url).mock(
             return_value=httpx.Response(
-                200, headers={"content-type": "application/vnd.apple.mpegurl"}
+                200,
+                content=playlist,
+                headers={"content-type": "application/vnd.apple.mpegurl"},
             )
         )
         skill = FeedValidationSkill()

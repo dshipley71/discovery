@@ -7,13 +7,14 @@ Validation strategy by URL type
 ---------------------------------
 HLS  (.m3u8)    — GET first 1 KB; verify #EXTM3U magic → high/live.
 MJPEG (.mjpeg)  — HEAD for multipart/x-mixed-replace; byte-probe if HEAD returns 405.
-MP4/WebM        — HEAD for video/* content-type.
-YouTube embed   — Exempt from stream-content check; return medium/live.
-HTML page       — GET full page; scan for live-player patterns (HLS.js, JW Player,
-                  Video.js, flowplayer, data-setup, .m3u8 src, MJPEG img).
-                  → high   if live-player pattern found in HTML
-                  → medium if <video> tag or camera-keyword present
-                  → low    if only static images detected, no video
+MP4/WebM        — Rejected immediately: static recorded files, not live streams.
+YouTube embed   — Exempt from stream-content check; return high/live.
+XML/RSS/Atom    — Parsed for media:content or enclosure elements with video type;
+                  fast-path checks raw text for .m3u8/.mjpeg URLs → high/live.
+HTML page       — GET full page; scan for live-video player patterns only.
+                  → high   if live-player JS pattern found (HLS.js, JW Player, etc.)
+                  → low    if only generic <video> tag / camera keyword — not confirmed live
+                  → low    if no video detected at all
 
 Concurrency: asyncio.Semaphore(settings.validation_concurrency) — default 50.
 Timeout:     connect=10 s, read=25 s — generous for slow camera servers.
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import xml.etree.ElementTree as ET
 from typing import Optional
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
@@ -86,6 +88,11 @@ _MJPEG_URL_RE  = re.compile(r"\.(mjpg|mjpeg)(\?|$)", re.IGNORECASE)
 _STATIC_IMG_RE = re.compile(r"\.(jpg|jpeg|png|gif|bmp|webp)(\?|$)", re.IGNORECASE)
 _MP4_URL_RE    = re.compile(r"\.(mp4|webm|ogv)(\?|$)", re.IGNORECASE)
 _YOUTUBE_RE    = re.compile(r"youtube(?:-nocookie)?\.com/embed/", re.IGNORECASE)
+_XML_URL_RE    = re.compile(r"\.(xml|rss|atom)(\?|$)", re.IGNORECASE)
+_XML_CT_RE     = re.compile(
+    r"(text/xml|application/xml|application/rss\+xml|application/atom\+xml)",
+    re.IGNORECASE,
+)
 _AUTH_URL_RE   = re.compile(
     r"/(login|signin|sign-in|auth|register|subscribe|account|member|join)",
     re.IGNORECASE,
@@ -223,9 +230,10 @@ class FeedValidationSkill:
     async def _dispatch(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
         """Route to the correct probe based on URL type."""
         if _is_youtube(url):
+            # YouTube live embeds are confirmed live; high legitimacy
             return ValidationResult(
                 url=url, status_code=200, content_type="text/html",
-                legitimacy_score="medium", status="live",
+                legitimacy_score="high", status="live",
             )
         if _has_auth_path(url):
             return ValidationResult(
@@ -240,6 +248,8 @@ class FeedValidationSkill:
             return await self._probe_video(client, url)
         if _STATIC_IMG_RE.search(url):
             return await self._probe_static_image(client, url)
+        if _XML_URL_RE.search(url):
+            return await self._probe_xml(client, url)
         return await self._probe_html(client, url)
 
     # ── Per-type probes ───────────────────────────────────────────────────────
@@ -294,7 +304,7 @@ class FeedValidationSkill:
                     url=url, status_code=resp.status_code, content_type=ct,
                     legitimacy_score="high", status="live",
                 )
-            if resp.status_code in (405, 501) or not ct:
+            if resp.status_code in (405, 501) or (not ct and resp.status_code in range(200, 207)):
                 async with client.stream("GET", url) as gr:
                     ct = gr.headers.get("content-type", "")
                     if "multipart/x-mixed-replace" in ct.lower():
@@ -323,25 +333,13 @@ class FeedValidationSkill:
             return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
 
     async def _probe_video(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """HEAD probe for MP4/WebM — confirm video/* content-type."""
-        try:
-            resp = await client.head(url)
-            ct = resp.headers.get("content-type", "")
-            base = _ct_base(ct)
-            if base.startswith("video/") or base == "application/octet-stream":
-                return ValidationResult(
-                    url=url, status_code=resp.status_code, content_type=ct,
-                    legitimacy_score="high", status="live",
-                )
-            legit, status, fail = _classify_by_status(url, resp.status_code, ct, dict(resp.headers))
-            return ValidationResult(
-                url=url, status_code=resp.status_code, content_type=ct or None,
-                legitimacy_score=legit, status=status, fail_reason=fail,
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
+        """MP4/WebM/OGV are static recorded files, not live streams — reject without probing."""
+        return ValidationResult(
+            url=url,
+            legitimacy_score="low",
+            status="dead",
+            fail_reason="not_live_stream",
+        )
 
     async def _probe_static_image(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
         """Accessible static images are marked low legitimacy (not a live feed)."""
@@ -366,11 +364,13 @@ class FeedValidationSkill:
 
     async def _probe_html(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
         """
-        GET page and scan the first 64 KB for live-video player patterns.
+        GET page and scan the first 64 KB for confirmed live-video player patterns.
 
-        high   → live-player pattern (_LIVE_HTML_HIGH_RE matched)
-        medium → <video> tag or camera keyword present
-        low    → 200 OK but no video detected
+        XML content-type → delegated to _parse_xml_text() for MRSS/enclosure parsing.
+        high   → live-player JS pattern found (HLS.js, JW Player, Video.js, flowplayer,
+                 .m3u8 source, MJPEG img) — page embeds a confirmed live stream.
+        low    → only generic <video> tag / camera keyword (not confirmed live).
+        low    → 200 OK with no video indicators at all.
         """
         try:
             resp = await client.get(url)
@@ -384,6 +384,10 @@ class FeedValidationSkill:
                     legitimacy_score=legit, status=status, fail_reason=fail,
                 )
 
+            # XML content-type — parse for embedded video
+            if _XML_CT_RE.search(ct):
+                return self._parse_xml_text(url, resp.status_code, ct, resp.text)
+
             html = resp.text[:65_536]
 
             if _LIVE_HTML_HIGH_RE.search(html):
@@ -392,11 +396,12 @@ class FeedValidationSkill:
                     url=url, status_code=200, content_type=ct or None,
                     legitimacy_score="high", status="live",
                 )
+            # Generic <video> or camera keywords — not confirmed live; reject
             if _LIVE_HTML_MED_RE.search(html):
                 return ValidationResult(
                     url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="medium", status="live",
-                    fail_reason="html_content_type",
+                    legitimacy_score="low", status="dead",
+                    fail_reason="html_no_live_stream",
                 )
             return ValidationResult(
                 url=url, status_code=200, content_type=ct or None,
@@ -407,6 +412,90 @@ class FeedValidationSkill:
             return ValidationResult(url=url, status="unknown", fail_reason="timeout")
         except Exception as exc:
             return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
+
+    async def _probe_xml(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
+        """
+        Fetch XML/RSS/Atom/MRSS and parse for embedded video stream URLs.
+
+        Fast-path: raw-text search for .m3u8 / .mjpeg before XML parse.
+        Structured: checks media:content type="video/...", enclosure with video
+        MIME type, and any element whose url attribute points to a stream.
+        """
+        try:
+            resp = await client.get(url)
+            ct = resp.headers.get("content-type", "")
+            if resp.status_code not in range(200, 207):
+                legit, status, fail = _classify_by_status(
+                    url, resp.status_code, ct, dict(resp.headers)
+                )
+                return ValidationResult(
+                    url=url, status_code=resp.status_code, content_type=ct or None,
+                    legitimacy_score=legit, status=status, fail_reason=fail,
+                )
+            return self._parse_xml_text(url, resp.status_code, ct, resp.text)
+        except httpx.TimeoutException:
+            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
+        except Exception as exc:
+            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
+
+    @staticmethod
+    def _parse_xml_text(
+        url: str, status_code: int, ct: str, text: str
+    ) -> ValidationResult:
+        """
+        Synchronous XML parser shared by _probe_xml and _probe_html (XML content-type).
+
+        Returns high/live if a video stream URL or media:content/enclosure with
+        a video MIME type is found; low/dead otherwise.
+        """
+        # Fast-path: look for stream URL patterns in raw text before full parse
+        if _HLS_URL_RE.search(text):
+            logger.debug("FeedValidationSkill: HLS URL found in XML {}", url)
+            return ValidationResult(
+                url=url, status_code=status_code, content_type=ct or None,
+                legitimacy_score="high", status="live",
+            )
+        if _MJPEG_URL_RE.search(text):
+            logger.debug("FeedValidationSkill: MJPEG URL found in XML {}", url)
+            return ValidationResult(
+                url=url, status_code=status_code, content_type=ct or None,
+                legitimacy_score="high", status="live",
+            )
+
+        # Structured XML parse
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return ValidationResult(
+                url=url, status_code=status_code, content_type=ct or None,
+                legitimacy_score="low", status="dead", fail_reason="xml_parse_error",
+            )
+
+        for elem in root.iter():
+            # Strip namespace prefix for comparison
+            tag       = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+            type_attr = (elem.get("type") or "").lower()
+            elem_url  = (elem.get("url") or elem.text or "").strip()
+
+            # media:content type="video/..."
+            if tag == "content" and "video" in type_attr:
+                return ValidationResult(
+                    url=url, status_code=status_code, content_type=ct or None,
+                    legitimacy_score="high", status="live",
+                )
+            # <enclosure type="video/..."> or enclosure pointing to a stream
+            if tag == "enclosure" and (
+                "video" in type_attr or _HLS_URL_RE.search(elem_url)
+            ):
+                return ValidationResult(
+                    url=url, status_code=status_code, content_type=ct or None,
+                    legitimacy_score="high", status="live",
+                )
+
+        return ValidationResult(
+            url=url, status_code=status_code, content_type=ct or None,
+            legitimacy_score="low", status="dead", fail_reason="no_video_in_xml",
+        )
 
 
 # ── RobotsPolicySkill ──────────────────────────────────────────────────────────

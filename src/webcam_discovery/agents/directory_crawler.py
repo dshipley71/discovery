@@ -261,7 +261,7 @@ class DirectoryAgent:
         for i in range(0, len(allowed_sources), self.BATCH_SIZE):
             batch = allowed_sources[i : i + self.BATCH_SIZE]
             tasks = [
-                traversal_skill.run(TraversalInput(base_url=url, max_depth=2))
+                traversal_skill.run(TraversalInput(base_url=url, max_depth=4))
                 for url in batch
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
