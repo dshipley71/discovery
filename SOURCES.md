@@ -26,7 +26,6 @@ These are high-yield aggregators with structured, city-indexed, open-access list
 | **EarthCam** | https://www.earthcam.com | Major landmarks globally; some feeds free without login | HLS, iframe |
 | **Roundshot** | https://www.roundshot.com/live | Panoramic city and mountain cams; public embeds | MJPEG, iframe |
 | **Panomax** | https://www.panomax.com | Alpine, city, and resort panoramas; free access | MJPEG, iframe |
-| **foto-webcam.eu** | https://www.foto-webcam.eu | European focus; direct image/MJPEG feeds; no auth | MJPEG, static |
 | **Webcam.nl** | https://www.webcam.nl | Netherlands + broader Europe; long-running directory | iframe, MJPEG |
 
 ---
@@ -44,6 +43,7 @@ High-yield for specific regions or camera types. Search after Tier 1 for relevan
 | **Feratel Webcams** | https://www.feratel.com | Alps/Central Europe | High-quality alpine and resort cams |
 | **Foto-Webcam DE** | https://www.foto-webcam.de | Germany | German city and landscape cams |
 | **Webcams.travel** | https://www.webcams.travel | Europe-focused | Tourism-oriented, city-indexed |
+| **foto-webcam.eu** | https://www.foto-webcam.eu | European focus; direct image/MJPEG feeds; no auth | static images |
 
 #### Oceania
 | Source | URL | Coverage | Notes |
