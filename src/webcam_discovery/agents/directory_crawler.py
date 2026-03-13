@@ -303,16 +303,23 @@ class DirectoryAgent:
         self, candidates: list[CameraCandidate]
     ) -> list[CameraCandidate]:
         """
-        Run FeedExtractionSkill on every candidate page to get the most direct
-        stream URL. Updates candidate.url in place; original page URL is
-        preserved in source_refs.
+        Run FeedExtractionSkill on every candidate page URL and convert results
+        into the most direct camera links possible.
 
-        Uses a semaphore to cap concurrent HTTP requests at EXTRACT_CONCURRENCY.
+        Behaviour per candidate
+        -----------------------
+        - direct_stream_url found  → candidate URL updated to stream URL.
+        - embed_url found (≠ page) → candidate URL updated to embed URL (e.g. YouTube).
+        - Nothing found, page is deep (path ≥ 3 segments) → keep as HTML embed candidate.
+        - Nothing found, page is shallow (path < 3 segments) → drop (listing/nav page).
+        - embedded_links non-empty → each extra link becomes an additional sub-candidate.
+
+        A semaphore caps concurrent HTTP requests at EXTRACT_CONCURRENCY.
         """
         skill = FeedExtractionSkill()
         sem = asyncio.Semaphore(self.EXTRACT_CONCURRENCY)
 
-        async def _extract(candidate: CameraCandidate) -> CameraCandidate:
+        async def _extract(candidate: CameraCandidate) -> list[CameraCandidate]:
             page_url = candidate.url
             async with sem:
                 try:
@@ -321,23 +328,62 @@ class DirectoryAgent:
                     logger.warning(
                         "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
                     )
-                    return candidate
+                    return [candidate]
 
-            # Choose the most direct URL available
-            best_url = feed.direct_stream_url or feed.embed_url or page_url
-            if best_url != page_url:
-                logger.debug(
-                    "DirectoryAgent: resolved {} → {}", page_url, best_url
-                )
-                # Preserve original page URL in source_refs
+            results: list[CameraCandidate] = []
+            already_seen: set[str] = {page_url}
+
+            # Best primary URL: direct stream > distinct embed > nothing
+            best_url: Optional[str] = feed.direct_stream_url or (
+                feed.embed_url
+                if feed.embed_url and feed.embed_url != page_url
+                else None
+            )
+
+            if best_url:
+                already_seen.add(best_url)
                 refs = list(candidate.source_refs)
                 if page_url not in refs:
                     refs.append(page_url)
-                return candidate.model_copy(update={"url": best_url, "source_refs": refs})
-            return candidate
+                results.append(
+                    candidate.model_copy(update={"url": best_url, "source_refs": refs})
+                )
+                logger.debug("DirectoryAgent: resolved {} → {}", page_url, best_url)
+            else:
+                # No stream/embed found — keep only if this looks like a specific camera
+                # page (deep URL path), not a shallow listing/navigation page.
+                path_depth = len(
+                    [s for s in urlparse(page_url).path.strip("/").split("/") if s]
+                )
+                if path_depth >= 3:
+                    results.append(candidate)
+                else:
+                    logger.debug(
+                        "DirectoryAgent: dropping shallow listing page (depth={}) {}",
+                        path_depth, page_url,
+                    )
 
-        resolved = await asyncio.gather(*[_extract(c) for c in candidates])
-        return list(resolved)
+            # Sub-candidates from additional embedded links found on the page
+            for link in feed.embedded_links:
+                if link in already_seen:
+                    continue
+                already_seen.add(link)
+                results.append(
+                    CameraCandidate(
+                        url=link,
+                        label=candidate.label,
+                        city=candidate.city,
+                        country=candidate.country,
+                        source_directory=candidate.source_directory,
+                        source_refs=[page_url] + list(candidate.source_refs),
+                        notes=f"embedded_in:{page_url}",
+                    )
+                )
+
+            return results if results else [candidate]
+
+        nested = await asyncio.gather(*[_extract(c) for c in candidates])
+        return [item for sublist in nested for item in sublist]
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

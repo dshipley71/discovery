@@ -48,6 +48,9 @@ class FeedExtractionOutput(BaseModel):
     direct_stream_url: Optional[str] = None
     embed_url: Optional[str] = None
     feed_type_hint: Optional[str] = None
+    embedded_links: list[str] = []
+    """All stream/embed URLs collected from the page (direct streams + iframes + YouTube).
+    Used by DirectoryAgent to create sub-candidates when the page is a listing."""
 
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
@@ -305,78 +308,104 @@ class FeedExtractionSkill:
         return self._extract_from_html(html, url)
 
     def _extract_from_html(self, html: str, base_url: str) -> FeedExtractionOutput:
-        """Extract stream URL from HTML content."""
-        soup = BeautifulSoup(html, "html.parser")
+        """
+        Extract all stream/embed URLs from HTML content.
 
-        # 1. Check <source src="..."> for stream extensions
+        Collects every match across all pattern types (finditer, not search) so
+        that listing pages with multiple embedded cameras surface all of them.
+        Results are stored in `embedded_links`; the single best link is promoted
+        to `direct_stream_url` or `embed_url`.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        direct_streams: list[str] = []
+        embed_urls: list[str] = []
+
+        def _add_direct(raw: str) -> None:
+            abs_url = _absolute(raw, base_url) if raw.startswith("/") else raw
+            if abs_url not in direct_streams:
+                direct_streams.append(abs_url)
+
+        def _add_embed(raw: str) -> None:
+            abs_url = _absolute(raw, base_url)
+            if abs_url not in embed_urls:
+                embed_urls.append(abs_url)
+
+        # 1. <source src="..."> with stream extensions
         for source in soup.find_all("source"):
             src = source.get("src", "")
             if src and _STREAM_EXTENSIONS.search(src):
-                abs_src = _absolute(src, base_url)
-                feed_type = self._guess_feed_type(abs_src)
-                logger.debug("FeedExtractionSkill: <source> stream found: {}", abs_src)
-                return FeedExtractionOutput(
-                    direct_stream_url=abs_src,
-                    embed_url=base_url,
-                    feed_type_hint=feed_type,
-                )
+                _add_direct(src)
 
-        # 2. Check YouTube iframes
+        # 2. All iframes — YouTube or generic embed
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src", "")
-            yt_match = _YOUTUBE_EMBED_RE.search(src)
-            if yt_match:
-                abs_src = _absolute(src, base_url)
-                logger.debug("FeedExtractionSkill: YouTube embed found: {}", abs_src)
-                return FeedExtractionOutput(
-                    embed_url=abs_src,
-                    feed_type_hint="youtube_live",
-                )
+            if not src:
+                continue
+            if _YOUTUBE_EMBED_RE.search(src):
+                _add_embed(src)
+            else:
+                _add_embed(src)
 
-        # 3. Scan JS for known player patterns
+        # 3. JS player patterns — collect ALL matches via finditer
         scripts = " ".join(tag.get_text() for tag in soup.find_all("script"))
+        for pattern in (_JW_PLAYER_RE, _HLS_LOAD_RE, _STREAM_VAR_RE):
+            for m in pattern.finditer(scripts):
+                _add_direct(m.group(1))
 
-        for pattern, feed_hint in [
-            (_JW_PLAYER_RE, "js_player"),
-            (_HLS_LOAD_RE, "HLS"),
-            (_STREAM_VAR_RE, "HLS"),
-        ]:
-            match = pattern.search(scripts)
-            if match:
-                stream_url = match.group(1)
-                abs_stream = _absolute(stream_url, base_url) if stream_url.startswith("/") else stream_url
-                logger.debug("FeedExtractionSkill: JS player stream found: {}", abs_stream)
-                return FeedExtractionOutput(
-                    direct_stream_url=abs_stream,
-                    embed_url=base_url,
-                    feed_type_hint=feed_hint,
-                )
-
-        # 4. Check data-src attributes
+        # 4. data-* attributes — collect ALL matches via finditer
         for pattern in (_DATA_CAM_RE, _DATA_STREAM_RE, _DATA_SRC_RE):
-            match = pattern.search(html)
-            if match:
-                stream_url = match.group(1)
-                abs_stream = _absolute(stream_url, base_url)
-                logger.debug("FeedExtractionSkill: data-attr stream found: {}", abs_stream)
-                return FeedExtractionOutput(
-                    direct_stream_url=abs_stream,
-                    embed_url=base_url,
-                    feed_type_hint=self._guess_feed_type(abs_stream),
-                )
+            for m in pattern.finditer(html):
+                _add_direct(m.group(1))
 
-        # 5. Check for non-YouTube iframe embeds
-        for iframe in soup.find_all("iframe"):
-            src = iframe.get("src", "")
-            if src:
-                abs_src = _absolute(src, base_url)
-                return FeedExtractionOutput(
-                    embed_url=abs_src,
-                    feed_type_hint="iframe",
-                )
+        # 5. <a href> with direct stream extensions (listing pages linking to streams)
+        for link in soup.find_all("a", href=True):
+            href = str(link["href"])
+            if _STREAM_EXTENSIONS.search(href):
+                _add_direct(href)
 
-        # Fallback: return page as iframe embed
-        return FeedExtractionOutput(embed_url=base_url, feed_type_hint="iframe")
+        # Build deduplicated embedded_links (direct streams first, then embeds)
+        seen: set[str] = set()
+        embedded_links: list[str] = []
+        for url in direct_streams + embed_urls:
+            if url not in seen:
+                seen.add(url)
+                embedded_links.append(url)
+
+        # Choose best single direct stream and best embed
+        best_direct = direct_streams[0] if direct_streams else None
+        best_embed = next(
+            (u for u in embed_urls if _YOUTUBE_EMBED_RE.search(u)),
+            embed_urls[0] if embed_urls else None,
+        )
+
+        if best_direct:
+            logger.debug(
+                "FeedExtractionSkill: {} direct stream(s) on {}", len(direct_streams), base_url
+            )
+            return FeedExtractionOutput(
+                direct_stream_url=best_direct,
+                embed_url=best_embed or base_url,
+                feed_type_hint=self._guess_feed_type(best_direct),
+                embedded_links=embedded_links,
+            )
+
+        if best_embed:
+            logger.debug(
+                "FeedExtractionSkill: {} embed(s) on {}", len(embed_urls), base_url
+            )
+            ft = "youtube_live" if _YOUTUBE_EMBED_RE.search(best_embed) else "iframe"
+            return FeedExtractionOutput(
+                embed_url=best_embed,
+                feed_type_hint=ft,
+                embedded_links=embedded_links,
+            )
+
+        # Fallback: return page URL itself; embedded_links may still carry useful hints
+        return FeedExtractionOutput(
+            embed_url=base_url,
+            feed_type_hint="iframe",
+            embedded_links=embedded_links,
+        )
 
     def _guess_feed_type(self, url: str) -> str:
         """Guess feed type from URL extension."""
