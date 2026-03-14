@@ -2,6 +2,20 @@
 """
 traversal.py — Directory traversal and feed URL extraction from webcam listing pages.
 Part of the Public Webcam Discovery System.
+
+Traversal strategy
+------------------
+DirectoryTraversalSkill fetches a webcam directory's root page and recursively
+follows both same-domain sub-category links and pagination links to find
+individual camera pages.  max_depth=5 (default) lets it reach cameras that are
+buried 4–5 URL segments deep (e.g. /en/usa/new-york-state/niagara/niagara.html).
+
+Limits:
+  MAX_PAGES_PER_SOURCE  = 100  — total HTTP fetches per source before stopping.
+  MAX_SUB_LINKS_PER_PAGE = 10  — sub-category links followed per page.
+
+FeedExtractionSkill is the companion tool that fetches individual camera pages
+and returns all .m3u8/.mjpeg stream URLs found in the static HTML.
 """
 from __future__ import annotations
 
@@ -25,7 +39,7 @@ class TraversalInput(BaseModel):
 
     base_url: str
     city_filter: Optional[str] = None
-    max_depth: int = 2
+    max_depth: int = 5
 
 
 class TraversalOutput(BaseModel):
@@ -80,6 +94,15 @@ _STREAM_EXTENSIONS = re.compile(r"\.(m3u8|mjpg|mjpeg)(\?|$)", re.IGNORECASE)
 _YOUTUBE_EMBED_RE = re.compile(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", re.IGNORECASE)
 
 _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next|p=\d+)[^'"]*)['"]""", re.IGNORECASE)
+
+# Broad patterns: catch ANY quoted .m3u8 or .mjpeg URL regardless of variable name or context.
+# These supplement the specific patterns above for sites that use non-standard naming.
+_BROAD_HLS_RE  = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""", re.IGNORECASE)
+_BROAD_MJPEG_RE = re.compile(r"""['"]([^'"]{4,500}\.mj(?:pg|peg)[^'"]{0,100})['"]""", re.IGNORECASE)
+
+# Per-source traversal limits — prevent runaway crawls on large directories.
+MAX_PAGES_PER_SOURCE   = 100   # total HTTP GETs per source URL
+MAX_SUB_LINKS_PER_PAGE = 10    # sub-category links to recursively follow per page
 
 
 def _extract_domain(url: str) -> str:
@@ -160,8 +183,24 @@ class DirectoryTraversalSkill:
         visited: set[str],
         pages_fetched_ref: list[int],
     ) -> list[CameraCandidate]:
-        """Fetch a single directory page and extract camera candidates."""
+        """
+        Fetch a single directory page, extract camera candidates, and recurse.
+
+        Recursion strategy
+        ------------------
+        - Pagination links  → followed at the SAME depth (horizontal sweep).
+        - Sub-category links → followed at depth-1 (vertical descent).
+          Limited to MAX_SUB_LINKS_PER_PAGE per page; prefer shorter paths
+          (broad directory nodes) over deep single-camera URLs.
+        - MAX_PAGES_PER_SOURCE guards total HTTP requests across all recursion.
+        """
         if url in visited or depth < 0:
+            return []
+        if pages_fetched_ref[0] >= MAX_PAGES_PER_SOURCE:
+            logger.debug(
+                "DirectoryTraversalSkill: page limit ({}) reached for {}",
+                MAX_PAGES_PER_SOURCE, source_directory,
+            )
             return []
         visited.add(url)
 
@@ -172,40 +211,44 @@ class DirectoryTraversalSkill:
 
         soup = BeautifulSoup(html, "html.parser")
         candidates: list[CameraCandidate] = []
+        sub_pages: list[tuple[int, str]] = []  # (path_depth, abs_url) for sorting
 
-        # Extract camera links from this page
+        # ── Collect all same-domain links from this page ───────────────────────
         for link in soup.find_all("a", href=True):
             href = str(link["href"])
             abs_href = _absolute(href, url)
             text = link.get_text(strip=True)
 
-            # Only follow links within the same domain
+            # Same domain only
             if _extract_domain(abs_href) != source_directory:
+                continue
+            if abs_href in visited:
                 continue
 
             # City filter
-            if city_filter and city_filter.lower() not in abs_href.lower() and city_filter.lower() not in text.lower():
+            if (city_filter
+                    and city_filter.lower() not in abs_href.lower()
+                    and city_filter.lower() not in text.lower()):
                 continue
 
-            # Extract city/country from URL path segments
-            path_parts = urlparse(abs_href).path.strip("/").split("/")
-            city = None
+            # Skip anchors, javascript, mailto, etc.
+            parsed = urlparse(abs_href)
+            if parsed.scheme not in ("http", "https"):
+                continue
+
+            path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+            path_depth = len(path_parts)
+            city    = None
             country = None
-            label = text or None
+            label   = text or None
 
-            if len(path_parts) >= 3:
-                country = path_parts[-2].replace("-", " ").title() if len(path_parts) >= 3 else None
+            if path_depth >= 3:
+                country = path_parts[-2].replace("-", " ").title()
+                city    = path_parts[-1].replace("-", " ").title()
+            elif path_depth == 2:
                 city = path_parts[-1].replace("-", " ").title()
-            elif len(path_parts) == 2:
-                city = path_parts[-1].replace("-", " ").title()
-
-            # Look for media stream indicators in the linked page context
-            parent = link.find_parent()
-            img_src = None
-            if parent:
-                img = parent.find("img")
-                if img and img.get("src"):
-                    img_src = _absolute(str(img["src"]), url)
+            elif path_depth == 1:
+                city = path_parts[0].replace("-", " ").title()
 
             candidates.append(CameraCandidate(
                 url=abs_href,
@@ -214,17 +257,32 @@ class DirectoryTraversalSkill:
                 country=country,
                 source_directory=source_directory,
                 source_refs=[url],
-                notes=f"thumbnail:{img_src}" if img_src else None,
             ))
 
-        # Follow pagination links if depth > 0
+            # Queue sub-category pages for recursive descent (depth > 0)
+            if depth > 0 and 1 <= path_depth <= 5:
+                sub_pages.append((path_depth, abs_href))
+
+        # ── Recursive descent into sub-category pages ──────────────────────────
+        if depth > 0 and sub_pages:
+            # Prefer shallower paths first (directory roots → cities → cameras)
+            sub_pages.sort(key=lambda t: t[0])
+            for _, sub_url in sub_pages[:MAX_SUB_LINKS_PER_PAGE]:
+                if sub_url not in visited and pages_fetched_ref[0] < MAX_PAGES_PER_SOURCE:
+                    sub_candidates = await self._fetch_page(
+                        client, sub_url, source_directory,
+                        city_filter, depth - 1, visited, pages_fetched_ref,
+                    )
+                    candidates.extend(sub_candidates)
+
+        # ── Pagination (horizontal sweep, same depth) ──────────────────────────
         if depth > 0:
             next_links = self._find_next_links(soup, url, source_directory)
-            for next_url in next_links[:5]:  # Limit pagination depth
-                if next_url not in visited:
+            for next_url in next_links[:5]:
+                if next_url not in visited and pages_fetched_ref[0] < MAX_PAGES_PER_SOURCE:
                     sub_candidates = await self._fetch_page(
                         client, next_url, source_directory,
-                        city_filter, depth - 1, visited, pages_fetched_ref
+                        city_filter, depth, visited, pages_fetched_ref,
                     )
                     candidates.extend(sub_candidates)
 
@@ -344,7 +402,14 @@ class FeedExtractionSkill:
             for m in pattern.finditer(html):
                 _add_direct(m.group(1))
 
-        # 4. <a href> with direct stream extensions (listing pages linking to streams)
+        # 4. Broad catch-all: any quoted .m3u8 or .mjpeg URL anywhere in HTML.
+        #    Runs over the full raw HTML so it catches stream URLs in JSON blobs,
+        #    window.__data__ assignments, and any non-standard variable names.
+        for pattern in (_BROAD_HLS_RE, _BROAD_MJPEG_RE):
+            for m in pattern.finditer(html):
+                _add_direct(m.group(1))
+
+        # 5. <a href> with direct stream extensions (listing pages linking to streams)
         for link in soup.find_all("a", href=True):
             _add_direct(str(link["href"]))
 
