@@ -333,12 +333,9 @@ class DirectoryAgent:
             results: list[CameraCandidate] = []
             already_seen: set[str] = {page_url}
 
-            # Best primary URL: direct stream > distinct embed > nothing
-            best_url: Optional[str] = feed.direct_stream_url or (
-                feed.embed_url
-                if feed.embed_url and feed.embed_url != page_url
-                else None
-            )
+            # Only direct stream URLs (.m3u8, .mjpeg) are accepted as camera links.
+            # Embed pages (YouTube, iframes) and HTML pages are not active streams.
+            best_url: Optional[str] = feed.direct_stream_url
 
             if best_url:
                 already_seen.add(best_url)

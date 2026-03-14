@@ -7,13 +7,15 @@ Validation strategy by URL type
 ---------------------------------
 HLS  (.m3u8)    — GET first 1 KB; verify #EXTM3U magic → high/live.
 MJPEG (.mjpeg)  — HEAD for multipart/x-mixed-replace; byte-probe if HEAD returns 405.
-MP4/WebM        — HEAD for video/* content-type.
-YouTube embed   — Exempt from stream-content check; return medium/live.
-HTML page       — GET full page; scan for live-player patterns (HLS.js, JW Player,
-                  Video.js, flowplayer, data-setup, .m3u8 src, MJPEG img).
-                  → high   if live-player pattern found in HTML
-                  → medium if <video> tag or camera-keyword present
-                  → low    if only static images detected, no video
+MP4/WebM        — Rejected outright; static video files are not live camera feeds.
+YouTube embed   — Rejected outright; embed pages are not direct stream URLs.
+HTML page       — GET full page; scan for embedded .m3u8 or .mjpeg URLs.
+                  Each found stream URL is probed directly.
+                  → high/live   if a live HLS or MJPEG stream URL is confirmed
+                  → dead        if no live stream URL is found in the HTML
+
+Only HLS and MJPEG streams are accepted as active camera links.
+HTML pages, MP4 files, YouTube embeds, and iframe pages are all rejected.
 
 Concurrency: asyncio.Semaphore(settings.validation_concurrency) — default 50.
 Timeout:     connect=10 s, read=25 s — generous for slow camera servers.
@@ -25,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -45,6 +47,8 @@ class ValidationResult(BaseModel):
     legitimacy_score: LegitimacyScore = "medium"
     status: CameraStatus = "unknown"
     fail_reason: Optional[str] = None
+    stream_url: Optional[str] = None
+    """Resolved direct stream URL when probed URL was an HTML page containing a stream."""
 
 
 class RobotsPolicyInput(BaseModel):
@@ -124,6 +128,17 @@ _MEDIA_CONTENT_TYPES = frozenset({
     "application/vnd.apple.mpegurl", "application/x-mpegurl",
     "video/x-flv", "video/mpeg",
 })
+
+# Patterns for extracting actual stream URLs embedded inside HTML pages.
+# Only HLS (.m3u8) and MJPEG (.mjpg/.mjpeg) are valid live stream types.
+_HLS_URL_IN_HTML = re.compile(
+    r"""['"]([^'"]{1,500}\.m3u8[^'"]{0,100})['"]""",
+    re.IGNORECASE,
+)
+_MJPEG_URL_IN_HTML = re.compile(
+    r"""['"]([^'"]{1,500}\.mj(?:pg|peg)[^'"]{0,100})['"]""",
+    re.IGNORECASE,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -221,11 +236,16 @@ class FeedValidationSkill:
         return result
 
     async def _dispatch(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """Route to the correct probe based on URL type."""
+        """Route to the correct probe based on URL type.
+
+        Only HLS (.m3u8) and MJPEG (.mjpg/.mjpeg) streams are accepted as active
+        camera links.  YouTube embeds, MP4 files, and static images are rejected
+        immediately.  HTML pages are deep-scanned for embedded stream URLs.
+        """
         if _is_youtube(url):
             return ValidationResult(
-                url=url, status_code=200, content_type="text/html",
-                legitimacy_score="medium", status="live",
+                url=url, legitimacy_score="low", status="dead",
+                fail_reason="youtube_embed_not_stream",
             )
         if _has_auth_path(url):
             return ValidationResult(
@@ -237,9 +257,15 @@ class FeedValidationSkill:
         if _MJPEG_URL_RE.search(url):
             return await self._probe_mjpeg(client, url)
         if _MP4_URL_RE.search(url):
-            return await self._probe_video(client, url)
+            return ValidationResult(
+                url=url, legitimacy_score="low", status="dead",
+                fail_reason="mp4_static_video_not_stream",
+            )
         if _STATIC_IMG_RE.search(url):
-            return await self._probe_static_image(client, url)
+            return ValidationResult(
+                url=url, legitimacy_score="low", status="dead",
+                fail_reason="static_image_not_stream",
+            )
         return await self._probe_html(client, url)
 
     # ── Per-type probes ───────────────────────────────────────────────────────
@@ -294,7 +320,7 @@ class FeedValidationSkill:
                     url=url, status_code=resp.status_code, content_type=ct,
                     legitimacy_score="high", status="live",
                 )
-            if resp.status_code in (405, 501) or not ct:
+            if resp.status_code in (405, 501) or (resp.status_code in range(200, 207) and not ct):
                 async with client.stream("GET", url) as gr:
                     ct = gr.headers.get("content-type", "")
                     if "multipart/x-mixed-replace" in ct.lower():
@@ -366,11 +392,14 @@ class FeedValidationSkill:
 
     async def _probe_html(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
         """
-        GET page and scan the first 64 KB for live-video player patterns.
+        GET page and scan for embedded HLS (.m3u8) or MJPEG stream URLs.
 
-        high   → live-player pattern (_LIVE_HTML_HIGH_RE matched)
-        medium → <video> tag or camera keyword present
-        low    → 200 OK but no video detected
+        The HTML page URL itself is never accepted as a camera link.  Only an
+        actual stream URL extracted from the page and confirmed live is returned.
+
+        high/live  → a live .m3u8 or .mjpeg stream URL was found and confirmed.
+                     ValidationResult.stream_url carries the resolved stream URL.
+        dead       → the page loaded but contained no confirmedactive stream URL.
         """
         try:
             resp = await client.get(url)
@@ -386,22 +415,56 @@ class FeedValidationSkill:
 
             html = resp.text[:65_536]
 
-            if _LIVE_HTML_HIGH_RE.search(html):
-                logger.debug("FeedValidationSkill: live-player detected in HTML {}", url)
+            # Collect candidate stream URLs embedded in this page (HLS first, then MJPEG)
+            stream_candidates: list[tuple[str, str]] = []
+            seen_streams: set[str] = set()
+
+            for m in _HLS_URL_IN_HTML.finditer(html):
+                raw = m.group(1).strip()
+                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
+                if abs_url not in seen_streams:
+                    seen_streams.add(abs_url)
+                    stream_candidates.append(("hls", abs_url))
+
+            for m in _MJPEG_URL_IN_HTML.finditer(html):
+                raw = m.group(1).strip()
+                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
+                if abs_url not in seen_streams:
+                    seen_streams.add(abs_url)
+                    stream_candidates.append(("mjpeg", abs_url))
+
+            if not stream_candidates:
+                logger.debug(
+                    "FeedValidationSkill: no stream URLs found in HTML {}", url
+                )
                 return ValidationResult(
                     url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="high", status="live",
+                    legitimacy_score="low", status="dead",
+                    fail_reason="no_stream_url_in_html",
                 )
-            if _LIVE_HTML_MED_RE.search(html):
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="medium", status="live",
-                    fail_reason="html_content_type",
-                )
+
+            # Probe the first few stream candidates; return on first confirmed live stream
+            for kind, stream_url in stream_candidates[:5]:
+                if kind == "hls":
+                    result = await self._probe_hls(client, stream_url)
+                else:
+                    result = await self._probe_mjpeg(client, stream_url)
+
+                if result.status == "live":
+                    logger.debug(
+                        "FeedValidationSkill: stream confirmed via HTML {} → {}",
+                        url, stream_url,
+                    )
+                    return ValidationResult(
+                        url=url, status_code=200, content_type=ct or None,
+                        legitimacy_score=result.legitimacy_score, status="live",
+                        stream_url=stream_url,
+                    )
+
             return ValidationResult(
                 url=url, status_code=200, content_type=ct or None,
-                legitimacy_score="low", status="unknown",
-                fail_reason="no_live_video_detected",
+                legitimacy_score="low", status="dead",
+                fail_reason="stream_urls_found_but_all_dead",
             )
         except httpx.TimeoutException:
             return ValidationResult(url=url, status="unknown", fail_reason="timeout")
