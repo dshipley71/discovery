@@ -218,7 +218,7 @@ def _normalize_url(url: str) -> str:
         # Normalize protocol
         scheme = "https"
         # Remove www.
-        netloc = parsed.netloc.lstrip("www.")
+        netloc = parsed.netloc.removeprefix("www.")
         # Strip tracking query params
         params = parse_qs(parsed.query, keep_blank_values=True)
         clean_params = {k: v for k, v in params.items() if k.lower() not in _TRACKING_PARAMS}
@@ -402,7 +402,7 @@ class GeoEnrichmentSkill:
 
     def __init__(self) -> None:
         """Initialize geocoder with a polite user-agent."""
-        self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0")
+        self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0", timeout=5)
         self._cache: dict[str, Optional[GeoEnrichmentOutput]] = {}
 
     async def run(self, input: GeoEnrichmentInput) -> GeoEnrichmentOutput:
@@ -467,11 +467,11 @@ class GeoEnrichmentSkill:
                 ),
             )
         except (GeocoderTimedOut, GeocoderUnavailable) as exc:
-            logger.warning("GeoEnrichmentSkill geocoder error for '{}': {}", query, exc)
+            logger.debug("GeoEnrichmentSkill geocoder error for '{}': {}", query, exc)
             self._cache[key] = None
             return GeoEnrichmentOutput()
         except Exception as exc:
-            logger.warning("GeoEnrichmentSkill unexpected error for '{}': {}", query, exc)
+            logger.debug("GeoEnrichmentSkill unexpected error for '{}': {}", query, exc)
             self._cache[key] = None
             return GeoEnrichmentOutput()
 

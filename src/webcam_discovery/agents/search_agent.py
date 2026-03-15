@@ -63,8 +63,8 @@ _CITY_TIERS: dict[int, list[str]] = {
 
 
 def _domain_of(url: str) -> str:
-    """Extract domain from URL."""
-    return urlparse(url).netloc.lstrip("www.")
+    """Extract domain from URL, stripping a 'www.' prefix if present."""
+    return urlparse(url).netloc.removeprefix("www.")
 
 
 def _is_blocked(url: str, extra: frozenset[str] = frozenset()) -> bool:

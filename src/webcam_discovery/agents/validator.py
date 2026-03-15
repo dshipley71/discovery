@@ -29,6 +29,7 @@ from typing import Optional
 
 from loguru import logger
 from slugify import slugify
+from tqdm.asyncio import tqdm_asyncio
 
 from webcam_discovery.config import settings
 from webcam_discovery.schemas import CameraCandidate, CameraRecord, LegitimacyScore
@@ -54,7 +55,7 @@ def _legit_ok(score: LegitimacyScore, minimum: str) -> bool:
 
 
 def _domain_of(url: str) -> str:
-    return urlparse(url).netloc.lstrip("www.")
+    return urlparse(url).netloc.removeprefix("www.")
 
 
 def _make_slug(city: str, label: str) -> str:
@@ -178,20 +179,31 @@ class ValidationAgent:
         loop = asyncio.get_event_loop()
         records: list[CameraRecord] = []
 
+        async def _safe_geo(fut):
+            try:
+                return await fut
+            except Exception as exc:
+                return exc
+
         with ThreadPoolExecutor(
             max_workers=settings.geo_thread_workers,
             thread_name_prefix="geo-worker",
         ) as executor:
             geo_futures = [
-                loop.run_in_executor(
+                _safe_geo(loop.run_in_executor(
                     executor,
                     self._geo_enrich_sync,
                     geo_skill,
                     candidate,
-                )
+                ))
                 for candidate, _ in to_enrich
             ]
-            geo_results = await asyncio.gather(*geo_futures, return_exceptions=True)
+            geo_results = await tqdm_asyncio.gather(
+                *geo_futures,
+                desc="Geo-enriching",
+                unit="cam",
+                ncols=90,
+            )
 
         # ── Step 6: build CameraRecord objects ────────────────────────────────
         for (candidate, v), geo in zip(to_enrich, geo_results):

@@ -241,8 +241,9 @@ class SourcesRegistry:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _domain_of(url: str) -> str:
-    """Extract netloc from URL, stripping leading 'www.'."""
-    return urlparse(url).netloc.lstrip("www.")
+    """Extract netloc from URL, stripping a 'www.' prefix if present."""
+    netloc = urlparse(url).netloc
+    return netloc.removeprefix("www.")
 
 
 # ── DirectoryAgent ────────────────────────────────────────────────────────────

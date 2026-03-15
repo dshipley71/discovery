@@ -222,7 +222,7 @@ class SourceDiscoverySkill:
 
         for url in input.search_results:
             try:
-                domain = urlparse(url).netloc.lower().lstrip("www.")
+                domain = urlparse(url).netloc.lower().removeprefix("www.")
                 if domain and domain not in known:
                     domain_counts[domain] = domain_counts.get(domain, 0) + 1
             except Exception:
