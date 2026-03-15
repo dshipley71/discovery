@@ -52,11 +52,12 @@ class SourcesRegistry:
     warning if the file cannot be found.
     """
 
-    _URL_RE        = re.compile(r'\|\s*(https?://[^\s|]+)\s*\|')
-    _TIER_RE       = re.compile(r'###\s+Tier\s+(\d+)', re.IGNORECASE)
-    _SECTION_RE    = re.compile(r'^##\s+Section\s+(\d+)[^\n]*\n', re.IGNORECASE | re.MULTILINE)
-    _BOLD_CELL_RE  = re.compile(r'^\|\s*\*\*([^*|]+)\*\*', re.MULTILINE)
-    _DOMAIN_RE     = re.compile(r'^[\w.-]+\.[a-zA-Z]{2,}$')
+    _URL_RE             = re.compile(r'\|\s*(https?://[^\s|]+)\s*\|')
+    _TIER_RE            = re.compile(r'###\s+Tier\s+(\d+)', re.IGNORECASE)
+    _SECTION_RE         = re.compile(r'^##\s+Section\s+(\d+)[^\n]*\n', re.IGNORECASE | re.MULTILINE)
+    _BOLD_CELL_RE       = re.compile(r'^\|\s*\*\*([^*|]+)\*\*', re.MULTILINE)
+    _DOMAIN_RE          = re.compile(r'^[\w.-]+\.[a-zA-Z]{2,}$')
+    _FEED_TYPE_HDR_RE   = re.compile(r'feed\s+type', re.IGNORECASE)
 
     # Domains that must always be blocked regardless of SOURCES.md parse quality.
     _ALWAYS_BLOCKED: frozenset[str] = frozenset({
@@ -92,6 +93,7 @@ class SourcesRegistry:
         self._path = sources_path
         self._tier_sources: dict[int, list[str]] = {}
         self._blocked_domains: set[str] = set(self._ALWAYS_BLOCKED)
+        self._feed_types: dict[str, str] = {}  # url → raw feed-types string from SOURCES.md
 
         if self._path and self._path.exists():
             self._parse()
@@ -103,12 +105,15 @@ class SourcesRegistry:
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def sources_for_tier(self, max_tier: int) -> list[str]:
+    def sources_for_tier(self, max_tier: int, hls_only: bool = False) -> list[str]:
         """
         Return deduplicated source URLs for tiers 1 through max_tier (inclusive).
 
         Args:
-            max_tier: Highest tier to include (1 = Tier 1 only, 5 = all tiers).
+            max_tier:  Highest tier to include (1 = Tier 1 only, 5 = all tiers).
+            hls_only:  When True, skip any source whose SOURCES.md feed-types column
+                       is known and does not include "HLS".  Sources with no feed-type
+                       data are always included.
 
         Returns:
             Ordered list of source URLs, higher-priority tiers first.
@@ -117,10 +122,36 @@ class SourcesRegistry:
         result: list[str] = []
         for tier in range(1, max_tier + 1):
             for url in self._tier_sources.get(tier, []):
+                if hls_only:
+                    feed_types = self._feed_types.get(url, "")
+                    if feed_types and "hls" not in feed_types.lower():
+                        logger.info(
+                            "SourcesRegistry: skipping non-HLS source {} (feed_types={})",
+                            url, feed_types,
+                        )
+                        continue
                 if url not in seen:
                     seen.add(url)
                     result.append(url)
         return result
+
+    @property
+    def non_hls_domains(self) -> frozenset[str]:
+        """
+        Domains of known sources whose feed types do not include HLS.
+
+        Only sources with explicit feed-type data in SOURCES.md are included;
+        sources with no feed-type entry are not returned here.
+        """
+        domains: set[str] = set()
+        for url, feed_types in self._feed_types.items():
+            if feed_types and "hls" not in feed_types.lower():
+                netloc = urlparse(url).netloc
+                if netloc.startswith("www."):
+                    netloc = netloc[4:]
+                if netloc:
+                    domains.add(netloc)
+        return frozenset(domains)
 
     @property
     def blocked_domains(self) -> frozenset[str]:
@@ -158,20 +189,38 @@ class SourcesRegistry:
         )
 
     def _parse_tiers(self, content: str) -> dict[int, list[str]]:
-        """Extract {tier: [url, ...]} from Section 1 content."""
+        """Extract {tier: [url, ...]} from Section 1 content, capturing feed types."""
         result: dict[int, list[str]] = {}
         current_tier = 0
+        feed_type_col_idx: int = -1  # column index of "Feed Types" in current table
+
         for line in content.splitlines():
             tier_match = self._TIER_RE.search(line)
             if tier_match:
                 current_tier = int(tier_match.group(1))
                 result.setdefault(current_tier, [])
+                feed_type_col_idx = -1
             elif current_tier > 0:
+                # Detect "Feed Types" column header row
+                if self._FEED_TYPE_HDR_RE.search(line) and "|" in line:
+                    cols = [c.strip() for c in line.split("|")]
+                    for idx, col in enumerate(cols):
+                        if self._FEED_TYPE_HDR_RE.search(col):
+                            feed_type_col_idx = idx
+                            break
+
                 url_match = self._URL_RE.search(line)
                 if url_match:
                     url = url_match.group(1).rstrip("/").rstrip(")").strip()
                     if url not in result[current_tier]:
                         result[current_tier].append(url)
+                    # Capture feed type when the column has been detected
+                    if feed_type_col_idx >= 0:
+                        cols = [c.strip() for c in line.split("|")]
+                        if feed_type_col_idx < len(cols):
+                            feed_types = cols[feed_type_col_idx]
+                            if feed_types and feed_types != "-":
+                                self._feed_types[url] = feed_types
         return result
 
     def _parse_blocked_domains(self, content: str) -> set[str]:
@@ -226,7 +275,7 @@ class DirectoryAgent:
             Deduplicated list of CameraCandidate objects with resolved feed URLs.
         """
         registry = SourcesRegistry()
-        sources = registry.sources_for_tier(tier)
+        sources = registry.sources_for_tier(tier, hls_only=True)
         blocked = registry.blocked_domains
 
         if not sources:
