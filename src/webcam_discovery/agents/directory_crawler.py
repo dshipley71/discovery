@@ -22,9 +22,13 @@ from __future__ import annotations
 import asyncio
 import argparse
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+
+import httpx
+from tqdm.asyncio import tqdm_asyncio
 
 from loguru import logger
 from pydantic import BaseModel
@@ -259,8 +263,8 @@ class DirectoryAgent:
     6. Deduplicate by URL and return combined list.
     """
 
-    BATCH_SIZE          = 3    # parallel traversal tasks
-    EXTRACT_CONCURRENCY = 10   # parallel feed-extraction requests
+    BATCH_SIZE          = 5    # parallel traversal tasks
+    EXTRACT_CONCURRENCY = 25   # parallel feed-extraction requests
     MAX_DEPTH           = 5    # URL depth to traverse into source directories
     WINDY_LIMIT         = 500  # max webcams to request from Windy API
 
@@ -305,17 +309,11 @@ class DirectoryAgent:
                 result = await robots_skill.run(RobotsPolicyInput(domain=domain))
                 if result.allowed:
                     allowed_sources.append(source_url)
-                    logger.debug("DirectoryAgent: robots.txt allows {}", domain)
                 else:
-                    logger.info("DirectoryAgent: robots.txt disallows {} — skipping", domain)
+                    logger.debug("DirectoryAgent: robots.txt disallows {} — skipping", domain)
             except Exception as exc:
-                logger.warning("DirectoryAgent: robots check error for {}: {}", domain, exc)
+                logger.debug("DirectoryAgent: robots check error for {}: {}", domain, exc)
                 allowed_sources.append(source_url)  # default-allow on error
-
-        logger.info(
-            "DirectoryAgent: {}/{} sources allowed after robots.txt checks",
-            len(allowed_sources), len(filtered),
-        )
 
         # ── Step 3: traverse directories ──────────────────────────────────────
         traversal_skill = DirectoryTraversalSkill()
@@ -323,6 +321,8 @@ class DirectoryAgent:
 
         for i in range(0, len(allowed_sources), self.BATCH_SIZE):
             batch = allowed_sources[i : i + self.BATCH_SIZE]
+            for url in batch:
+                logger.info("DirectoryAgent: crawling {}", _domain_of(url))
             tasks = [
                 traversal_skill.run(TraversalInput(base_url=url, max_depth=self.MAX_DEPTH))
                 for url in batch
@@ -335,15 +335,6 @@ class DirectoryAgent:
                     )
                 else:
                     raw_candidates.extend(result.candidates)
-                    logger.debug(
-                        "DirectoryAgent: {} candidates from {}",
-                        len(result.candidates), source_url,
-                    )
-
-        logger.info(
-            "DirectoryAgent: traversal complete — {} raw candidates before feed extraction",
-            len(raw_candidates),
-        )
 
         # ── Step 4: resolve direct feed URLs via FeedExtractionSkill ──────────
         resolved = await self._resolve_feed_urls(raw_candidates)
@@ -379,78 +370,90 @@ class DirectoryAgent:
         Behaviour per candidate
         -----------------------
         - direct_stream_url found  → candidate URL updated to stream URL.
-        - embed_url found (≠ page) → candidate URL updated to embed URL (e.g. YouTube).
-        - Nothing found, page is deep (path ≥ 3 segments) → keep as HTML embed candidate.
-        - Nothing found, page is shallow (path < 3 segments) → drop (listing/nav page).
+        - Nothing found, url_path_depth ≥ 3  → keep as HTML embed candidate.
+        - Nothing found, url_path_depth < 3  → drop (listing/nav page).
         - embedded_links non-empty → each extra link becomes an additional sub-candidate.
 
-        A semaphore caps concurrent HTTP requests at EXTRACT_CONCURRENCY.
+        A shared AsyncClient and semaphore cap concurrent HTTP requests at
+        EXTRACT_CONCURRENCY; tqdm shows overall extraction progress.
         """
-        skill = FeedExtractionSkill()
         sem = asyncio.Semaphore(self.EXTRACT_CONCURRENCY)
+        streams_by_domain: defaultdict[str, int] = defaultdict(int)
 
-        async def _extract(candidate: CameraCandidate) -> list[CameraCandidate]:
-            page_url = candidate.url
-            async with sem:
-                try:
-                    feed = await skill.run(FeedExtractionInput(page_url=page_url))
-                except Exception as exc:
-                    logger.warning(
-                        "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            follow_redirects=True,
+            headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
+            limits=httpx.Limits(max_connections=self.EXTRACT_CONCURRENCY + 5),
+        ) as shared_client:
+            skill = FeedExtractionSkill(client=shared_client)
+
+            async def _extract(candidate: CameraCandidate) -> list[CameraCandidate]:
+                page_url = candidate.url
+                async with sem:
+                    try:
+                        feed = await skill.run(FeedExtractionInput(page_url=page_url))
+                    except Exception as exc:
+                        logger.warning(
+                            "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
+                        )
+                        return [candidate]
+
+                results: list[CameraCandidate] = []
+                already_seen: set[str] = {page_url}
+                best_url: Optional[str] = feed.direct_stream_url
+
+                if best_url:
+                    already_seen.add(best_url)
+                    refs = list(candidate.source_refs)
+                    if page_url not in refs:
+                        refs.append(page_url)
+                    results.append(
+                        candidate.model_copy(update={"url": best_url, "source_refs": refs})
                     )
-                    return [candidate]
-
-            results: list[CameraCandidate] = []
-            already_seen: set[str] = {page_url}
-
-            # Only direct stream URLs (.m3u8, .mjpeg) are accepted as camera links.
-            # Embed pages (YouTube, iframes) and HTML pages are not active streams.
-            best_url: Optional[str] = feed.direct_stream_url
-
-            if best_url:
-                already_seen.add(best_url)
-                refs = list(candidate.source_refs)
-                if page_url not in refs:
-                    refs.append(page_url)
-                results.append(
-                    candidate.model_copy(update={"url": best_url, "source_refs": refs})
-                )
-                logger.debug("DirectoryAgent: resolved {} → {}", page_url, best_url)
-            else:
-                # No stream/embed found — keep only if this looks like a specific camera
-                # page (deep URL path), not a shallow listing/navigation page.
-                path_depth = len(
-                    [s for s in urlparse(page_url).path.strip("/").split("/") if s]
-                )
-                if path_depth >= 3:
-                    results.append(candidate)
+                    streams_by_domain[_domain_of(page_url)] += 1
                 else:
-                    logger.debug(
-                        "DirectoryAgent: dropping shallow listing page (depth={}) {}",
-                        path_depth, page_url,
+                    # Keep only pages that look like specific camera pages (deep paths),
+                    # not shallow listing/navigation pages.
+                    url_path_depth = len(
+                        [s for s in urlparse(page_url).path.strip("/").split("/") if s]
+                    )
+                    if url_path_depth >= 3:
+                        results.append(candidate)
+
+                for link in feed.embedded_links:
+                    if link in already_seen:
+                        continue
+                    already_seen.add(link)
+                    results.append(
+                        CameraCandidate(
+                            url=link,
+                            label=candidate.label,
+                            city=candidate.city,
+                            country=candidate.country,
+                            source_directory=candidate.source_directory,
+                            source_refs=[page_url] + list(candidate.source_refs),
+                            notes=f"embedded_in:{page_url}",
+                        )
                     )
 
-            # Sub-candidates from additional embedded links found on the page
-            for link in feed.embedded_links:
-                if link in already_seen:
-                    continue
-                already_seen.add(link)
-                results.append(
-                    CameraCandidate(
-                        url=link,
-                        label=candidate.label,
-                        city=candidate.city,
-                        country=candidate.country,
-                        source_directory=candidate.source_directory,
-                        source_refs=[page_url] + list(candidate.source_refs),
-                        notes=f"embedded_in:{page_url}",
-                    )
-                )
+                return results if results else [candidate]
 
-            return results if results else [candidate]
+            nested = await tqdm_asyncio.gather(
+                *[_extract(c) for c in candidates],
+                desc="Extracting feeds",
+                unit="page",
+                ncols=90,
+            )
 
-        nested = await asyncio.gather(*[_extract(c) for c in candidates])
-        return [item for sublist in nested for item in sublist]
+        flat = [item for sublist in nested for item in sublist]
+
+        # Per-domain stream summary
+        if streams_by_domain:
+            for domain, count in sorted(streams_by_domain.items(), key=lambda x: -x[1]):
+                logger.info("  {}: {} HLS stream(s) found", domain, count)
+
+        return flat
 
     async def _api_discovery(self) -> list[CameraCandidate]:
         """
