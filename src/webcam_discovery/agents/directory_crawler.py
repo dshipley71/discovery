@@ -70,6 +70,7 @@ class SourcesRegistry:
         "fofa.info",
         "binaryedge.io",
         "greynoise.io",
+        "pictimo.com",
     })
 
     def __init__(self, sources_path: Optional[Path] = None) -> None:

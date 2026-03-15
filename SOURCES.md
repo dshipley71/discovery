@@ -34,6 +34,8 @@ These are high-yield aggregators with structured, city-indexed, open-access list
 | **LiveBeaches** | https://livebeaches.com | Global beach and coastal cams; no auth | HLS, iframe |
 | **Camscape** | https://camscape.com | Global webcam directory; city and nature cams | iframe, MJPEG |
 | **EarthTV** | https://earthtv.com | Global landmark and city cams; high-quality public feeds | HLS, iframe |
+| **GeoWebcams** | https://www.geowebcams.com | Global curated directory; city/country/continent-indexed; community-submitted; public API | HLS, iframe |
+| **CamStreamer** | https://camstreamer.com/live | Live gallery of Axis/network cameras; public no-auth streams; world map search | HLS, MJPEG |
 
 ---
 
@@ -233,6 +235,7 @@ These sources must never be searched, scraped, or used as a basis for catalog en
 | **Any `.m3u8` or RTSP requiring VPN** | Geo/access restricted; not universally public |
 | **Insecam.org** | Aggregates misconfigured private cameras; ethically excluded |
 | **Opentopia.com** | Same as Insecam — aggregates unintentionally exposed private cameras |
+| **Pictimo.com** | Self-describes listing "unsecured, open" cameras including "live home cameras" — aggregates misconfigured/unintended private exposures; same profile as Insecam |
 | **Camhacker.com** | Exploits exposed private devices; excluded entirely |
 | **Any site that lists "hacked cameras"** | Entirely excluded regardless of phrasing |
 | **foto-webcam.eu** | https://www.foto-webcam.eu | image/MJPEG feeds |
