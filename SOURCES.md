@@ -34,6 +34,7 @@ These are high-yield aggregators with structured, city-indexed, open-access list
 | **LiveBeaches** | https://livebeaches.com | Global beach and coastal cams; no auth | HLS, iframe |
 | **Camscape** | https://camscape.com | Global webcam directory; city and nature cams | iframe, MJPEG |
 | **EarthTV** | https://earthtv.com | Global landmark and city cams; high-quality public feeds | HLS, iframe |
+| **GeoWebcams** | https://www.geowebcams.com | Global curated directory; city/country/continent-indexed; community-submitted; public API | HLS, iframe |
 
 ---
 
