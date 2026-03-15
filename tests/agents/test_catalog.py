@@ -26,8 +26,8 @@ def make_record(**kwargs) -> CameraRecord:
         continent="Europe",
         latitude=51.5055,
         longitude=-0.0754,
-        url="https://example.com/tower-bridge",
-        feed_type="youtube_live",
+        url="https://cdn.example.com/tower-bridge/live.m3u8",
+        feed_type="HLS_stream",
         legitimacy_score="high",
         status="live",
     )

@@ -14,12 +14,8 @@ from pydantic import BaseModel, HttpUrl, field_validator
 # ── Feed types ────────────────────────────────────────────────────────────────
 
 FeedType = Literal[
-    "youtube_live",
-    "static_refresh",
-    "MJPEG",
-    "HLS",
-    "iframe",
-    "js_player",
+    "HLS_master",   # Master playlist: contains #EXT-X-STREAM-INF variant references
+    "HLS_stream",   # Media playlist: contains #EXTINF segments (direct live stream)
     "unknown",
 ]
 
@@ -48,28 +44,26 @@ class CameraRecord(BaseModel):
     Validated, geo-enriched camera record.
     Produced by ValidationAgent; catalogued by CatalogAgent.
     All fields required before export to camera.geojson.
+    url always points to the direct .m3u8 stream.
     """
-    id:                 str
-    label:              str
-    city:               str
-    region:             Optional[str]  = None
-    country:            str
-    continent:          str
-    latitude:           Optional[float] = None
-    longitude:          Optional[float] = None
-    url:                str
-    stream_url:         Optional[str]  = None
-    direct_stream_url:  Optional[str]  = None
-    video_id:           Optional[str]  = None
-    feed_type:          FeedType       = "unknown"
-    source_directory:   Optional[str]  = None
-    source_refs:        list[str]      = []
-    legitimacy_score:   LegitimacyScore = "medium"
-    requires_js:        bool           = False
-    geo_restricted:     bool           = False
-    last_verified:      Optional[str]  = None   # ISO date string
-    status:             CameraStatus   = "unknown"
-    notes:              Optional[str]  = None
+    id:               str
+    label:            str
+    city:             str
+    region:           Optional[str]  = None
+    country:          str
+    continent:        str
+    latitude:         Optional[float] = None
+    longitude:        Optional[float] = None
+    url:              str                              # direct .m3u8 stream URL
+    feed_type:        FeedType        = "unknown"
+    playlist_type:    Optional[Literal["master", "media"]] = None
+    variant_streams:  list[str]       = []            # variant URLs from master playlist
+    source_directory: Optional[str]  = None
+    source_refs:      list[str]      = []
+    legitimacy_score: LegitimacyScore = "medium"
+    last_verified:    Optional[str]  = None           # ISO date string
+    status:           CameraStatus   = "unknown"
+    notes:            Optional[str]  = None
 
     @field_validator("latitude")
     @classmethod

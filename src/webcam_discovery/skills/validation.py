@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-validation.py — Feed liveness validation, robots.txt compliance, and feed type classification.
+validation.py — HLS stream validation and robots.txt compliance.
 Part of the Public Webcam Discovery System.
 
-Validation strategy by URL type
----------------------------------
-HLS  (.m3u8)    — GET first 1 KB; verify #EXTM3U magic → high/live.
-MJPEG (.mjpeg)  — HEAD for multipart/x-mixed-replace; byte-probe if HEAD returns 405.
-MP4/WebM        — Rejected outright; static video files are not live camera feeds.
-YouTube embed   — Rejected outright; embed pages are not direct stream URLs.
-HTML page       — GET full page; scan for embedded .m3u8 or .mjpeg URLs.
-                  Each found stream URL is probed directly.
-                  → high/live   if a live HLS or MJPEG stream URL is confirmed
-                  → dead        if no live stream URL is found in the HTML
+Validation strategy
+-------------------
+Only .m3u8 (HLS) URLs are accepted as active camera streams.
+All other URL types are rejected immediately — no HTML probing, no MJPEG,
+no iframes, no YouTube embeds, no MP4 files.
 
-Only HLS and MJPEG streams are accepted as active camera links.
-HTML pages, MP4 files, YouTube embeds, and iframe pages are all rejected.
+HLS validation
+--------------
+1. GET the first 4 KB of the URL.
+2. Verify #EXTM3U magic byte on line 1.
+3. Classify playlist type:
+   - Master playlist: contains #EXT-X-STREAM-INF → feed_type=HLS_master
+     Variant stream URLs are extracted and stored in variant_streams.
+   - Media playlist: contains #EXTINF or #EXT-X-TARGETDURATION → feed_type=HLS_stream
+4. Return ValidationResult with playlist_type and variant_streams.
 
 Concurrency: asyncio.Semaphore(settings.validation_concurrency) — default 50.
 Timeout:     connect=10 s, read=25 s — generous for slow camera servers.
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 
@@ -47,8 +49,10 @@ class ValidationResult(BaseModel):
     legitimacy_score: LegitimacyScore = "medium"
     status: CameraStatus = "unknown"
     fail_reason: Optional[str] = None
-    stream_url: Optional[str] = None
-    """Resolved direct stream URL when probed URL was an HTML page containing a stream."""
+    playlist_type: Optional[Literal["master", "media"]] = None
+    """HLS playlist type: 'master' (multi-bitrate index) or 'media' (live segment list)."""
+    variant_streams: list[str] = []
+    """Variant stream URLs extracted from a master playlist."""
 
 
 class RobotsPolicyInput(BaseModel):
@@ -66,7 +70,7 @@ class FeedTypeInput(BaseModel):
     """Input for feed type classification."""
     url: str
     content_type: Optional[str] = None
-    page_html: Optional[str] = None
+    playlist_type: Optional[Literal["master", "media"]] = None
 
 
 class FeedTypeResult(BaseModel):
@@ -83,115 +87,28 @@ _BROWSER_UA = (
 )
 
 _HLS_MAGIC   = b"#EXTM3U"
-_JPEG_MAGIC  = b"\xff\xd8\xff"
-
-_HLS_URL_RE    = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
-_MJPEG_URL_RE  = re.compile(r"\.(mjpg|mjpeg)(\?|$)", re.IGNORECASE)
-_STATIC_IMG_RE = re.compile(r"\.(jpg|jpeg|png|gif|bmp|webp)(\?|$)", re.IGNORECASE)
-_MP4_URL_RE    = re.compile(r"\.(mp4|webm|ogv)(\?|$)", re.IGNORECASE)
-_YOUTUBE_RE    = re.compile(r"youtube(?:-nocookie)?\.com/embed/", re.IGNORECASE)
-_AUTH_URL_RE   = re.compile(
+_HLS_URL_RE  = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
+_AUTH_URL_RE = re.compile(
     r"/(login|signin|sign-in|auth|register|subscribe|account|member|join)",
-    re.IGNORECASE,
-)
-
-# Live-stream indicators inside HTML — any match → HIGH legitimacy
-_LIVE_HTML_HIGH_RE = re.compile(
-    r"""(?:
-        \.m3u8['"\s]                            |
-        multipart/x-mixed-replace               |
-        hls\.loadSource\s*\(                    |
-        jwplayer\s*\(                           |
-        (?<!\w)videojs\s*\(                     |
-        Hls\.js                                 |
-        flowplayer\s*\(                         |
-        data-setup\s*=                          |
-        ['"]stream[Uu]rl['"]                    |
-        ['"]hls[Uu]rl['"]                       |
-        ['"]stream_url['"]                      |
-        src\s*=\s*['"][^'"]*\.m3u8              |
-        data-src\s*=\s*['"][^'"]*\.m3u8         |
-        <img[^>]+src\s*=\s*[^>]*\.mjpe?g
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Secondary indicators → MEDIUM legitimacy
-_LIVE_HTML_MED_RE = re.compile(
-    r"(?:<video[\s>]|autoplay|webcam|live\s*cam|camera\s*feed|live\s*stream)",
-    re.IGNORECASE,
-)
-
-_MEDIA_CONTENT_TYPES = frozenset({
-    "multipart/x-mixed-replace", "image/jpeg", "image/png",
-    "video/mp4", "video/webm", "video/ogg",
-    "application/vnd.apple.mpegurl", "application/x-mpegurl",
-    "video/x-flv", "video/mpeg",
-})
-
-# Patterns for extracting actual stream URLs embedded inside HTML pages.
-# Only HLS (.m3u8) and MJPEG (.mjpg/.mjpeg) are valid live stream types.
-_HLS_URL_IN_HTML = re.compile(
-    r"""['"]([^'"]{1,500}\.m3u8[^'"]{0,100})['"]""",
-    re.IGNORECASE,
-)
-_MJPEG_URL_IN_HTML = re.compile(
-    r"""['"]([^'"]{1,500}\.mj(?:pg|peg)[^'"]{0,100})['"]""",
     re.IGNORECASE,
 )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _is_youtube(url: str) -> bool:
-    p = urlparse(url)
-    return p.netloc in (
-        "www.youtube-nocookie.com", "youtube-nocookie.com",
-        "www.youtube.com", "youtube.com",
-    ) and "/embed/" in p.path
-
-
 def _has_auth_path(url: str) -> bool:
     return bool(_AUTH_URL_RE.search(urlparse(url).path))
-
-
-def _ct_base(ct: str) -> str:
-    return ct.split(";")[0].strip().lower() if ct else ""
-
-
-def _classify_by_status(
-    url: str, code: int, ct: str, headers: dict
-) -> tuple[LegitimacyScore, CameraStatus, Optional[str]]:
-    """Classify purely from HTTP status + content-type (no HTML inspection)."""
-    if "www-authenticate" in headers or "x-auth-required" in headers:
-        return "low", "dead", "auth_header"
-    if code in (401, 403, 407):
-        return "low", "dead", f"http_{code}"
-    if code == 404:
-        return "low", "dead", "http_404"
-    if code in range(301, 308):
-        return "medium", "unknown", "redirect"
-    if code not in range(200, 207):
-        return "low", "dead", f"http_{code}"
-    if _has_auth_path(url):
-        return "low", "dead", "auth_url_pattern"
-    base = _ct_base(ct)
-    if any(base.startswith(m) for m in _MEDIA_CONTENT_TYPES):
-        return "high", "live", None
-    if "text/html" in ct.lower():
-        return "medium", "live", "html_no_probe"
-    return "medium", "live", None
 
 
 # ── FeedValidationSkill ────────────────────────────────────────────────────────
 
 class FeedValidationSkill:
     """
-    Validate a list of URLs for liveness and live-video content.
+    Validate a list of .m3u8 URLs for liveness.
 
-    Routes each URL to a specialised probe: HLS playlist magic check,
-    MJPEG multipart probe, video/* content-type check, or HTML deep-scan
-    for live-player patterns.  Semaphore-limited to avoid overwhelming servers.
+    Only HLS (.m3u8) stream URLs are accepted. All other URL types are rejected
+    immediately without making an HTTP request. Semaphore-limited concurrency
+    avoids overwhelming servers.
     """
 
     async def run(self, urls: list[str]) -> list[ValidationResult]:
@@ -199,7 +116,7 @@ class FeedValidationSkill:
         Probe each URL and return a ValidationResult.
 
         Args:
-            urls: Candidate URLs to validate.
+            urls: Candidate URLs to validate (only .m3u8 URLs will be probed).
 
         Returns:
             list[ValidationResult] in the same order as urls.
@@ -236,17 +153,11 @@ class FeedValidationSkill:
         return result
 
     async def _dispatch(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """Route to the correct probe based on URL type.
-
-        Only HLS (.m3u8) and MJPEG (.mjpg/.mjpeg) streams are accepted as active
-        camera links.  YouTube embeds, MP4 files, and static images are rejected
-        immediately.  HTML pages are deep-scanned for embedded stream URLs.
         """
-        if _is_youtube(url):
-            return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
-                fail_reason="youtube_embed_not_stream",
-            )
+        Route .m3u8 URLs to the HLS probe; reject all other URL types immediately.
+
+        Only HLS (.m3u8) streams are accepted as active camera links.
+        """
         if _has_auth_path(url):
             return ValidationResult(
                 url=url, legitimacy_score="low", status="dead",
@@ -254,24 +165,18 @@ class FeedValidationSkill:
             )
         if _HLS_URL_RE.search(url):
             return await self._probe_hls(client, url)
-        if _MJPEG_URL_RE.search(url):
-            return await self._probe_mjpeg(client, url)
-        if _MP4_URL_RE.search(url):
-            return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
-                fail_reason="mp4_static_video_not_stream",
-            )
-        if _STATIC_IMG_RE.search(url):
-            return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
-                fail_reason="static_image_not_stream",
-            )
-        return await self._probe_html(client, url)
-
-    # ── Per-type probes ───────────────────────────────────────────────────────
+        return ValidationResult(
+            url=url, legitimacy_score="low", status="dead",
+            fail_reason="not_m3u8_stream",
+        )
 
     async def _probe_hls(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """Fetch first 1 KB of HLS playlist and verify #EXTM3U magic."""
+        """
+        Fetch HLS playlist, verify #EXTM3U magic, and classify as master or media.
+
+        Master playlist (#EXT-X-STREAM-INF) → playlist_type='master', variant_streams extracted.
+        Media playlist  (#EXTINF / #EXT-X-TARGETDURATION) → playlist_type='media'.
+        """
         try:
             async with client.stream("GET", url) as resp:
                 ct = resp.headers.get("content-type", "")
@@ -284,187 +189,58 @@ class FeedValidationSkill:
                 buf = b""
                 async for chunk in resp.aiter_bytes():
                     buf += chunk
-                    if len(buf) >= 1024:
+                    if len(buf) >= 4096:
                         break
 
-            if _HLS_MAGIC in buf:
-                logger.debug("FeedValidationSkill: HLS confirmed {}", url)
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="high", status="live",
-                )
-            if any(k in ct.lower() for k in ("mpegurl", "m3u8", "octet-stream")):
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="medium", status="live",
-                    fail_reason="no_m3u8_magic",
-                )
-            return ValidationResult(
-                url=url, status_code=200, content_type=ct or None,
-                legitimacy_score="low", status="unknown",
-                fail_reason="no_m3u8_magic",
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
-    async def _probe_mjpeg(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """HEAD for multipart/x-mixed-replace; fall back to byte-probe GET."""
-        try:
-            resp = await client.head(url)
-            ct = resp.headers.get("content-type", "")
-
-            if "multipart/x-mixed-replace" in ct.lower():
-                return ValidationResult(
-                    url=url, status_code=resp.status_code, content_type=ct,
-                    legitimacy_score="high", status="live",
-                )
-            if resp.status_code in (405, 501) or (resp.status_code in range(200, 207) and not ct):
-                async with client.stream("GET", url) as gr:
-                    ct = gr.headers.get("content-type", "")
-                    if "multipart/x-mixed-replace" in ct.lower():
-                        return ValidationResult(
-                            url=url, status_code=gr.status_code, content_type=ct,
-                            legitimacy_score="high", status="live",
-                        )
-                    buf = b""
-                    async for chunk in gr.aiter_bytes():
-                        buf += chunk
-                        if len(buf) >= 512:
-                            break
-                    if buf.startswith(_JPEG_MAGIC):
-                        return ValidationResult(
-                            url=url, status_code=gr.status_code, content_type=ct or None,
-                            legitimacy_score="high", status="live",
-                        )
-            legit, status, fail = _classify_by_status(url, resp.status_code, ct, dict(resp.headers))
-            return ValidationResult(
-                url=url, status_code=resp.status_code, content_type=ct or None,
-                legitimacy_score=legit, status=status, fail_reason=fail,
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
-    async def _probe_video(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """HEAD probe for MP4/WebM — confirm video/* content-type."""
-        try:
-            resp = await client.head(url)
-            ct = resp.headers.get("content-type", "")
-            base = _ct_base(ct)
-            if base.startswith("video/") or base == "application/octet-stream":
-                return ValidationResult(
-                    url=url, status_code=resp.status_code, content_type=ct,
-                    legitimacy_score="high", status="live",
-                )
-            legit, status, fail = _classify_by_status(url, resp.status_code, ct, dict(resp.headers))
-            return ValidationResult(
-                url=url, status_code=resp.status_code, content_type=ct or None,
-                legitimacy_score=legit, status=status, fail_reason=fail,
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
-    async def _probe_static_image(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """Accessible static images are marked low legitimacy (not a live feed)."""
-        try:
-            resp = await client.head(url)
-            ct = resp.headers.get("content-type", "")
-            if resp.status_code in range(200, 207):
-                return ValidationResult(
-                    url=url, status_code=resp.status_code, content_type=ct or None,
-                    legitimacy_score="low", status="live",
-                    fail_reason="static_image",
-                )
-            legit, status, fail = _classify_by_status(url, resp.status_code, ct, dict(resp.headers))
-            return ValidationResult(
-                url=url, status_code=resp.status_code, content_type=ct or None,
-                legitimacy_score=legit, status=status, fail_reason=fail,
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
-    async def _probe_html(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
-        """
-        GET page and scan for embedded HLS (.m3u8) or MJPEG stream URLs.
-
-        The HTML page URL itself is never accepted as a camera link.  Only an
-        actual stream URL extracted from the page and confirmed live is returned.
-
-        high/live  → a live .m3u8 or .mjpeg stream URL was found and confirmed.
-                     ValidationResult.stream_url carries the resolved stream URL.
-        dead       → the page loaded but contained no confirmedactive stream URL.
-        """
-        try:
-            resp = await client.get(url)
-            ct = resp.headers.get("content-type", "")
-            if resp.status_code not in range(200, 207):
-                legit, status, fail = _classify_by_status(
-                    url, resp.status_code, ct, dict(resp.headers)
-                )
-                return ValidationResult(
-                    url=url, status_code=resp.status_code, content_type=ct or None,
-                    legitimacy_score=legit, status=status, fail_reason=fail,
-                )
-
-            html = resp.text[:65_536]
-
-            # Collect candidate stream URLs embedded in this page (HLS first, then MJPEG)
-            stream_candidates: list[tuple[str, str]] = []
-            seen_streams: set[str] = set()
-
-            for m in _HLS_URL_IN_HTML.finditer(html):
-                raw = m.group(1).strip()
-                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
-                if abs_url not in seen_streams:
-                    seen_streams.add(abs_url)
-                    stream_candidates.append(("hls", abs_url))
-
-            for m in _MJPEG_URL_IN_HTML.finditer(html):
-                raw = m.group(1).strip()
-                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
-                if abs_url not in seen_streams:
-                    seen_streams.add(abs_url)
-                    stream_candidates.append(("mjpeg", abs_url))
-
-            if not stream_candidates:
-                logger.debug(
-                    "FeedValidationSkill: no stream URLs found in HTML {}", url
-                )
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="low", status="dead",
-                    fail_reason="no_stream_url_in_html",
-                )
-
-            # Probe the first few stream candidates; return on first confirmed live stream
-            for kind, stream_url in stream_candidates[:5]:
-                if kind == "hls":
-                    result = await self._probe_hls(client, stream_url)
-                else:
-                    result = await self._probe_mjpeg(client, stream_url)
-
-                if result.status == "live":
-                    logger.debug(
-                        "FeedValidationSkill: stream confirmed via HTML {} → {}",
-                        url, stream_url,
-                    )
+            if _HLS_MAGIC not in buf:
+                if any(k in ct.lower() for k in ("mpegurl", "m3u8", "octet-stream")):
                     return ValidationResult(
                         url=url, status_code=200, content_type=ct or None,
-                        legitimacy_score=result.legitimacy_score, status="live",
-                        stream_url=stream_url,
+                        legitimacy_score="medium", status="live",
+                        fail_reason="no_m3u8_magic",
                     )
+                return ValidationResult(
+                    url=url, status_code=200, content_type=ct or None,
+                    legitimacy_score="low", status="unknown",
+                    fail_reason="no_m3u8_magic",
+                )
 
+            content = buf.decode("utf-8", errors="replace")
+
+            # Classify playlist type
+            is_master = "#EXT-X-STREAM-INF" in content
+            is_media  = "#EXTINF" in content or "#EXT-X-TARGETDURATION" in content
+
+            playlist_type: Optional[Literal["master", "media"]] = None
+            variant_streams: list[str] = []
+
+            if is_master:
+                playlist_type = "master"
+                lines = content.splitlines()
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        for j in range(i + 1, len(lines)):
+                            variant_line = lines[j].strip()
+                            if variant_line and not variant_line.startswith("#"):
+                                abs_url = (
+                                    variant_line if variant_line.startswith("http")
+                                    else urljoin(url, variant_line)
+                                )
+                                if abs_url not in variant_streams:
+                                    variant_streams.append(abs_url)
+                                break
+            elif is_media:
+                playlist_type = "media"
+
+            logger.debug(
+                "FeedValidationSkill: HLS confirmed {} (playlist_type={})",
+                url, playlist_type or "unclassified",
+            )
             return ValidationResult(
                 url=url, status_code=200, content_type=ct or None,
-                legitimacy_score="low", status="dead",
-                fail_reason="stream_urls_found_but_all_dead",
+                legitimacy_score="high", status="live",
+                playlist_type=playlist_type,
+                variant_streams=variant_streams,
             )
         except httpx.TimeoutException:
             return ValidationResult(url=url, status="unknown", fail_reason="timeout")
@@ -539,54 +315,31 @@ class RobotsPolicySkill:
 
 # ── FeedTypeClassificationSkill ───────────────────────────────────────────────
 
-_YT_PATTERN      = re.compile(r"(youtube\.com/embed/|youtu\.be/)", re.IGNORECASE)
-_HLS_EXT_RE      = re.compile(r"\.(m3u8)(\?|$)", re.IGNORECASE)
-_MJPEG_EXT_RE    = re.compile(r"\.(mjpg|mjpeg)(\?|$)", re.IGNORECASE)
-_JPEG_EXT_RE     = re.compile(r"\.(jpg|jpeg|png)(\?|$)", re.IGNORECASE)
-_MP4_EXT_RE      = re.compile(r"\.(mp4|webm)(\?|$)", re.IGNORECASE)
-_JS_PLAYER_RE    = re.compile(
-    r"(jwplayer|hls\.loadSource|videojs|Video\.js|data-setup|Hls\.js|flowplayer)",
-    re.IGNORECASE,
-)
-_META_REFRESH_RE = re.compile(r'<meta[^>]+http-equiv=["\']refresh["\']', re.IGNORECASE)
-_IFRAME_RE       = re.compile(r"<iframe", re.IGNORECASE)
+_HLS_EXT_RE = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 
 
 class FeedTypeClassificationSkill:
-    """Classify feed type from URL, content-type, and page HTML."""
+    """Classify HLS feed type (master vs. media) from playlist_type and URL."""
 
     def run(self, input: FeedTypeInput) -> FeedTypeResult:
         """
-        Classify the feed type for a given URL.
+        Classify the HLS feed type for a given URL.
 
         Args:
-            input: FeedTypeInput with url, optional content_type and page_html.
+            input: FeedTypeInput with url, optional content_type, and playlist_type.
 
         Returns:
-            FeedTypeResult with feed_type string.
+            FeedTypeResult with feed_type: HLS_master, HLS_stream, or unknown.
         """
-        url  = input.url or ""
-        ct   = (input.content_type or "").lower()
-        html = input.page_html or ""
-
-        if _YT_PATTERN.search(url) or "youtube-nocookie.com/embed/" in url:
-            return FeedTypeResult(feed_type="youtube_live")
-        if _HLS_EXT_RE.search(url) or "application/vnd.apple.mpegurl" in ct or "application/x-mpegurl" in ct:
-            return FeedTypeResult(feed_type="HLS")
-        if _MJPEG_EXT_RE.search(url) or "multipart/x-mixed-replace" in ct:
-            return FeedTypeResult(feed_type="MJPEG")
-        if _MP4_EXT_RE.search(url) and "video/" in ct:
-            return FeedTypeResult(feed_type="HLS")
-        if _JPEG_EXT_RE.search(url) and ("image/jpeg" in ct or "image/png" in ct):
-            return FeedTypeResult(feed_type="static_refresh")
-        if html and (_META_REFRESH_RE.search(html) or "setInterval" in html) and "image/" in ct:
-            return FeedTypeResult(feed_type="static_refresh")
-        if html and _JS_PLAYER_RE.search(html):
-            return FeedTypeResult(feed_type="js_player")
-        if html and _IFRAME_RE.search(html):
-            return FeedTypeResult(feed_type="iframe")
-        if "text/html" in ct:
-            return FeedTypeResult(feed_type="iframe")
+        if input.playlist_type == "master":
+            return FeedTypeResult(feed_type="HLS_master")
+        if input.playlist_type == "media":
+            return FeedTypeResult(feed_type="HLS_stream")
+        if _HLS_EXT_RE.search(input.url or ""):
+            ct = (input.content_type or "").lower()
+            if "vnd.apple.mpegurl" in ct or "x-mpegurl" in ct:
+                return FeedTypeResult(feed_type="HLS_stream")
+            return FeedTypeResult(feed_type="HLS_stream")
         return FeedTypeResult(feed_type="unknown")
 
 
@@ -597,7 +350,7 @@ if __name__ == "__main__":
 
     async def _main() -> None:
         urls = sys.argv[1:] or [
-            "https://www.webcamtaxi.com/en/usa/new-york-state/times-square.html",
+            "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8",
         ]
         skill = FeedValidationSkill()
         results = await skill.run(urls)

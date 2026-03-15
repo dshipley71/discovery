@@ -33,10 +33,9 @@ def sample_record() -> CameraRecord:
         continent="North America",
         latitude=40.7580,
         longitude=-73.9855,
-        url="https://example.com/webcam/times-square",
-        feed_type="youtube_live",
-        video_id="dQw4w9WgXcQ",
-        stream_url="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?autoplay=1&mute=1",
+        url="https://cdn.example.com/times-square/live.m3u8",
+        feed_type="HLS_stream",
+        playlist_type="media",
         legitimacy_score="high",
         status="live",
         last_verified="2025-03-10",
@@ -46,19 +45,23 @@ def sample_record() -> CameraRecord:
 
 @pytest.fixture
 def mock_live_stream():
-    """Mock a live MJPEG stream response."""
+    """Mock a live HLS stream response."""
     with respx.mock:
-        respx.head("https://example.com/stream.mjpg").mock(
-            return_value=httpx.Response(200, headers={"content-type": "multipart/x-mixed-replace"})
+        respx.get("https://cdn.example.com/live.m3u8").mock(
+            return_value=httpx.Response(
+                200,
+                headers={"content-type": "application/vnd.apple.mpegurl"},
+                content=b"#EXTM3U\n#EXTINF:6.0,\nseg.ts\n",
+            )
         )
         yield
 
 
 @pytest.fixture
 def mock_dead_stream():
-    """Mock a dead / HTML-returning stream URL."""
+    """Mock a dead HLS stream URL."""
     with respx.mock:
-        respx.head("https://example.com/dead.mjpg").mock(
+        respx.get("https://cdn.example.com/dead.m3u8").mock(
             return_value=httpx.Response(404)
         )
         yield
