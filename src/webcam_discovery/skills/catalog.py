@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -400,6 +402,11 @@ class GeoEnrichmentSkill:
     _IP_API_URL = "http://ip-api.com/json/{host}"
     _IP_API_FIELDS = "status,lat,lon,country,regionName,city"
 
+    # Nominatim usage policy: max 1 request/second across ALL instances.
+    _nominatim_lock: threading.Lock = threading.Lock()
+    _nominatim_last_req: float = 0.0
+    _NOMINATIM_INTERVAL: float = 1.1  # seconds between requests
+
     def __init__(self) -> None:
         """Initialize geocoder with a polite user-agent."""
         self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0", timeout=5)
@@ -458,14 +465,24 @@ class GeoEnrichmentSkill:
             cached = self._cache[key]
             return cached if cached is not None else GeoEnrichmentOutput()
 
+        def _rate_limited_geocode() -> object:
+            """Acquire the class-level Nominatim lock and enforce ≥1.1 s between requests."""
+            with GeoEnrichmentSkill._nominatim_lock:
+                wait = GeoEnrichmentSkill._NOMINATIM_INTERVAL - (
+                    time.monotonic() - GeoEnrichmentSkill._nominatim_last_req
+                )
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    return self._geocoder.geocode(
+                        query, exactly_one=True, addressdetails=True, language="en"
+                    )
+                finally:
+                    GeoEnrichmentSkill._nominatim_last_req = time.monotonic()
+
         try:
             loop = asyncio.get_event_loop()
-            location = await loop.run_in_executor(
-                None,
-                lambda: self._geocoder.geocode(
-                    query, exactly_one=True, addressdetails=True, language="en"
-                ),
-            )
+            location = await loop.run_in_executor(None, _rate_limited_geocode)
         except (GeocoderTimedOut, GeocoderUnavailable) as exc:
             logger.debug("GeoEnrichmentSkill geocoder error for '{}': {}", query, exc)
             self._cache[key] = None

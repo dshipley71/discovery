@@ -491,6 +491,8 @@ class DirectoryAgent:
 
 def main() -> None:
     """CLI entry point for the directory crawler (wcd-discover)."""
+    from webcam_discovery.pipeline import configure_logging
+    configure_logging()
     parser = argparse.ArgumentParser(
         description="Traverse public webcam directories and write candidates.jsonl."
     )

@@ -210,6 +210,8 @@ class SearchAgent:
 
 def main() -> None:
     """CLI entry point for search agent."""
+    from webcam_discovery.pipeline import configure_logging
+    configure_logging()
     parser = argparse.ArgumentParser(
         description="Discover cameras via structured search queries."
     )

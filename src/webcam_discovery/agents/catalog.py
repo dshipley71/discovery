@@ -166,6 +166,8 @@ class CatalogAgent:
 
 def main() -> None:
     """CLI entry point for catalog agent."""
+    from webcam_discovery.pipeline import configure_logging
+    configure_logging()
     parser = argparse.ArgumentParser(description="Deduplicate and export camera catalog")
     parser.add_argument("--input", type=Path, required=True,
                         help="Path to validated.jsonl from ValidationAgent")

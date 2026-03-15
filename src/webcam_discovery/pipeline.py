@@ -7,10 +7,29 @@ Part of the Public Webcam Discovery System.
 from __future__ import annotations
 import asyncio
 import argparse
+import sys
 from pathlib import Path
 from loguru import logger
 
 from webcam_discovery.config import settings
+
+
+def configure_logging() -> None:
+    """
+    Set up loguru handlers for pipeline runs.
+
+    Terminal: INFO and above only (keeps progress bars clean).
+    Log file: DEBUG and above (full detail for post-run inspection).
+    Call once at the start of any pipeline or agent entry point.
+    """
+    logger.remove()  # remove the default DEBUG stderr handler
+    logger.add(sys.stderr, level="INFO", colorize=True)
+    logger.add(
+        settings.log_dir / "pipeline.log",
+        level="DEBUG",
+        rotation="10 MB",
+        retention="30 days",
+    )
 
 
 async def run_pipeline(tier: int = 1) -> None:
@@ -21,7 +40,7 @@ async def run_pipeline(tier: int = 1) -> None:
         tier: Source tier to start discovery from (1 = highest priority).
     """
     settings.ensure_dirs()
-    logger.add(settings.log_dir / "pipeline.log", rotation="10 MB", retention="30 days")
+    configure_logging()
     logger.info("Pipeline starting — tier={}", tier)
 
     # Step 1 + 2: Discovery
