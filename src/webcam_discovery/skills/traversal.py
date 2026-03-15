@@ -335,6 +335,23 @@ class DirectoryTraversalSkill:
 class FeedExtractionSkill:
     """Extract .m3u8 stream URLs from webcam player pages."""
 
+    _CLIENT_DEFAULTS = dict(
+        timeout=httpx.Timeout(10.0),
+        follow_redirects=True,
+        headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
+    )
+
+    def __init__(self, client: Optional[httpx.AsyncClient] = None) -> None:
+        """
+        Initialise the skill.
+
+        Args:
+            client: A pre-created AsyncClient to reuse across many calls.
+                    When None (default) a fresh client is created per ``run()`` call.
+                    Pass a shared client from the caller for better throughput.
+        """
+        self._shared_client = client
+
     async def run(self, input: FeedExtractionInput) -> FeedExtractionOutput:
         """
         Fetch a page and extract .m3u8 stream URLs.
@@ -345,17 +362,21 @@ class FeedExtractionSkill:
         Returns:
             FeedExtractionOutput with direct_stream_url and embedded_links (.m3u8 only).
         """
-        url = input.page_url
+        if self._shared_client is not None:
+            return await self._fetch_and_extract(self._shared_client, input.page_url)
+
+        async with httpx.AsyncClient(**self._CLIENT_DEFAULTS) as client:
+            return await self._fetch_and_extract(client, input.page_url)
+
+    async def _fetch_and_extract(
+        self, client: httpx.AsyncClient, url: str
+    ) -> FeedExtractionOutput:
+        """Fetch ``url`` using ``client`` and extract HLS streams from the response."""
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0),
-                follow_redirects=True,
-                headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
-            ) as client:
-                response = await client.get(url)
-                if response.status_code != 200:
-                    return FeedExtractionOutput()
-                html = response.text
+            response = await client.get(url)
+            if response.status_code != 200:
+                return FeedExtractionOutput()
+            html = response.text
         except httpx.TimeoutException:
             logger.warning("FeedExtractionSkill timeout: {}", url)
             return FeedExtractionOutput()
