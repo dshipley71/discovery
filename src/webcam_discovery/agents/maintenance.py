@@ -212,6 +212,8 @@ class MaintenanceAgent:
 
 def main() -> None:
     """CLI entry point for maintenance agent."""
+    from webcam_discovery.pipeline import configure_logging
+    configure_logging()
     parser = argparse.ArgumentParser(description="Run maintenance checks on camera catalog")
     parser.add_argument(
         "--catalog", type=Path, default=Path("camera.geojson"),

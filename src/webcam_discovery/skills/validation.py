@@ -238,10 +238,7 @@ class FeedValidationSkill:
             elif is_media:
                 playlist_type = "media"
 
-            logger.debug(
-                "FeedValidationSkill: HLS confirmed {} (playlist_type={})",
-                url, playlist_type or "unclassified",
-            )
+
             return ValidationResult(
                 url=url, status_code=200, content_type=ct or None,
                 legitimacy_score="high", status="live",

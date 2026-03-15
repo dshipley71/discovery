@@ -348,6 +348,8 @@ class ValidationAgent:
 
 def main() -> None:
     """CLI entry point for validator (wcd-validate)."""
+    from webcam_discovery.pipeline import configure_logging
+    configure_logging()
     parser = argparse.ArgumentParser(description="Validate camera candidates")
     parser.add_argument(
         "--input", type=Path, required=True,
