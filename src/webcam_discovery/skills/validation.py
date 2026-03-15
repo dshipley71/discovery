@@ -35,6 +35,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 from loguru import logger
 from pydantic import BaseModel
+from tqdm.asyncio import tqdm_asyncio
 
 from webcam_discovery.schemas import CameraStatus, FeedType, LegitimacyScore
 
@@ -138,7 +139,12 @@ class FeedValidationSkill:
             headers={"User-Agent": _BROWSER_UA},
         ) as client:
             tasks = [self._probe(client, url, sem) for url in urls]
-            return list(await asyncio.gather(*tasks, return_exceptions=False))
+            return list(await tqdm_asyncio.gather(
+                *tasks,
+                desc="Probing URLs",
+                unit="url",
+                ncols=90,
+            ))
 
     async def _probe(
         self, client: httpx.AsyncClient, url: str, sem: asyncio.Semaphore
@@ -292,7 +298,7 @@ class RobotsPolicySkill:
                 )
                 result = RobotsPolicyResult(allowed=not blocked, disallowed_paths=disallowed)
         except Exception as exc:
-            logger.warning("robots.txt fetch failed for {}: {}", domain, exc)
+            logger.debug("robots.txt fetch failed for {}: {}", domain, exc)
             result = RobotsPolicyResult(allowed=True)
 
         self._cache[domain] = result
