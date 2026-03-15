@@ -364,36 +364,28 @@ function openModal(p) {{
 
   const playerDiv = document.getElementById('modal-player');
   playerDiv.innerHTML = '';
-  if (p.direct_stream_url && p.feed_type === 'HLS') {{
+  if (p.url) {{
     const video = document.createElement('video');
     video.controls = true; video.autoplay = false; video.muted = true;
     if (Hls.isSupported()) {{
-      const hls = new Hls(); hls.loadSource(p.direct_stream_url); hls.attachMedia(video);
+      const hls = new Hls(); hls.loadSource(p.url); hls.attachMedia(video);
     }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-      video.src = p.direct_stream_url;
+      video.src = p.url;
     }}
     playerDiv.appendChild(video);
-  }} else if (p.direct_stream_url && p.feed_type === 'MJPEG') {{
-    const img = document.createElement('img');
-    img.src = p.direct_stream_url; img.alt = p.label || 'stream';
-    playerDiv.appendChild(img);
-  }} else if (p.stream_url || p.url) {{
-    const iframe = document.createElement('iframe');
-    iframe.src = p.stream_url || p.url;
-    iframe.allow = 'autoplay; fullscreen';
-    iframe.style.height = '400px';
-    playerDiv.appendChild(iframe);
   }} else {{
     playerDiv.innerHTML = '<p style="color:#888;padding:20px">No stream URL available.</p>';
   }}
 
-  const yesNo = v => v ? 'Yes' : 'No';
+  const variantLinks = (p.variant_streams || []).map((v, i) =>
+    `<a href="${{v}}" target="_blank" rel="noopener" style="color:#89b4fa;font-size:11px">Variant ${{i+1}}</a>`
+  ).join(' ');
   document.getElementById('modal-meta').innerHTML = `
     <strong>Feed Type:</strong> ${{p.feed_type || '—'}}<br>
+    <strong>Playlist Type:</strong> ${{p.playlist_type || '—'}}<br>
+    ${{variantLinks ? `<strong>Variants:</strong> ${{variantLinks}}<br>` : ''}}
     <strong>Source:</strong> ${{p.source_directory || '—'}}<br>
     <strong>Legitimacy:</strong> ${{p.legitimacy_score || '—'}}<br>
-    <strong>Requires JS:</strong> ${{yesNo(p.requires_js)}}<br>
-    <strong>Geo Restricted:</strong> ${{yesNo(p.geo_restricted)}}<br>
     <strong>Last Verified:</strong> ${{p.last_verified || '—'}}<br>
     ${{p.notes ? `<strong>Notes:</strong> ${{p.notes}}<br>` : ''}}
   `;

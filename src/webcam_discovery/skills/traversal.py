@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-traversal.py — Directory traversal and feed URL extraction from webcam listing pages.
+traversal.py — Directory traversal and .m3u8 feed URL extraction from webcam listing pages.
 Part of the Public Webcam Discovery System.
 
 Traversal strategy
@@ -15,7 +15,8 @@ Limits:
   MAX_SUB_LINKS_PER_PAGE = 10  — sub-category links followed per page.
 
 FeedExtractionSkill is the companion tool that fetches individual camera pages
-and returns all .m3u8/.mjpeg stream URLs found in the static HTML.
+and returns all .m3u8 stream URLs found in the static HTML.
+Only HLS (.m3u8) streams are collected — all other URL types are ignored.
 """
 from __future__ import annotations
 
@@ -63,7 +64,7 @@ class FeedExtractionOutput(BaseModel):
     embed_url: Optional[str] = None
     feed_type_hint: Optional[str] = None
     embedded_links: list[str] = []
-    """All stream/embed URLs collected from the page (direct streams + iframes + YouTube).
+    """All .m3u8 stream URLs collected from the page.
     Used by DirectoryAgent to create sub-candidates when the page is a listing."""
 
 
@@ -87,18 +88,16 @@ _STREAM_VAR_RE = re.compile(
 )
 _DATA_CAM_RE = re.compile(r"""data-cam-url\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _DATA_STREAM_RE = re.compile(r"""data-stream\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
-_DATA_SRC_RE = re.compile(r"""data-src\s*=\s*['"]([^'"]+\.(?:m3u8|mjpg|mjpeg)[^'"]*)['"]""", re.IGNORECASE)
+_DATA_SRC_RE = re.compile(r"""data-src\s*=\s*['"]([^'"]+\.m3u8[^'"]*)['"]""", re.IGNORECASE)
 
-# Only HLS and MJPEG are accepted as live streams; MP4 is a static video format.
-_STREAM_EXTENSIONS = re.compile(r"\.(m3u8|mjpg|mjpeg)(\?|$)", re.IGNORECASE)
-_YOUTUBE_EMBED_RE = re.compile(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", re.IGNORECASE)
+# Only HLS (.m3u8) is accepted as a live stream.
+_STREAM_EXTENSIONS = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 
 _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next|p=\d+)[^'"]*)['"]""", re.IGNORECASE)
 
-# Broad patterns: catch ANY quoted .m3u8 or .mjpeg URL regardless of variable name or context.
-# These supplement the specific patterns above for sites that use non-standard naming.
-_BROAD_HLS_RE  = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""", re.IGNORECASE)
-_BROAD_MJPEG_RE = re.compile(r"""['"]([^'"]{4,500}\.mj(?:pg|peg)[^'"]{0,100})['"]""", re.IGNORECASE)
+# Broad pattern: catch ANY quoted .m3u8 URL regardless of variable name or context.
+# Supplements the specific patterns above for sites that use non-standard naming.
+_BROAD_HLS_RE = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""", re.IGNORECASE)
 
 # Per-source traversal limits — prevent runaway crawls on large directories.
 MAX_PAGES_PER_SOURCE   = 100   # total HTTP GETs per source URL
@@ -334,17 +333,17 @@ class DirectoryTraversalSkill:
 # ── FeedExtractionSkill ────────────────────────────────────────────────────────
 
 class FeedExtractionSkill:
-    """Extract raw stream URLs from embed or player pages."""
+    """Extract .m3u8 stream URLs from webcam player pages."""
 
     async def run(self, input: FeedExtractionInput) -> FeedExtractionOutput:
         """
-        Fetch a page and extract direct stream URL and feed type hint.
+        Fetch a page and extract .m3u8 stream URLs.
 
         Args:
             input: FeedExtractionInput with page_url.
 
         Returns:
-            FeedExtractionOutput with direct_stream_url, embed_url, feed_type_hint.
+            FeedExtractionOutput with direct_stream_url and embedded_links (.m3u8 only).
         """
         url = input.page_url
         try:
@@ -355,24 +354,23 @@ class FeedExtractionSkill:
             ) as client:
                 response = await client.get(url)
                 if response.status_code != 200:
-                    return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
+                    return FeedExtractionOutput()
                 html = response.text
         except httpx.TimeoutException:
             logger.warning("FeedExtractionSkill timeout: {}", url)
-            return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
+            return FeedExtractionOutput()
         except Exception as exc:
             logger.warning("FeedExtractionSkill error on {}: {}", url, exc)
-            return FeedExtractionOutput(embed_url=url, feed_type_hint="iframe")
+            return FeedExtractionOutput()
 
         return self._extract_from_html(html, url)
 
     def _extract_from_html(self, html: str, base_url: str) -> FeedExtractionOutput:
         """
-        Extract direct HLS (.m3u8) and MJPEG stream URLs from HTML content.
+        Extract HLS (.m3u8) stream URLs from HTML content.
 
-        Only actual stream URLs are collected — iframe embeds and YouTube links are
-        ignored because they are HTML pages, not active camera feeds.  All stream
-        URL matches are collected via finditer so listing pages with multiple
+        Only .m3u8 URLs are collected — all other URL types are ignored.
+        All matches are collected via finditer so listing pages with multiple
         embedded cameras surface all of them.  Results are stored in
         `embedded_links`; the single best stream is promoted to `direct_stream_url`.
         """
@@ -383,11 +381,10 @@ class FeedExtractionSkill:
             if not raw:
                 return
             abs_url = _absolute(raw, base_url) if not raw.startswith("http") else raw
-            # Only accept HLS and MJPEG — the two live-stream formats
             if _STREAM_EXTENSIONS.search(abs_url) and abs_url not in direct_streams:
                 direct_streams.append(abs_url)
 
-        # 1. <source src="..."> with stream extensions
+        # 1. <source src="..."> with .m3u8 extension
         for source in soup.find_all("source"):
             _add_direct(source.get("src", ""))
 
@@ -402,46 +399,34 @@ class FeedExtractionSkill:
             for m in pattern.finditer(html):
                 _add_direct(m.group(1))
 
-        # 4. Broad catch-all: any quoted .m3u8 or .mjpeg URL anywhere in HTML.
+        # 4. Broad catch-all: any quoted .m3u8 URL anywhere in HTML.
         #    Runs over the full raw HTML so it catches stream URLs in JSON blobs,
         #    window.__data__ assignments, and any non-standard variable names.
-        for pattern in (_BROAD_HLS_RE, _BROAD_MJPEG_RE):
-            for m in pattern.finditer(html):
-                _add_direct(m.group(1))
+        for m in _BROAD_HLS_RE.finditer(html):
+            _add_direct(m.group(1))
 
-        # 5. <a href> with direct stream extensions (listing pages linking to streams)
+        # 5. <a href> with .m3u8 extension (listing pages linking directly to streams)
         for link in soup.find_all("a", href=True):
             _add_direct(str(link["href"]))
 
-        # embedded_links contains only confirmed stream URLs (no iframes, no YouTube)
         best_direct = direct_streams[0] if direct_streams else None
 
         if best_direct:
             logger.debug(
-                "FeedExtractionSkill: {} stream(s) on {}", len(direct_streams), base_url
+                "FeedExtractionSkill: {} .m3u8 stream(s) on {}", len(direct_streams), base_url
             )
             return FeedExtractionOutput(
                 direct_stream_url=best_direct,
                 embed_url=base_url,
-                feed_type_hint=self._guess_feed_type(best_direct),
+                feed_type_hint="HLS",
                 embedded_links=direct_streams,
             )
 
-        # No stream URLs found — return empty result (page will be dropped or deep-kept)
         return FeedExtractionOutput(
             embed_url=None,
             feed_type_hint=None,
             embedded_links=[],
         )
-
-    def _guess_feed_type(self, url: str) -> str:
-        """Guess feed type from URL extension. Only HLS and MJPEG are live streams."""
-        lower = url.lower()
-        if ".m3u8" in lower:
-            return "HLS"
-        if ".mjpg" in lower or ".mjpeg" in lower:
-            return "MJPEG"
-        return "unknown"
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ from webcam_discovery.skills.validation import (
     RobotsPolicyInput,
     FeedTypeClassificationSkill,
     FeedTypeInput,
+    ValidationResult,
 )
 from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput
 
@@ -194,13 +195,10 @@ class ValidationAgent:
 
         # ── Step 6: build CameraRecord objects ────────────────────────────────
         for (candidate, v), geo in zip(to_enrich, geo_results):
-            # When _probe_html resolved an actual stream URL embedded in an HTML
-            # page, v.stream_url carries that URL.  Use it as the camera link so
-            # the record always points to an active stream, never to an HTML page.
-            effective_url = v.stream_url or candidate.url
             feed_type_result = type_skill.run(FeedTypeInput(
-                url=effective_url,
+                url=candidate.url,
                 content_type=v.content_type,
+                playlist_type=v.playlist_type,
             ))
 
             city    = candidate.city    or "Unknown"
@@ -222,16 +220,13 @@ class ValidationAgent:
                 if geo.country:
                     country = geo.country
 
-            record_id = _make_slug(city, label) or _make_slug("camera", effective_url[-30:])
+            record_id = _make_slug(city, label) or _make_slug("camera", candidate.url[-30:])
 
             notes = candidate.notes or ""
             if latitude is None:
                 notes = f"{notes} location_unknown".strip()
 
-            # Track the original HTML page URL in source_refs when stream_url differs
             source_refs = list(candidate.source_refs) if candidate.source_refs else []
-            if v.stream_url and candidate.url not in source_refs:
-                source_refs = [candidate.url] + source_refs
 
             try:
                 record = CameraRecord(
@@ -243,10 +238,12 @@ class ValidationAgent:
                     continent=continent,
                     latitude=latitude,
                     longitude=longitude,
-                    url=effective_url,
+                    url=candidate.url,
                     feed_type=feed_type_result.feed_type,
+                    playlist_type=v.playlist_type,
+                    variant_streams=v.variant_streams,
                     source_directory=candidate.source_directory,
-                    source_refs=source_refs or [effective_url],
+                    source_refs=source_refs or [candidate.url],
                     legitimacy_score=v.legitimacy_score,
                     status=v.status,
                     last_verified=None,
@@ -254,12 +251,13 @@ class ValidationAgent:
                 )
                 records.append(record)
                 logger.debug(
-                    "ValidationAgent: ✓ {} | feed={} | legit={} | coords={} | url={}",
+                    "ValidationAgent: ✓ {} | feed={} | playlist={} | legit={} | coords={} | url={}",
                     label,
                     feed_type_result.feed_type,
+                    v.playlist_type or "—",
                     v.legitimacy_score,
                     f"{latitude:.3f},{longitude:.3f}" if latitude is not None else "none",
-                    effective_url,
+                    candidate.url,
                 )
             except Exception as exc:
                 logger.warning(

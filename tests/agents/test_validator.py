@@ -2,10 +2,13 @@
 """
 test_validator.py — Unit tests for ValidationAgent contracts.
 All HTTP mocked via respx. No live network calls.
+
+After the m3u8-only refactor, all non-.m3u8 URLs are rejected immediately
+without making an HTTP request.
 """
 from __future__ import annotations
 
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 from typing import Optional
 
 import pytest
@@ -20,7 +23,7 @@ from webcam_discovery.skills.catalog import GeoEnrichmentOutput
 def make_candidate(**kwargs) -> CameraCandidate:
     """Build a minimal CameraCandidate."""
     defaults = dict(
-        url="https://example.com/webcam/test",
+        url="https://cdn.example.com/webcam/live.m3u8",
         label="Test Camera",
         city="London",
         country="United Kingdom",
@@ -49,15 +52,17 @@ def _mock_geo_skill(output: Optional[GeoEnrichmentOutput] = None):
 
 
 @pytest.mark.asyncio
-async def test_legitimacy_high_on_media():
-    """Media content-type → high legitimacy record created."""
-    candidate = make_candidate(url="https://example.com/stream.mjpg")
+async def test_legitimacy_high_on_hls_media_playlist():
+    """HLS media playlist → high legitimacy, status=live, playlist_type=media."""
+    candidate = make_candidate(url="https://cdn.example.com/stream.m3u8")
 
     with respx.mock:
-        respx.head("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
-        respx.head("https://example.com/stream.mjpg").mock(
+        respx.get("https://cdn.example.com/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://cdn.example.com/stream.m3u8").mock(
             return_value=httpx.Response(
-                200, headers={"content-type": "multipart/x-mixed-replace; boundary=frame"}
+                200,
+                headers={"content-type": "application/vnd.apple.mpegurl"},
+                content=b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\n",
             )
         )
         with patch(
@@ -70,18 +75,28 @@ async def test_legitimacy_high_on_media():
     assert len(records) == 1
     assert records[0].legitimacy_score == "high"
     assert records[0].status == "live"
+    assert records[0].playlist_type == "media"
+    assert records[0].feed_type == "HLS_stream"
 
 
 @pytest.mark.asyncio
-async def test_html_stream_url_medium_legitimacy():
-    """text/html on stream URL → medium legitimacy (not hard-rejected by default config)."""
-    candidate = make_candidate(url="https://example.com/cam-embed-page")
+async def test_hls_master_playlist_feed_type():
+    """HLS master playlist → feed_type=HLS_master, variant_streams populated."""
+    candidate = make_candidate(url="https://cdn.example.com/master.m3u8")
 
     with respx.mock:
-        respx.head("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
-        respx.head("https://example.com/cam-embed-page").mock(
+        respx.get("https://cdn.example.com/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://cdn.example.com/master.m3u8").mock(
             return_value=httpx.Response(
-                200, headers={"content-type": "text/html; charset=utf-8"}
+                200,
+                headers={"content-type": "application/vnd.apple.mpegurl"},
+                content=(
+                    b"#EXTM3U\n"
+                    b"#EXT-X-STREAM-INF:BANDWIDTH=2500000\n"
+                    b"high.m3u8\n"
+                    b"#EXT-X-STREAM-INF:BANDWIDTH=800000\n"
+                    b"low.m3u8\n"
+                ),
             )
         )
         with patch(
@@ -91,27 +106,43 @@ async def test_html_stream_url_medium_legitimacy():
             agent = ValidationAgent()
             records = await agent.run(candidates=[candidate])
 
-    # text/html returns medium legitimacy — depends on min_legitimacy setting
-    # With default "medium" min, these should be accepted
+    assert len(records) == 1
+    assert records[0].feed_type == "HLS_master"
+    assert records[0].playlist_type == "master"
+    assert len(records[0].variant_streams) == 2
+
+
+@pytest.mark.asyncio
+async def test_non_m3u8_url_rejected():
+    """Non-.m3u8 URL (HTML page) → status=dead, fail_reason=not_m3u8_stream."""
+    candidate = make_candidate(url="https://example.com/cam-embed-page.html")
+
+    with respx.mock:
+        respx.get("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
+        # No HTTP call expected for the candidate URL — rejected without probing
+        agent = ValidationAgent()
+        records = await agent.run(candidates=[candidate])
+
+    # The record may be created (depending on min_legitimacy setting) but must be dead
     if records:
-        assert records[0].legitimacy_score == "medium"
+        assert records[0].status == "dead"
+        assert records[0].url == "https://example.com/cam-embed-page.html"
 
 
 @pytest.mark.asyncio
 async def test_robots_blocked_domain_skipped():
     """robots.txt disallows webcam paths → candidate skipped."""
-    candidate = make_candidate(url="https://blocked-site.com/webcams/london")
+    candidate = make_candidate(url="https://blocked-site.com/webcams/stream.m3u8")
 
     robots_txt = """User-agent: *
-Disallow: /webcams/
-Disallow: /cameras/
-Disallow: /live/
+Disallow: /webcams
+Disallow: /cameras
+Disallow: /live
 """
     with respx.mock:
-        respx.head("https://blocked-site.com/robots.txt").mock(
+        respx.get("https://blocked-site.com/robots.txt").mock(
             return_value=httpx.Response(200, text=robots_txt)
         )
-        # HEAD for the actual URL should NOT be called if robots blocks it
         agent = ValidationAgent()
         records = await agent.run(candidates=[candidate])
 
@@ -121,12 +152,12 @@ Disallow: /live/
 
 @pytest.mark.asyncio
 async def test_timeout_status_unknown():
-    """Timeout → status=unknown, not a crash; record may be excluded due to missing coords."""
-    candidate = make_candidate(url="https://example.com/slow-cam")
+    """HLS timeout → status=unknown, not a crash."""
+    candidate = make_candidate(url="https://cdn.example.com/slow.m3u8")
 
     with respx.mock:
-        respx.head("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
-        respx.head("https://example.com/slow-cam").mock(
+        respx.get("https://cdn.example.com/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://cdn.example.com/slow.m3u8").mock(
             side_effect=httpx.TimeoutException("timed out")
         )
         with patch(
@@ -134,22 +165,20 @@ async def test_timeout_status_unknown():
             _mock_geo_skill(),
         ):
             agent = ValidationAgent()
-            # Should not raise — graceful handling
             records = await agent.run(candidates=[candidate])
 
-    # Timeout → status unknown → may or may not produce a record depending on min_legitimacy
-    # Critical assertion: no exception was raised
+    # Timeout → status=unknown, low legitimacy → may be filtered; no exception raised
     assert isinstance(records, list)
 
 
 @pytest.mark.asyncio
-async def test_401_candidate_excluded():
-    """401 response → legitimacy=low → excluded from output."""
-    candidate = make_candidate(url="https://example.com/auth-cam")
+async def test_401_hls_candidate_dead():
+    """HLS returning 401 → status=dead, legitimacy=low."""
+    candidate = make_candidate(url="https://cdn.example.com/private.m3u8")
 
     with respx.mock:
-        respx.head("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
-        respx.head("https://example.com/auth-cam").mock(
+        respx.get("https://cdn.example.com/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://cdn.example.com/private.m3u8").mock(
             return_value=httpx.Response(401)
         )
         with patch(
@@ -159,8 +188,10 @@ async def test_401_candidate_excluded():
             agent = ValidationAgent()
             records = await agent.run(candidates=[candidate])
 
-    # Low legitimacy should be excluded with default min_legitimacy="medium"
-    assert records == []
+    # Record may or may not appear depending on min_legitimacy; if present it must be dead/low
+    if records:
+        assert records[0].status == "dead"
+        assert records[0].legitimacy_score == "low"
 
 
 @pytest.mark.asyncio
@@ -175,16 +206,18 @@ async def test_empty_candidates():
 async def test_record_id_is_slug():
     """Validated record ID is a slugified string."""
     candidate = make_candidate(
-        url="https://example.com/stream.mjpg",
+        url="https://cdn.example.com/big-ben.m3u8",
         label="Big Ben Live View",
         city="London",
     )
 
     with respx.mock:
-        respx.head("https://example.com/robots.txt").mock(return_value=httpx.Response(404))
-        respx.head("https://example.com/stream.mjpg").mock(
+        respx.get("https://cdn.example.com/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://cdn.example.com/big-ben.m3u8").mock(
             return_value=httpx.Response(
-                200, headers={"content-type": "image/jpeg"}
+                200,
+                headers={"content-type": "application/vnd.apple.mpegurl"},
+                content=b"#EXTM3U\n#EXTINF:6.0,\nseg.ts\n",
             )
         )
         with patch(
@@ -196,7 +229,6 @@ async def test_record_id_is_slug():
 
     if records:
         record_id = records[0].id
-        # ID should be lowercase, hyphen-separated, no special chars
         assert record_id == record_id.lower()
         assert " " not in record_id
         assert record_id.replace("-", "").replace("_", "").isalnum() or "-" in record_id

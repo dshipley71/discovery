@@ -21,8 +21,8 @@ def make_record(**kwargs) -> CameraRecord:
         continent="North America",
         latitude=40.7580,
         longitude=-73.9855,
-        url="https://example.com/webcam/times-square",
-        feed_type="youtube_live",
+        url="https://cdn.example.com/webcam/times-square.m3u8",
+        feed_type="HLS_stream",
         legitimacy_score="high",
         status="live",
     )
