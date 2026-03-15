@@ -433,9 +433,6 @@ class FeedExtractionSkill:
         best_direct = direct_streams[0] if direct_streams else None
 
         if best_direct:
-            logger.debug(
-                "FeedExtractionSkill: {} .m3u8 stream(s) on {}", len(direct_streams), base_url
-            )
             return FeedExtractionOutput(
                 direct_stream_url=best_direct,
                 embed_url=base_url,
