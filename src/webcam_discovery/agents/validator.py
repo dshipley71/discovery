@@ -32,6 +32,7 @@ from typing import Optional
 
 from loguru import logger
 from slugify import slugify
+from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 
 from webcam_discovery.config import settings
@@ -303,12 +304,14 @@ class ValidationAgent:
                 if key not in cache and key not in seen_city_country:
                     seen_city_country[key] = c
 
-        if seen_city_country:
-            logger.info(
-                "ValidationAgent: pre-geocoding {} unique city+country pair(s) …",
-                len(seen_city_country),
-            )
-        for key, c in seen_city_country.items():
+        for key, c in tqdm(
+            seen_city_country.items(),
+            total=len(seen_city_country),
+            desc="Geocoding city+country",
+            unit="pair",
+            ncols=90,
+            disable=not seen_city_country,
+        ):
             city = (c.city or "").strip()
             country = (c.country or "").strip()
             query = f"{city}, {country}" if country else city
@@ -323,12 +326,14 @@ class ValidationAgent:
                 if ckey not in cache:
                     seen_countries.add(country)
 
-        if seen_countries:
-            logger.debug(
-                "ValidationAgent: pre-geocoding {} unique country center(s) …",
-                len(seen_countries),
-            )
-        for country in seen_countries:
+        for country in tqdm(
+            seen_countries,
+            total=len(seen_countries),
+            desc="Geocoding countries  ",
+            unit="country",
+            ncols=90,
+            disable=not seen_countries,
+        ):
             await skill._geocode_nominatim(country, cache_key=f"country:{country}")
 
         # Phase 3: concurrent per-candidate resolution (mostly cache hits)
