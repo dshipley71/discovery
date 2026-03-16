@@ -456,7 +456,7 @@ class FeedExtractionSkill:
                     logger.warning("FeedExtractionSkill timeout (gave up): {}", url)
                     return None
             except Exception as exc:
-                logger.warning("FeedExtractionSkill error on {}: {}", url, exc)
+                logger.warning("FeedExtractionSkill error on {}: {}", url, repr(exc))
                 return None
         return None
 
