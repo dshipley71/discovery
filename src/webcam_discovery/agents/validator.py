@@ -166,6 +166,8 @@ class ValidationAgent:
             v = url_to_val.get(candidate.url)
             if v is None:
                 continue
+            if v.status != "live":
+                continue
             if not _legit_ok(v.legitimacy_score, min_legit):
                 logger.debug(
                     "ValidationAgent: drop {} — legit={} < min={}",
