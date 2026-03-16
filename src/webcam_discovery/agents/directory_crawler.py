@@ -8,10 +8,8 @@ canonical allow/block registry; this module never hardcodes source lists.
 
 Discovery sources
 -----------------
-1. Directory crawl  — recursively traverses all Tier-N SOURCES.md entries up to
-                      max_depth=5, following sub-category links and pagination.
-2. Windy API        — no-key public API; returns embed player URLs that the
-                      ValidationAgent's _probe_html will extract .m3u8 streams from.
+Directory crawl  — recursively traverses all Tier-N SOURCES.md entries up to
+                   max_depth=5, following sub-category links and pagination.
 
 Pipeline output: candidates/candidates.jsonl — one CameraCandidate JSON per line,
 with `url` set to the most direct stream URL found, or an embed page URL when the
@@ -42,7 +40,6 @@ from webcam_discovery.skills.traversal import (
     TraversalInput,
 )
 from webcam_discovery.skills.validation import RobotsPolicySkill, RobotsPolicyInput
-from webcam_discovery.skills.api_discovery import WindyApiSkill
 
 
 # ── SOURCES.md parser ─────────────────────────────────────────────────────────
@@ -256,18 +253,15 @@ class DirectoryAgent:
     Execution steps
     ---------------
     1. Parse SOURCES.md via SourcesRegistry to get source URLs and blocked domains.
-    2. Filter blocked domains; check robots.txt for each remaining source.
+    2. Filter blocked domains; check robots.txt concurrently for all remaining sources.
     3. Traverse each allowed source (batched, max_depth=5) via DirectoryTraversalSkill.
     4. Run FeedExtractionSkill on each candidate page to resolve direct stream URLs.
-    5. Call WindyApiSkill (no key required) to add embed-page candidates that the
-       validation pipeline can probe for .m3u8 stream URLs.
-    6. Deduplicate by URL and return combined list.
+    5. Deduplicate by URL and return combined list.
     """
 
     BATCH_SIZE          = 5    # parallel traversal tasks
     EXTRACT_CONCURRENCY = 25   # parallel feed-extraction requests
     MAX_DEPTH           = 5    # URL depth to traverse into source directories
-    WINDY_LIMIT         = 500  # max webcams to request from Windy API
 
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
         """
@@ -301,20 +295,23 @@ class DirectoryAgent:
             else:
                 filtered.append(url)
 
-        # ── Step 2: robots.txt checks ─────────────────────────────────────────
+        # ── Step 2: robots.txt checks (concurrent) ────────────────────────────
         robots_skill = RobotsPolicySkill()
-        allowed_sources: list[str] = []
-        for source_url in filtered:
+
+        async def _check_robots(source_url: str) -> Optional[str]:
             domain = _domain_of(source_url)
             try:
                 result = await robots_skill.run(RobotsPolicyInput(domain=domain))
                 if result.allowed:
-                    allowed_sources.append(source_url)
-                else:
-                    logger.debug("DirectoryAgent: robots.txt disallows {} — skipping", domain)
+                    return source_url
+                logger.debug("DirectoryAgent: robots.txt disallows {} — skipping", domain)
+                return None
             except Exception as exc:
                 logger.debug("DirectoryAgent: robots check error for {}: {}", domain, exc)
-                allowed_sources.append(source_url)  # default-allow on error
+                return source_url  # default-allow on error
+
+        robots_results = await asyncio.gather(*[_check_robots(url) for url in filtered])
+        allowed_sources = [url for url in robots_results if url is not None]
 
         # ── Step 3: traverse directories ──────────────────────────────────────
         traversal_skill = DirectoryTraversalSkill()
@@ -340,11 +337,7 @@ class DirectoryAgent:
         # ── Step 4: resolve direct feed URLs via FeedExtractionSkill ──────────
         resolved = await self._resolve_feed_urls(raw_candidates)
 
-        # ── Step 5: API-based discovery (no key required) ──────────────────────
-        api_candidates = await self._api_discovery()
-        resolved.extend(api_candidates)
-
-        # ── Step 6: deduplicate by URL ─────────────────────────────────────────
+        # ── Step 5: deduplicate by URL ─────────────────────────────────────────
         seen_urls: set[str] = set()
         unique: list[CameraCandidate] = []
         for c in resolved:
@@ -353,11 +346,8 @@ class DirectoryAgent:
                 unique.append(c)
 
         logger.info(
-            "DirectoryAgent: tier={} → {} unique candidates ({} from crawl, {} from APIs)",
-            tier,
-            len(unique),
-            len(resolved) - len(api_candidates),
-            len(api_candidates),
+            "DirectoryAgent: tier={} → {} unique candidates",
+            tier, len(unique),
         )
         return unique
 
@@ -455,36 +445,6 @@ class DirectoryAgent:
                 logger.info("  {}: {} HLS stream(s) found", domain, count)
 
         return flat
-
-    async def _api_discovery(self) -> list[CameraCandidate]:
-        """
-        Collect webcam candidates from public APIs that require no authentication.
-
-        Currently integrates:
-          - Windy Webcams API v2 (no key required for basic access)
-
-        Returns an empty list (with a warning) if the API is unreachable or has
-        started requiring authentication — the pipeline continues unaffected.
-        """
-        candidates: list[CameraCandidate] = []
-
-        # ── Windy API ─────────────────────────────────────────────────────────
-        try:
-            windy = WindyApiSkill()
-            result = await windy.run(total_limit=self.WINDY_LIMIT)
-            if result.error == "api_key_required":
-                logger.warning(
-                    "DirectoryAgent: Windy API now requires a key — skipping API source"
-                )
-            else:
-                candidates.extend(result.candidates)
-                logger.info(
-                    "DirectoryAgent: {} candidates from Windy API", len(result.candidates)
-                )
-        except Exception as exc:
-            logger.warning("DirectoryAgent: Windy API error — {}", exc)
-
-        return candidates
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     validation_timeout_connect: float = 10.0   # seconds to open TCP connection
     validation_timeout_read:    float = 25.0   # seconds to receive first response bytes
     validation_concurrency:     int   = 50     # max simultaneous HTTP probe requests
-    geo_thread_workers:         int   = 20     # ThreadPoolExecutor size for geocoding
 
     # Maintenance schedule
     maintenance_cadence_days: int = 7

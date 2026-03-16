@@ -407,10 +407,14 @@ class GeoEnrichmentSkill:
     _nominatim_last_req: float = 0.0
     _NOMINATIM_INTERVAL: float = 1.1  # seconds between requests
 
+    # Process-wide geocoding cache shared across all GeoEnrichmentSkill instances.
+    # Avoids redundant Nominatim / ip-api calls when the same city+country, label,
+    # or host is encountered across different candidates or pipeline runs.
+    _geo_cache: dict[str, Optional[GeoEnrichmentOutput]] = {}
+
     def __init__(self) -> None:
         """Initialize geocoder with a polite user-agent."""
         self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0", timeout=5)
-        self._cache: dict[str, Optional[GeoEnrichmentOutput]] = {}
 
     async def run(self, input: GeoEnrichmentInput) -> GeoEnrichmentOutput:
         """
@@ -461,8 +465,8 @@ class GeoEnrichmentSkill:
     ) -> GeoEnrichmentOutput:
         """Geocode a free-text query via Nominatim; results are cached."""
         key = cache_key or query
-        if key in self._cache:
-            cached = self._cache[key]
+        if key in GeoEnrichmentSkill._geo_cache:
+            cached = GeoEnrichmentSkill._geo_cache[key]
             return cached if cached is not None else GeoEnrichmentOutput()
 
         def _rate_limited_geocode() -> object:
@@ -485,16 +489,16 @@ class GeoEnrichmentSkill:
             location = await loop.run_in_executor(None, _rate_limited_geocode)
         except (GeocoderTimedOut, GeocoderUnavailable) as exc:
             logger.debug("GeoEnrichmentSkill geocoder error for '{}': {}", query, exc)
-            self._cache[key] = None
+            GeoEnrichmentSkill._geo_cache[key] = None
             return GeoEnrichmentOutput()
         except Exception as exc:
             logger.debug("GeoEnrichmentSkill unexpected error for '{}': {}", query, exc)
-            self._cache[key] = None
+            GeoEnrichmentSkill._geo_cache[key] = None
             return GeoEnrichmentOutput()
 
         if location is None:
             logger.debug("GeoEnrichmentSkill: no Nominatim result for '{}'", query)
-            self._cache[key] = None
+            GeoEnrichmentSkill._geo_cache[key] = None
             return GeoEnrichmentOutput()
 
         address = location.raw.get("address", {})
@@ -513,7 +517,7 @@ class GeoEnrichmentSkill:
             continent=_country_to_continent(found_country),
             confidence="high" if found_country else "medium",
         )
-        self._cache[key] = result
+        GeoEnrichmentSkill._geo_cache[key] = result
         logger.debug(
             "GeoEnrichmentSkill: Nominatim '{}' → ({:.4f}, {:.4f}) {}",
             query, result.latitude, result.longitude, found_country,
@@ -535,8 +539,8 @@ class GeoEnrichmentSkill:
                 return GeoEnrichmentOutput()
 
             cache_key = f"ip:{host}"
-            if cache_key in self._cache:
-                cached = self._cache[cache_key]
+            if cache_key in GeoEnrichmentSkill._geo_cache:
+                cached = GeoEnrichmentSkill._geo_cache[cache_key]
                 return cached if cached is not None else GeoEnrichmentOutput()
 
             api_url = self._IP_API_URL.format(host=host)
@@ -546,7 +550,7 @@ class GeoEnrichmentSkill:
 
             if data.get("status") != "success":
                 logger.debug("GeoEnrichmentSkill: ip-api no result for '{}'", host)
-                self._cache[cache_key] = None
+                GeoEnrichmentSkill._geo_cache[cache_key] = None
                 return GeoEnrichmentOutput()
 
             country = data.get("country") or ""
@@ -558,7 +562,7 @@ class GeoEnrichmentSkill:
                 continent=_country_to_continent(country),
                 confidence="low",
             )
-            self._cache[cache_key] = result
+            GeoEnrichmentSkill._geo_cache[cache_key] = result
             logger.debug(
                 "GeoEnrichmentSkill: IP geo '{}' → ({:.4f}, {:.4f}) {} [{}]",
                 host, result.latitude, result.longitude, country,

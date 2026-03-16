@@ -7,10 +7,14 @@ Performance model
 -----------------
 HTTP probing    — asyncio with Semaphore(settings.validation_concurrency).
                   FeedValidationSkill handles its own semaphore internally.
-Geo-enrichment  — concurrent.futures.ThreadPoolExecutor(settings.geo_thread_workers)
-                  via asyncio.run_in_executor; geopy calls are synchronous and
-                  rate-limited per-domain (1 req/s), so threads allow multiple
-                  lookups to run in parallel without blocking the event loop.
+Geo-enrichment  — pure asyncio with upfront cache warming.
+                  Before per-candidate resolution, unique city+country pairs and
+                  unique country names are geocoded once sequentially (respecting
+                  the Nominatim 1 req/s policy).  Per-candidate calls then run
+                  concurrently via asyncio.gather: most are instant cache hits;
+                  ip-api.com fallbacks execute in parallel since they share no lock.
+                  The process-wide class-level cache (GeoEnrichmentSkill._geo_cache)
+                  means repeated pipeline runs never re-geocode the same location.
 Coordinates     — GeoEnrichmentSkill tries four strategies: city+country,
                   label text, IP geolocation of hostname, country center.
                   Cameras that survive all fallbacks with no coordinates are
@@ -22,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import argparse
 import json
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
@@ -75,9 +78,9 @@ class ValidationAgent:
     1. Group by domain; check robots.txt concurrently (one task per domain).
     2. Probe all allowed URLs via FeedValidationSkill (semaphore-limited async).
     3. Filter by settings.min_legitimacy.
-    4. Classify feed type via FeedTypeClassificationSkill (synchronous).
-    5. Geo-enrich in parallel via ThreadPoolExecutor (synchronous geopy in threads).
-    6. Build CameraRecord; cameras where all geo fallbacks fail get latitude=None/longitude=None.
+    4. Geo-enrich via batch async: pre-warm cache for unique city+country pairs,
+       then resolve all candidates concurrently (cache hits + parallel ip-api calls).
+    5. Build CameraRecord; cameras where all geo fallbacks fail get latitude=None/longitude=None.
     """
 
     async def run(
@@ -175,37 +178,14 @@ class ValidationAgent:
             len(to_enrich), min_legit,
         )
 
-        # ── Step 4 & 5: classify + geo-enrich (threads for geo) ───────────────
-        loop = asyncio.get_event_loop()
+        # ── Step 4: geo-enrich (batch async with cache warming) ───────────────
+        geo_results = await self._batch_geo_enrich(
+            geo_skill, [c for c, _ in to_enrich]
+        )
+
         records: list[CameraRecord] = []
 
-        async def _safe_geo(fut):
-            try:
-                return await fut
-            except Exception as exc:
-                return exc
-
-        with ThreadPoolExecutor(
-            max_workers=settings.geo_thread_workers,
-            thread_name_prefix="geo-worker",
-        ) as executor:
-            geo_futures = [
-                _safe_geo(loop.run_in_executor(
-                    executor,
-                    self._geo_enrich_sync,
-                    geo_skill,
-                    candidate,
-                ))
-                for candidate, _ in to_enrich
-            ]
-            geo_results = await tqdm_asyncio.gather(
-                *geo_futures,
-                desc="Geo-enriching",
-                unit="cam",
-                ncols=90,
-            )
-
-        # ── Step 6: build CameraRecord objects ────────────────────────────────
+        # ── Step 5: build CameraRecord objects ────────────────────────────────
         for (candidate, v), geo in zip(to_enrich, geo_results):
             feed_type_result = type_skill.run(FeedTypeInput(
                 url=candidate.url,
@@ -287,6 +267,92 @@ class ValidationAgent:
 
     # ── Concurrency helpers ───────────────────────────────────────────────────
 
+    async def _batch_geo_enrich(
+        self,
+        skill: GeoEnrichmentSkill,
+        candidates: list[CameraCandidate],
+    ) -> list[Optional[object]]:
+        """
+        Geo-enrich candidates in bulk, deduplicating Nominatim queries.
+
+        Strategy
+        --------
+        Phase 1 — Pre-warm cache for unique city+country pairs.
+                  Each unique pair triggers exactly one sequential Nominatim
+                  call (respecting the 1 req/s policy).  All other candidates
+                  sharing that pair will be instant cache hits.
+        Phase 2 — Pre-warm cache for unique country names (country-center
+                  fallback).  Only countries not already resolved by Phase 1
+                  are geocoded here.
+        Phase 3 — Run skill.run() for every candidate concurrently via
+                  asyncio.gather.  Nearly all calls return from cache
+                  immediately; ip-api.com hostname lookups execute in
+                  parallel since they share no global lock.
+
+        Returns results in the same order as `candidates`.
+        """
+        cache = GeoEnrichmentSkill._geo_cache
+
+        # Phase 1: unique city+country → one Nominatim call each
+        seen_city_country: dict[str, CameraCandidate] = {}
+        for c in candidates:
+            city = (c.city or "").strip()
+            country = (c.country or "").strip()
+            if city and city.lower() not in ("unknown", ""):
+                key = f"city:{city}|{country}"
+                if key not in cache and key not in seen_city_country:
+                    seen_city_country[key] = c
+
+        if seen_city_country:
+            logger.info(
+                "ValidationAgent: pre-geocoding {} unique city+country pair(s) …",
+                len(seen_city_country),
+            )
+        for key, c in seen_city_country.items():
+            city = (c.city or "").strip()
+            country = (c.country or "").strip()
+            query = f"{city}, {country}" if country else city
+            await skill._geocode_nominatim(query, cache_key=key)
+
+        # Phase 2: unique countries for country-center fallback
+        seen_countries: set[str] = set()
+        for c in candidates:
+            country = (c.country or "").strip()
+            if country and country.lower() not in ("unknown", ""):
+                ckey = f"country:{country}"
+                if ckey not in cache:
+                    seen_countries.add(country)
+
+        if seen_countries:
+            logger.debug(
+                "ValidationAgent: pre-geocoding {} unique country center(s) …",
+                len(seen_countries),
+            )
+        for country in seen_countries:
+            await skill._geocode_nominatim(country, cache_key=f"country:{country}")
+
+        # Phase 3: concurrent per-candidate resolution (mostly cache hits)
+        async def _safe_run(candidate: CameraCandidate) -> Optional[object]:
+            try:
+                return await skill.run(GeoEnrichmentInput(
+                    city=candidate.city,
+                    country=candidate.country,
+                    label=candidate.label,
+                    url=candidate.url,
+                ))
+            except Exception as exc:
+                logger.debug(
+                    "ValidationAgent: geo failed for '{}': {}", candidate.url, exc
+                )
+                return None
+
+        return list(await tqdm_asyncio.gather(
+            *[_safe_run(c) for c in candidates],
+            desc="Geo-enriching",
+            unit="cam",
+            ncols=90,
+        ))
+
     async def _check_robots(
         self,
         skill: RobotsPolicySkill,
@@ -306,42 +372,6 @@ class ValidationAgent:
         except Exception as exc:
             logger.warning("ValidationAgent: robots check error for {}: {}", domain, exc)
             return cands  # default-allow on error
-
-    @staticmethod
-    def _geo_enrich_sync(
-        skill: GeoEnrichmentSkill, candidate: CameraCandidate
-    ):
-        """
-        Synchronous wrapper for GeoEnrichmentSkill, intended for use inside
-        a ThreadPoolExecutor.  Runs a fresh event loop per thread so that
-        the async geopy interface works without touching the main loop.
-
-        Geocoding fallback order (handled by GeoEnrichmentSkill):
-        1. city + country via Nominatim
-        2. label text via Nominatim
-        3. IP geolocation of the camera hostname via ip-api.com
-        4. country-center via Nominatim
-
-        Returns GeoEnrichmentOutput (may have None coords if all strategies fail).
-        """
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(
-                skill.run(GeoEnrichmentInput(
-                    city=candidate.city,
-                    country=candidate.country,
-                    label=candidate.label,
-                    url=candidate.url,
-                ))
-            )
-        except Exception as exc:
-            logger.debug(
-                "ValidationAgent: geo lookup failed for '{}': {}", candidate.url, exc
-            )
-            return None
-        finally:
-            loop.close()
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
