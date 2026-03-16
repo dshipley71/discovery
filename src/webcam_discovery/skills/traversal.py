@@ -353,7 +353,7 @@ class FeedExtractionSkill:
     """Extract .m3u8 stream URLs from webcam player pages."""
 
     _CLIENT_DEFAULTS = dict(
-        timeout=httpx.Timeout(10.0),
+        timeout=httpx.Timeout(5.0),
         follow_redirects=True,
         headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
     )
