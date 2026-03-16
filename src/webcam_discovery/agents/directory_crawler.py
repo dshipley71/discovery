@@ -274,7 +274,7 @@ class DirectoryAgent:
             Deduplicated list of CameraCandidate objects with resolved feed URLs.
         """
         registry = SourcesRegistry()
-        sources = registry.sources_for_tier(tier, hls_only=True)
+        sources = registry.sources_for_tier(tier, hls_only=False)
         blocked = registry.blocked_domains
 
         if not sources:
@@ -372,7 +372,7 @@ class DirectoryAgent:
         streams_by_domain: defaultdict[str, int] = defaultdict(int)
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0),
+            timeout=httpx.Timeout(5.0),
             follow_redirects=True,
             headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
             limits=httpx.Limits(max_connections=self.EXTRACT_CONCURRENCY + 5),
@@ -442,7 +442,7 @@ class DirectoryAgent:
         # Per-domain stream summary
         if streams_by_domain:
             for domain, count in sorted(streams_by_domain.items(), key=lambda x: -x[1]):
-                logger.info("  {}: {} HLS stream(s) found", domain, count)
+                logger.info("  {}: {} stream(s) found", domain, count)
 
         return flat
 
