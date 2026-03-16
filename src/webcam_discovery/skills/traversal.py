@@ -27,6 +27,23 @@ from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+
+def _make_soup(content: str) -> BeautifulSoup:
+    """
+    Return a BeautifulSoup for *content*, choosing the right parser automatically.
+
+    XML documents (``<?xml …>`` or ``<rss …>`` prologues) are parsed with
+    lxml's XML parser to avoid the ``XMLParsedAsHTMLWarning``.  All other
+    content uses the pure-Python ``html.parser``.
+    """
+    stripped = content.lstrip()
+    if stripped.startswith("<?xml") or stripped.startswith("<rss"):
+        try:
+            return BeautifulSoup(content, features="xml")
+        except Exception:
+            pass  # lxml not installed or parse error — fall through
+    return BeautifulSoup(content, "html.parser")
 from loguru import logger
 from pydantic import BaseModel
 
@@ -208,7 +225,7 @@ class DirectoryTraversalSkill:
             return []
         pages_fetched_ref[0] += 1
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = _make_soup(html)
         candidates: list[CameraCandidate] = []
         sub_pages: list[tuple[int, str]] = []  # (path_depth, abs_url) for sorting
 
@@ -399,15 +416,7 @@ class FeedExtractionSkill:
         XML parser to avoid the XMLParsedAsHTMLWarning.  Everything else falls
         back to html.parser.
         """
-        stripped = html.lstrip()
-        is_xml = stripped.startswith("<?xml") or stripped.startswith("<rss")
-        if is_xml:
-            try:
-                soup = BeautifulSoup(html, features="xml")
-            except Exception:
-                soup = BeautifulSoup(html, "html.parser")
-        else:
-            soup = BeautifulSoup(html, "html.parser")
+        soup = _make_soup(html)
         direct_streams: list[str] = []
 
         def _add_direct(raw: str) -> None:
