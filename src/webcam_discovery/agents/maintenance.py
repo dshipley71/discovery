@@ -113,7 +113,7 @@ class MaintenanceAgent:
         health_skill = HealthCheckSkill()
         summary = await health_skill.run(HealthCheckInput(
             records=records,
-            concurrency=settings.max_concurrency,
+            concurrency=settings.validation_concurrency,
         ))
 
         today = date.today().isoformat()

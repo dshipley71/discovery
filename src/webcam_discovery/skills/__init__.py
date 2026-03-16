@@ -58,11 +58,6 @@ from webcam_discovery.skills.map_rendering import (
     MapRenderingOutput,
 )
 
-from webcam_discovery.skills.api_discovery import (
-    WindyApiSkill,
-    ApiDiscoveryResult,
-)
-
 __all__ = [
     # traversal
     "DirectoryTraversalSkill",
@@ -110,7 +105,4 @@ __all__ = [
     "MapRenderingSkill",
     "MapRenderingInput",
     "MapRenderingOutput",
-    # api_discovery
-    "WindyApiSkill",
-    "ApiDiscoveryResult",
 ]
