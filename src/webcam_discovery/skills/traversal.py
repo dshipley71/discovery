@@ -388,14 +388,26 @@ class FeedExtractionSkill:
 
     def _extract_from_html(self, html: str, base_url: str) -> FeedExtractionOutput:
         """
-        Extract HLS (.m3u8) stream URLs from HTML content.
+        Extract HLS (.m3u8) stream URLs from HTML or XML content.
 
         Only .m3u8 URLs are collected — all other URL types are ignored.
         All matches are collected via finditer so listing pages with multiple
         embedded cameras surface all of them.  Results are stored in
         `embedded_links`; the single best stream is promoted to `direct_stream_url`.
+
+        XML documents (e.g. XSPF playlists, Atom feeds) are parsed with lxml's
+        XML parser to avoid the XMLParsedAsHTMLWarning.  Everything else falls
+        back to html.parser.
         """
-        soup = BeautifulSoup(html, "html.parser")
+        stripped = html.lstrip()
+        is_xml = stripped.startswith("<?xml") or stripped.startswith("<rss")
+        if is_xml:
+            try:
+                soup = BeautifulSoup(html, features="xml")
+            except Exception:
+                soup = BeautifulSoup(html, "html.parser")
+        else:
+            soup = BeautifulSoup(html, "html.parser")
         direct_streams: list[str] = []
 
         def _add_direct(raw: str) -> None:
