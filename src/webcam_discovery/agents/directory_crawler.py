@@ -38,6 +38,7 @@ from webcam_discovery.skills.traversal import (
     FeedExtractionSkill,
     FeedExtractionInput,
     TraversalInput,
+    _BROWSER_UA,
 )
 from webcam_discovery.skills.validation import RobotsPolicySkill, RobotsPolicyInput
 
@@ -237,6 +238,15 @@ class SourcesRegistry:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# URL path patterns that indicate a listing/navigation page rather than a
+# camera page.  Matching pages are skipped in feed extraction without making
+# any HTTP request.
+_LISTING_PATH_RE = re.compile(
+    r"/(?:tag|tags|category|categories|search|sitemap|feed|rss)(?:/|$|\?|\.)",
+    re.IGNORECASE,
+)
+
+
 def _domain_of(url: str) -> str:
     """Extract netloc from URL, stripping a 'www.' prefix if present."""
     netloc = urlparse(url).netloc
@@ -372,15 +382,20 @@ class DirectoryAgent:
         streams_by_domain: defaultdict[str, int] = defaultdict(int)
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(5.0),
+            timeout=httpx.Timeout(connect=3.0, read=8.0, write=5.0, pool=3.0),
             follow_redirects=True,
-            headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
+            headers={"User-Agent": _BROWSER_UA},
             limits=httpx.Limits(max_connections=self.EXTRACT_CONCURRENCY + 5),
         ) as shared_client:
             skill = FeedExtractionSkill(client=shared_client)
 
             async def _extract(candidate: CameraCandidate) -> list[CameraCandidate]:
                 page_url = candidate.url
+
+                # Skip category/tag/listing pages without an HTTP request.
+                if _LISTING_PATH_RE.search(urlparse(page_url).path):
+                    return []
+
                 async with sem:
                     try:
                         feed = await skill.run(FeedExtractionInput(page_url=page_url))

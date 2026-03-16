@@ -50,6 +50,23 @@ from pydantic import BaseModel
 from webcam_discovery.schemas import CameraCandidate
 
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Domains whose iframes should never be followed (ads, social, maps, CDN).
+_SKIP_IFRAME_DOMAINS: frozenset[str] = frozenset({
+    "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com",
+    "facebook.com", "twitter.com", "x.com", "instagram.com", "tiktok.com",
+    "doubleclick.net", "googlesyndication.com", "google.com",
+    "maps.google.com", "openstreetmap.org", "disqus.com",
+})
+
+
 # ── I/O Models ────────────────────────────────────────────────────────────────
 
 class TraversalInput(BaseModel):
@@ -353,9 +370,9 @@ class FeedExtractionSkill:
     """Extract .m3u8 stream URLs from webcam player pages."""
 
     _CLIENT_DEFAULTS = dict(
-        timeout=httpx.Timeout(5.0),
+        timeout=httpx.Timeout(connect=3.0, read=8.0, write=5.0, pool=3.0),
         follow_redirects=True,
-        headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
+        headers={"User-Agent": _BROWSER_UA},
     )
 
     def __init__(self, client: Optional[httpx.AsyncClient] = None) -> None:
@@ -388,20 +405,98 @@ class FeedExtractionSkill:
     async def _fetch_and_extract(
         self, client: httpx.AsyncClient, url: str
     ) -> FeedExtractionOutput:
-        """Fetch ``url`` using ``client`` and extract HLS streams from the response."""
-        try:
-            response = await client.get(url)
-            if response.status_code != 200:
-                return FeedExtractionOutput()
-            html = response.text
-        except httpx.TimeoutException:
-            logger.warning("FeedExtractionSkill timeout: {}", url)
-            return FeedExtractionOutput()
-        except Exception as exc:
-            logger.warning("FeedExtractionSkill error on {}: {}", url, exc)
+        """
+        Fetch *url* and extract stream URLs from the response.
+
+        If the server returns a direct HLS/video content-type the URL itself
+        is returned as ``direct_stream_url`` without HTML parsing.
+        On timeout a single retry is attempted after a 1 s pause.
+        After successful HTML retrieval, player iframes are followed one level
+        deep when no stream URL was found in the page itself.
+        """
+        html = await self._get_html(client, url)
+        if html is None:
             return FeedExtractionOutput()
 
-        return self._extract_from_html(html, url)
+        result = self._extract_from_html(html, url)
+
+        # If nothing found in the page HTML, follow player iframes one level.
+        if not result.direct_stream_url:
+            result = await self._follow_iframes(client, html, url, result)
+
+        return result
+
+    async def _get_html(
+        self, client: httpx.AsyncClient, url: str
+    ) -> Optional[str]:
+        """
+        GET *url* and return the response body as text.
+
+        Returns None on non-200, timeout (after one retry), or error.
+        If the content-type signals a direct stream the URL is handled by
+        the caller via ``_extract_from_html`` receiving an empty string
+        — callers should check the content-type before this path is needed.
+        """
+        for attempt in range(2):
+            try:
+                response = await client.get(url)
+                if response.status_code != 200:
+                    return None
+                ct = response.headers.get("content-type", "").lower()
+                # Direct stream — content is not HTML; nothing to parse.
+                if any(k in ct for k in ("mpegurl", "x-mpegurl", "vnd.apple")):
+                    logger.debug("FeedExtractionSkill: direct stream content-type at {}", url)
+                    return None
+                return response.text
+            except httpx.TimeoutException:
+                if attempt == 0:
+                    logger.debug("FeedExtractionSkill: timeout {}, retrying …", url)
+                    await asyncio.sleep(1.0)
+                else:
+                    logger.warning("FeedExtractionSkill timeout (gave up): {}", url)
+                    return None
+            except Exception as exc:
+                logger.warning("FeedExtractionSkill error on {}: {}", url, exc)
+                return None
+        return None
+
+    async def _follow_iframes(
+        self,
+        client: httpx.AsyncClient,
+        html: str,
+        base_url: str,
+        existing: FeedExtractionOutput,
+    ) -> FeedExtractionOutput:
+        """
+        Follow ``<iframe src>`` one level deep to find player-embedded streams.
+
+        Many webcam directories embed a player page from a subdomain
+        (e.g. ``<iframe src="https://player.example.com/embed/42">``).
+        The player page contains the stream URL but the parent page does not.
+        Known ad/social/map domains are skipped.
+        """
+        soup = _make_soup(html)
+        for iframe in soup.find_all("iframe", src=True):
+            src = str(iframe["src"]).strip()
+            if not src or src.startswith("javascript"):
+                continue
+            abs_src = _absolute(src, base_url) if not src.startswith("http") else src
+            parsed = urlparse(abs_src)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            domain = parsed.netloc.removeprefix("www.")
+            if any(domain == d or domain.endswith("." + d) for d in _SKIP_IFRAME_DOMAINS):
+                continue
+            iframe_html = await self._get_html(client, abs_src)
+            if iframe_html:
+                result = self._extract_from_html(iframe_html, abs_src)
+                if result.direct_stream_url:
+                    logger.debug(
+                        "FeedExtractionSkill: found stream via iframe {} → {}",
+                        abs_src, result.direct_stream_url,
+                    )
+                    return result
+        return existing
 
     def _extract_from_html(self, html: str, base_url: str) -> FeedExtractionOutput:
         """
@@ -426,9 +521,10 @@ class FeedExtractionSkill:
             if _STREAM_EXTENSIONS.search(abs_url) and abs_url not in direct_streams:
                 direct_streams.append(abs_url)
 
-        # 1. <source src="..."> with .m3u8 extension
-        for source in soup.find_all("source"):
-            _add_direct(source.get("src", ""))
+        # 1. <source src> and <video src> — covers both nested <source> and
+        #    top-level <video src="..."> which many players use directly.
+        for tag in soup.find_all(["source", "video"]):
+            _add_direct(tag.get("src", ""))
 
         # 2. JS player patterns — collect ALL matches via finditer
         scripts = " ".join(tag.get_text() for tag in soup.find_all("script"))
