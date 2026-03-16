@@ -246,11 +246,29 @@ _LISTING_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Language prefixes that some directories prepend to every page
+# (e.g. /en/camera/x/, /ru/camera/x/, /zh-CN/camera/x/).
+# Used to collapse language duplicates of the same camera page.
+_LANG_PREFIX_RE = re.compile(r"^/([a-z]{2}(?:[_-][a-zA-Z]{2,4})?)/", re.ASCII)
+
 
 def _domain_of(url: str) -> str:
     """Extract netloc from URL, stripping a 'www.' prefix if present."""
     netloc = urlparse(url).netloc
     return netloc.removeprefix("www.")
+
+
+def _canonical_path(url: str) -> str:
+    """
+    Return a canonical key for *url* by stripping a leading language segment.
+
+    ``/en/camera/usa/foo/`` and ``/ru/camera/usa/foo/`` both map to
+    ``example.com/camera/usa/foo/``, so duplicates are dropped before
+    feed extraction, saving many redundant HTTP requests.
+    """
+    parsed = urlparse(url)
+    path = _LANG_PREFIX_RE.sub("/", parsed.path, count=1)
+    return parsed.netloc + path + ("?" + parsed.query if parsed.query else "")
 
 
 # ── DirectoryAgent ────────────────────────────────────────────────────────────
@@ -378,6 +396,23 @@ class DirectoryAgent:
         A shared AsyncClient and semaphore cap concurrent HTTP requests at
         EXTRACT_CONCURRENCY; tqdm shows overall extraction progress.
         """
+        # Collapse language-prefix duplicates before extraction.
+        # /en/camera/usa/foo/ and /ru/camera/usa/foo/ are the same camera page;
+        # keeping only one avoids redundant HTTP requests and log noise.
+        _seen_canon: set[str] = set()
+        deduped: list[CameraCandidate] = []
+        for c in candidates:
+            key = _canonical_path(c.url)
+            if key not in _seen_canon:
+                _seen_canon.add(key)
+                deduped.append(c)
+        if len(deduped) < len(candidates):
+            logger.info(
+                "DirectoryAgent: collapsed {} language-duplicate candidates ({} → {})",
+                len(candidates) - len(deduped), len(candidates), len(deduped),
+            )
+        candidates = deduped
+
         sem = asyncio.Semaphore(self.EXTRACT_CONCURRENCY)
         streams_by_domain: defaultdict[str, int] = defaultdict(int)
 
