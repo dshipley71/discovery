@@ -16,6 +16,7 @@ from pydantic import BaseModel, HttpUrl, field_validator
 FeedType = Literal[
     "HLS_master",   # Master playlist: contains #EXT-X-STREAM-INF variant references
     "HLS_stream",   # Media playlist: contains #EXTINF segments (direct live stream)
+    "MJPEG",        # Motion-JPEG stream (multipart/x-mixed-replace or .mjpg/.mjpeg URL)
     "unknown",
 ]
 
@@ -54,7 +55,7 @@ class CameraRecord(BaseModel):
     continent:        str
     latitude:         Optional[float] = None
     longitude:        Optional[float] = None
-    url:              str                              # direct .m3u8 stream URL
+    url:              str                              # direct stream URL (.m3u8 or MJPEG)
     feed_type:        FeedType        = "unknown"
     playlist_type:    Optional[Literal["master", "media"]] = None
     variant_streams:  list[str]       = []            # variant URLs from master playlist
