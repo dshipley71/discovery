@@ -516,9 +516,16 @@ class GeoEnrichmentSkill:
         that a simple space-insertion rule cannot fix, then title-cases the
         result so Nominatim's string matching works reliably.
         """
-        # Strip trailing file extensions left over from URL path scraping
-        # (e.g. "San Candido.Html" → "San Candido", "index.php" → "index")
-        text = re.sub(r"\.(html?|php|asp|aspx|jsp|cfm|cgi)\s*$", "", text.strip(), flags=re.IGNORECASE)
+        # Strip file extensions left over from URL path scraping.
+        # Lookahead (?=\s*(?:,|$)) matches the extension whether it appears
+        # at the end of the string or immediately before a comma separator,
+        # so both "San Candido.Html" and "San Candido.Html, Bolzano" are cleaned.
+        text = re.sub(
+            r"\.(html?|php|asp|aspx|jsp|cfm|cgi)(?=\s*(?:,|$))",
+            "",
+            text.strip(),
+            flags=re.IGNORECASE,
+        )
         text = text.strip()
 
         _ALIASES: dict[str, str] = {
