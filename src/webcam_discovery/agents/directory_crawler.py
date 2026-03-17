@@ -291,18 +291,21 @@ class DirectoryAgent:
     EXTRACT_CONCURRENCY = 25   # parallel feed-extraction requests
     MAX_DEPTH           = 5    # URL depth to traverse into source directories
 
-    async def run(self, tier: int = 1) -> list[CameraCandidate]:
+    async def run(self, tier: int = 1, hls_only: bool = False) -> list[CameraCandidate]:
         """
         Traverse webcam directories up to the given tier and return candidates.
 
         Args:
-            tier: Maximum tier to crawl (1 = Tier 1 only, 5 = all tiers 1–5).
+            tier:     Maximum tier to crawl (1 = Tier 1 only, 5 = all tiers 1–5).
+            hls_only: When True, skip source sites whose SOURCES.md feed-types column
+                      does not include "HLS", and drop any candidate whose URL does not
+                      end with ``.m3u8`` (removes MJPEG and HTML-page candidates).
 
         Returns:
             Deduplicated list of CameraCandidate objects with resolved feed URLs.
         """
         registry = SourcesRegistry()
-        sources = registry.sources_for_tier(tier, hls_only=False)
+        sources = registry.sources_for_tier(tier, hls_only=hls_only)
         blocked = registry.blocked_domains
 
         if not sources:
@@ -372,6 +375,16 @@ class DirectoryAgent:
             if c.url not in seen_urls:
                 seen_urls.add(c.url)
                 unique.append(c)
+
+        # ── Step 6: drop non-HLS URLs when hls_only is set ───────────────────
+        if hls_only:
+            _hls_re = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
+            before  = len(unique)
+            unique  = [c for c in unique if _hls_re.search(c.url)]
+            logger.info(
+                "DirectoryAgent: hls_only=True — kept {} / {} candidates (.m3u8 only)",
+                len(unique), before,
+            )
 
         logger.info(
             "DirectoryAgent: tier={} → {} unique candidates",
@@ -516,9 +529,13 @@ def main() -> None:
         default=settings.candidates_dir / "candidates.jsonl",
         help="Output path for candidates.jsonl (default: candidates/candidates.jsonl)",
     )
+    parser.add_argument(
+        "--hls-only", action="store_true", default=False,
+        help="Skip non-HLS source sites and drop all non-.m3u8 candidate URLs from output.",
+    )
     args = parser.parse_args()
 
-    candidates = asyncio.run(DirectoryAgent().run(tier=args.tier))
+    candidates = asyncio.run(DirectoryAgent().run(tier=args.tier, hls_only=args.hls_only))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
