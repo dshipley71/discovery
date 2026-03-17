@@ -275,13 +275,18 @@ class DirectoryTraversalSkill:
             country = None
             label   = text or None
 
+            def _part_to_place(part: str) -> str:
+                """Strip file extension and normalise a URL path segment to a place name."""
+                part = re.sub(r"\.[^./]+$", "", part)  # remove extension (e.g. .html, .php)
+                return part.replace("-", " ").replace("_", " ").title()
+
             if path_depth >= 3:
-                country = path_parts[-2].replace("-", " ").title()
-                city    = path_parts[-1].replace("-", " ").title()
+                country = _part_to_place(path_parts[-2])
+                city    = _part_to_place(path_parts[-1])
             elif path_depth == 2:
-                city = path_parts[-1].replace("-", " ").title()
+                city = _part_to_place(path_parts[-1])
             elif path_depth == 1:
-                city = path_parts[0].replace("-", " ").title()
+                city = _part_to_place(path_parts[0])
 
             candidates.append(CameraCandidate(
                 url=abs_href,
