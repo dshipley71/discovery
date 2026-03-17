@@ -504,17 +504,23 @@ class GeoEnrichmentSkill:
     @staticmethod
     def _normalize_place_query(text: str) -> str:
         """
-        Expand slugified / concatenated place tokens into spaced words.
+        Clean and expand place name tokens before sending to Nominatim.
 
-        Handles three common patterns found in webcam metadata:
-        - All-lowercase run-ons: ``lasvegas`` → ``Las Vegas``
-        - CamelCase tokens:      ``CnTower``  → ``Cn Tower``
-        - Digits mixed in:       ``Area51``   → ``Area 51``
+        Handles patterns found in scraped webcam metadata:
+        - File extensions:       ``San Candido.Html`` → ``San Candido``
+        - All-lowercase run-ons: ``lasvegas``         → ``Las Vegas``
+        - CamelCase tokens:      ``CnTower``          → ``Cn Tower``
+        - Digits mixed in:       ``Area51``           → ``Area 51``
 
         The function applies a small curated alias table for well-known tokens
         that a simple space-insertion rule cannot fix, then title-cases the
         result so Nominatim's string matching works reliably.
         """
+        # Strip trailing file extensions left over from URL path scraping
+        # (e.g. "San Candido.Html" → "San Candido", "index.php" → "index")
+        text = re.sub(r"\.(html?|php|asp|aspx|jsp|cfm|cgi)\s*$", "", text.strip(), flags=re.IGNORECASE)
+        text = text.strip()
+
         _ALIASES: dict[str, str] = {
             "lasvegas": "Las Vegas",
             "newyork": "New York",
