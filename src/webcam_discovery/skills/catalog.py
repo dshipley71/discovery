@@ -204,6 +204,32 @@ def _country_to_continent(country: str) -> str:
     return CONTINENT_MAP.get(country, "Unknown")
 
 
+def _normalize_place_name(name: str) -> str:
+    """
+    Normalize slug-style place names so Nominatim can match them.
+
+    Directory crawlers produce city/country values from URL path segments,
+    which are often slugged or CamelCased:
+      - 'TerminalTower'  → 'Terminal Tower'
+      - 'CnTower'        → 'Cn Tower'
+      - 'LasVegas'       → 'Las Vegas'
+      - 'KansasCity'     → 'Kansas City'
+      - 'lasvegas'       → 'lasvegas'  (all-lowercase slugs unchanged;
+                                         Nominatim handles many of these)
+
+    Transformations applied in order:
+    1. Insert space before an uppercase letter that follows a lowercase letter
+       (handles standard CamelCase: 'TerminalTower' → 'Terminal Tower').
+    2. Insert space before an uppercase letter that begins a new word inside
+       an all-caps run ('CNTower' → 'CN Tower').
+    3. Strip and title-case so Nominatim sees 'Terminal Tower' not 'terminal tower'.
+    """
+    import re as _re
+    result = _re.sub(r'([a-z])([A-Z])', r'\1 \2', name)        # step 1
+    result = _re.sub(r'([A-Z]{2,})([A-Z][a-z])', r'\1 \2', result)  # step 2
+    return result.strip().title()
+
+
 # ── URL normalization ──────────────────────────────────────────────────────────
 
 _TRACKING_PARAMS = frozenset({
@@ -427,14 +453,35 @@ class GeoEnrichmentSkill:
             GeoEnrichmentOutput with coordinates and geographic metadata, or empty
             GeoEnrichmentOutput if all strategies fail.
         """
-        city = (input.city or "").strip()
+        city    = (input.city    or "").strip()
         country = (input.country or "").strip()
-        label = (input.label or "").strip()
+        label   = (input.label   or "").strip()
 
-        # Strategy 1: city + country
-        if city and city.lower() not in ("unknown", ""):
-            query = f"{city}, {country}" if country else city
+        # Normalize slug-style names so Nominatim can match them.
+        # e.g. 'TerminalTower' → 'Terminal Tower', 'LasVegas' → 'Las Vegas'.
+        # All-lowercase slugs (e.g. 'lasvegas') are passed as-is; Nominatim
+        # handles many of them (it resolved 'kansascity' correctly).
+        city_norm    = _normalize_place_name(city)    if city    else ""
+        country_norm = _normalize_place_name(country) if country else ""
+
+        # Strategy 1: normalized city + normalized country.
+        # Cache key uses raw values so Phase 1 pre-warming in ValidationAgent
+        # stays coherent with Phase 3 lookups.
+        if city_norm and city_norm.lower() not in ("unknown", ""):
+            query = f"{city_norm}, {country_norm}" if country_norm else city_norm
             result = await self._geocode_nominatim(query, cache_key=f"city:{city}|{country}")
+            if result.latitude is not None:
+                return result
+
+        # Strategy 1b: country field used as a standalone place name.
+        # Directory crawlers sometimes populate the country field with a city
+        # name (e.g. city='Cntower', country='Toronto') because the URL path
+        # segment ordering is landmark/city rather than city/country.
+        # Trying country_norm alone recovers coordinates for those cases.
+        if country_norm and country_norm.lower() not in ("unknown", ""):
+            result = await self._geocode_nominatim(
+                country_norm, cache_key=f"place:{country_norm}"
+            )
             if result.latitude is not None:
                 return result
 
@@ -450,9 +497,11 @@ class GeoEnrichmentSkill:
             if result.latitude is not None:
                 return result
 
-        # Strategy 4: country center
-        if country and country.lower() not in ("unknown", ""):
-            result = await self._geocode_nominatim(country, cache_key=f"country:{country}")
+        # Strategy 4: country center (last resort)
+        if country_norm and country_norm.lower() not in ("unknown", ""):
+            result = await self._geocode_nominatim(
+                country_norm, cache_key=f"country:{country_norm}"
+            )
             if result.latitude is not None:
                 return result
 
