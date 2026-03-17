@@ -413,6 +413,15 @@ class DeduplicationSkill:
         })
 
 
+# ── GeoEnrichmentSkill helpers ─────────────────────────────────────────────────
+
+# Single-word labels that geocode to wrong places (e.g. "LIVE" → Belgium).
+_GENERIC_LABEL_WORDS: frozenset[str] = frozenset({
+    "LIVE", "STREAM", "CAM", "CAMERA", "WEBCAM", "VIEW", "ONLINE",
+    "NOW", "HD", "FEED", "VIDEO", "WATCH",
+})
+
+
 # ── GeoEnrichmentSkill ─────────────────────────────────────────────────────────
 
 class GeoEnrichmentSkill:
@@ -456,32 +465,38 @@ class GeoEnrichmentSkill:
         """
         city    = (input.city    or "").strip()
         country = (input.country or "").strip()
-        label = (input.label or "").strip()
+        label   = (input.label   or "").strip()
 
         # Normalize slugified/concatenated place tokens (e.g. "Lasvegas" → "Las Vegas")
-        city_norm = self._normalize_place_query(city) if city else city
+        city_norm    = self._normalize_place_query(city)    if city    else city
+        country_norm = self._normalize_place_query(country) if country else country
 
         # Strategy 1: normalized city + country
         if city_norm and city_norm.lower() not in ("unknown", ""):
-            query = f"{city_norm}, {country}" if country else city_norm
-            result = await self._geocode_nominatim(query, cache_key=f"city:{city_norm}|{country}")
+            query = f"{city_norm}, {country_norm}" if country_norm else city_norm
+            result = await self._geocode_nominatim(query, cache_key=f"city:{city_norm}|{country_norm}")
             if result.latitude is not None:
                 return result
 
-            # Strategy 1b: bare normalized city without country (handles landmark-as-city tokens)
-            if country:
+            # Strategy 1b: bare normalized city (handles landmark-as-city tokens)
+            if country_norm:
                 result = await self._geocode_nominatim(
                     city_norm, cache_key=f"city:{city_norm}|"
                 )
                 if result.latitude is not None:
                     return result
 
-        # Strategy 2: label text (may encode a landmark or place name)
+        # Strategy 2: label text — extract location portion, then normalize
         if label and label.lower() not in ("unknown", ""):
-            label_norm = self._normalize_place_query(label)
-            result = await self._geocode_nominatim(label_norm, cache_key=f"label:{label_norm}")
-            if result.latitude is not None:
-                return result
+            label_loc  = self._extract_label_location(label)
+            label_norm = self._normalize_place_query(label_loc)
+            # Skip labels that are too short or known-generic after cleaning
+            if label_norm and len(label_norm) >= 3 and label_norm.upper() not in _GENERIC_LABEL_WORDS:
+                result = await self._geocode_nominatim(
+                    label_norm, cache_key=f"label:{label_norm}"
+                )
+                if result.latitude is not None:
+                    return result
 
         # Strategy 3: IP geolocation from camera URL hostname
         if input.url:
@@ -500,6 +515,33 @@ class GeoEnrichmentSkill:
         return GeoEnrichmentOutput()
 
     # ── Private helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_label_location(text: str) -> str:
+        """
+        Trim a verbose camera label down to its location-only portion.
+
+        Many directory sites (e.g. skylinewebcams) use labels like:
+          "Boccadasse - Genoa View of the beach and the old fishing village..."
+          "Taormina Taormina, view over Piazza IX Aprile..."
+
+        Strategy:
+        1. Strip everything from the first description trigger word onward
+           (View / Overlooking / Panoram* / Live cam etc.)
+        2. Replace " - " separators with ", " so Nominatim gets city context.
+        """
+        # Cut at first description-trigger phrase (preceded by comma or space)
+        m = re.search(
+            r"(?:,\s*|\s+)(?:view\b|overlooking\b|panoram\w*\b|live\s+(?:cam|stream|view)\b)",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            text = text[:m.start()].strip()
+
+        # Normalise " - " separators to ", " for Nominatim (e.g. "Boccadasse - Genoa" → "Boccadasse, Genoa")
+        text = re.sub(r"\s+-\s+", ", ", text)
+        return text.strip()
 
     @staticmethod
     def _normalize_place_query(text: str) -> str:
