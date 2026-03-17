@@ -469,6 +469,12 @@ class GeoEnrichmentSkill:
     _nominatim_last_req: float = 0.0
     _NOMINATIM_INTERVAL: float = 1.1  # seconds between requests
 
+    # LLM (Ollama) rate limiting — serialise requests to avoid 429 responses.
+    # One request per _LLM_INTERVAL seconds across ALL GeoEnrichmentSkill instances.
+    _llm_lock: threading.Lock = threading.Lock()
+    _llm_last_req: float = 0.0
+    _LLM_INTERVAL: float = 1.0  # seconds between LLM requests
+
     # Process-wide geocoding cache shared across all GeoEnrichmentSkill instances.
     # Avoids redundant Nominatim / ip-api / LLM calls when the same location is
     # encountered across different candidates or pipeline runs.
@@ -617,6 +623,22 @@ class GeoEnrichmentSkill:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
         }
+
+        # ── Rate limiting ─────────────────────────────────────────────────────
+        # Serialise LLM requests via a class-level threading.Lock to avoid 429
+        # responses.  The lock is acquired in a thread executor (same pattern as
+        # Nominatim) so the asyncio event loop is not blocked during the wait.
+        def _rate_limited_wait() -> None:
+            with GeoEnrichmentSkill._llm_lock:
+                wait = GeoEnrichmentSkill._LLM_INTERVAL - (
+                    time.monotonic() - GeoEnrichmentSkill._llm_last_req
+                )
+                if wait > 0:
+                    time.sleep(wait)
+                GeoEnrichmentSkill._llm_last_req = time.monotonic()
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _rate_limited_wait)
 
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:

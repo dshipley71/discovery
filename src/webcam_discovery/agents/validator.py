@@ -146,19 +146,46 @@ class ValidationAgent:
             settings.validation_timeout_connect,
             settings.validation_timeout_read,
         )
-        validation_results = await feed_skill.run([c.url for c in allowed])
+        # Build Referer map: url → source_directory so _probe_hls can send the
+        # originating webcam site's URL as the Referer header.  Many CDNs gate
+        # .m3u8 delivery to requests that look like they come from the source site.
+        referers = {
+            c.url: c.source_directory
+            for c in allowed
+            if c.source_directory
+        }
+        validation_results = await feed_skill.run(
+            [c.url for c in allowed], referers=referers
+        )
         url_to_val = {r.url: r for r in validation_results}
 
         n_live    = sum(1 for r in validation_results if r.status == "live")
         n_timeout = sum(1 for r in validation_results if r.fail_reason == "timeout")
         n_dead    = sum(1 for r in validation_results if r.status == "dead")
+        n_unknown = sum(1 for r in validation_results if r.status == "unknown")
         logger.info(
-            "ValidationAgent: probe results — live={}, dead={}, timeout={}, other={}",
-            n_live, n_dead, n_timeout,
-            len(allowed) - n_live - n_dead - n_timeout,
+            "ValidationAgent: probe results — live={}, dead={}, unknown={}, timeout={}, other={}",
+            n_live, n_dead, n_unknown, n_timeout,
+            len(allowed) - n_live - n_dead - n_unknown - n_timeout,
         )
 
+        # Log fail_reason breakdown for dead + unknown results so operators can
+        # distinguish token-expiry (http_403), offline (http_404), hotlink (http_403),
+        # no-magic-bytes (no_m3u8_magic), and genuine timeouts.
+        from collections import Counter
+        fail_reasons = Counter(
+            r.fail_reason
+            for r in validation_results
+            if r.fail_reason and r.status in ("dead", "unknown")
+        )
+        if fail_reasons:
+            breakdown = "  ".join(f"{reason}={n}" for reason, n in fail_reasons.most_common())
+            logger.info("ValidationAgent: failure reasons — {}", breakdown)
+
         # ── Step 3: filter by legitimacy ──────────────────────────────────────
+        # status="unknown" with min_legitimacy="low" is kept: a 200 OK that
+        # lacked #EXTM3U magic may still be a valid stream (e.g. no-magic CDN
+        # delivery).  Operators can review these via notes="no_m3u8_magic".
         min_legit = settings.min_legitimacy
         to_enrich: list[tuple[CameraCandidate, object]] = []
 
@@ -166,7 +193,14 @@ class ValidationAgent:
             v = url_to_val.get(candidate.url)
             if v is None:
                 continue
-            if v.status != "live":
+            # Accept "live" always; accept "unknown" only when min_legitimacy="low"
+            if v.status == "dead":
+                continue
+            if v.status == "unknown" and min_legit != "low":
+                logger.debug(
+                    "ValidationAgent: drop {} — status=unknown requires min_legitimacy=low",
+                    candidate.url,
+                )
                 continue
             if not _legit_ok(v.legitimacy_score, min_legit):
                 logger.debug(
@@ -276,71 +310,83 @@ class ValidationAgent:
         candidates: list[CameraCandidate],
     ) -> list[Optional[object]]:
         """
-        Geo-enrich candidates in bulk, deduplicating Nominatim queries.
+        Geo-enrich candidates in bulk.
 
-        Strategy
-        --------
-        Phase 1 — Pre-warm cache for unique city+country pairs.
-                  Each unique pair triggers exactly one sequential Nominatim
-                  call (respecting the 1 req/s policy).  All other candidates
-                  sharing that pair will be instant cache hits.
+        LLM mode (use_llm_geodecode=True, default)
+        -------------------------------------------
+        Skips Nominatim pre-warm phases entirely.  Calls skill.run() for every
+        candidate concurrently via asyncio.gather; GeoEnrichmentSkill._llm_lock
+        serialises the underlying Ollama requests at 1 req/s to avoid 429s.
+        Progress is shown as each LLM call completes.
+
+        Nominatim mode (use_llm_geodecode=False)
+        ----------------------------------------
+        Phase 1 — Pre-warm cache for unique city+country pairs (sequential,
+                  1 req/s Nominatim policy).
         Phase 2 — Pre-warm cache for unique country names (country-center
-                  fallback).  Only countries not already resolved by Phase 1
-                  are geocoded here.
-        Phase 3 — Run skill.run() for every candidate concurrently via
-                  asyncio.gather.  Nearly all calls return from cache
-                  immediately; ip-api.com hostname lookups execute in
-                  parallel since they share no global lock.
+                  fallback).
+        Phase 3 — Concurrent per-candidate resolution; nearly all calls are
+                  instant cache hits.  ip-api.com fallbacks run in parallel.
 
         Returns results in the same order as `candidates`.
         """
         cache = GeoEnrichmentSkill._geo_cache
 
-        # Phase 1: unique city+country → one Nominatim call each
-        seen_city_country: dict[str, CameraCandidate] = {}
-        for c in candidates:
-            city = (c.city or "").strip()
-            country = (c.country or "").strip()
-            if city and city.lower() not in ("unknown", ""):
-                key = f"city:{city}|{country}"
-                if key not in cache and key not in seen_city_country:
-                    seen_city_country[key] = c
+        if not skill._use_llm:
+            # ── Nominatim Phase 1: unique city+country ─────────────────────────
+            seen_city_country: dict[str, CameraCandidate] = {}
+            for c in candidates:
+                city    = (c.city    or "").strip()
+                country = (c.country or "").strip()
+                if city and city.lower() not in ("unknown", ""):
+                    key = f"city:{city}|{country}"
+                    if key not in cache and key not in seen_city_country:
+                        seen_city_country[key] = c
 
-        for key, c in tqdm(
-            seen_city_country.items(),
-            total=len(seen_city_country),
-            desc="Geocoding city+country",
-            unit="pair",
-            ncols=90,
-            disable=not seen_city_country,
-        ):
-            city    = (c.city    or "").strip()
-            country = (c.country or "").strip()
-            city_norm    = _normalize_place_name(city)    if city    else ""
-            country_norm = _normalize_place_name(country) if country else ""
-            query = f"{city_norm}, {country_norm}" if country_norm else city_norm
-            await skill._geocode_nominatim(query, cache_key=key)
+            for key, c in tqdm(
+                seen_city_country.items(),
+                total=len(seen_city_country),
+                desc="Geocoding city+country",
+                unit="pair",
+                ncols=90,
+                disable=not seen_city_country,
+            ):
+                city    = (c.city    or "").strip()
+                country = (c.country or "").strip()
+                city_norm    = _normalize_place_name(city)    if city    else ""
+                country_norm = _normalize_place_name(country) if country else ""
+                query = f"{city_norm}, {country_norm}" if country_norm else city_norm
+                await skill._geocode_nominatim(query, cache_key=key)
 
-        # Phase 2: unique countries for country-center fallback
-        seen_countries: set[str] = set()
-        for c in candidates:
-            country = (c.country or "").strip()
-            if country and country.lower() not in ("unknown", ""):
-                ckey = f"country:{country}"
-                if ckey not in cache:
-                    seen_countries.add(country)
+            # ── Nominatim Phase 2: unique countries ────────────────────────────
+            seen_countries: set[str] = set()
+            for c in candidates:
+                country = (c.country or "").strip()
+                if country and country.lower() not in ("unknown", ""):
+                    ckey = f"country:{country}"
+                    if ckey not in cache:
+                        seen_countries.add(country)
 
-        for country in tqdm(
-            seen_countries,
-            total=len(seen_countries),
-            desc="Geocoding countries  ",
-            unit="country",
-            ncols=90,
-            disable=not seen_countries,
-        ):
-            await skill._geocode_nominatim(country, cache_key=f"country:{country}")
+            for country in tqdm(
+                seen_countries,
+                total=len(seen_countries),
+                desc="Geocoding countries  ",
+                unit="country",
+                ncols=90,
+                disable=not seen_countries,
+            ):
+                await skill._geocode_nominatim(country, cache_key=f"country:{country}")
 
-        # Phase 3: concurrent per-candidate resolution (mostly cache hits)
+        # ── Phase 3 (both modes): per-candidate resolution ─────────────────────
+        # LLM mode: calls are serialised inside _geocode_with_llm via _llm_lock
+        #           (1 req/s); tqdm shows each call completing in sequence.
+        # Nominatim mode: nearly all calls are instant cache hits from Phase 1/2.
+        geo_desc = (
+            f"LLM geocoding ({skill._LLM_INTERVAL:.1f}s/req)"
+            if skill._use_llm
+            else "Geo-enriching       "
+        )
+
         async def _safe_run(candidate: CameraCandidate) -> Optional[object]:
             try:
                 return await skill.run(GeoEnrichmentInput(
@@ -357,7 +403,7 @@ class ValidationAgent:
 
         return list(await tqdm_asyncio.gather(
             *[_safe_run(c) for c in candidates],
-            desc="Geo-enriching",
+            desc=geo_desc,
             unit="cam",
             ncols=90,
         ))
