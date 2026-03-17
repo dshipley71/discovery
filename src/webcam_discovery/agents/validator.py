@@ -45,7 +45,7 @@ from webcam_discovery.skills.validation import (
     FeedTypeInput,
     ValidationResult,
 )
-from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput
+from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput, _normalize_place_name
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -314,9 +314,11 @@ class ValidationAgent:
             ncols=90,
             disable=not seen_city_country,
         ):
-            city = (c.city or "").strip()
+            city    = (c.city    or "").strip()
             country = (c.country or "").strip()
-            query = f"{city}, {country}" if country else city
+            city_norm    = _normalize_place_name(city)    if city    else ""
+            country_norm = _normalize_place_name(country) if country else ""
+            query = f"{city_norm}, {country_norm}" if country_norm else city_norm
             await skill._geocode_nominatim(query, cache_key=key)
 
         # Phase 2: unique countries for country-center fallback
