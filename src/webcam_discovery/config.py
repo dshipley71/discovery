@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     dead_after_n_failures:    int = 2
     prune_after_n_failures:   int = 4
 
+    # LLM geocoding via Ollama — replaces Nominatim when enabled (default: True)
+    use_llm_geodecode: bool = True
+    ollama_api_key:    str  = ""                          # set via env or Colab secrets
+    ollama_base_url:   str  = "https://api.ollama.com"   # Ollama cloud endpoint
+    ollama_model:      str  = "llama3.2"                  # model for geocoding
+
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
 
     def ensure_dirs(self) -> None:

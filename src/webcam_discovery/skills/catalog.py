@@ -26,6 +26,27 @@ from pydantic import BaseModel
 from rapidfuzz import fuzz
 
 from webcam_discovery.schemas import CameraRecord
+from webcam_discovery.config import settings
+
+
+# ── LLM geocoding helpers ──────────────────────────────────────────────────────
+
+def _get_ollama_api_key() -> str:
+    """
+    Return the Ollama API key.
+
+    Resolution order:
+    1. Google Colab ``userdata`` secret named ``OLLAMA_API_KEY``
+    2. ``WCD_OLLAMA_API_KEY`` environment variable / ``settings.ollama_api_key``
+    """
+    try:
+        from google.colab import userdata  # type: ignore
+        key = userdata.get("OLLAMA_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    return settings.ollama_api_key
 
 
 # ── Continent map ──────────────────────────────────────────────────────────────
@@ -428,7 +449,12 @@ class GeoEnrichmentSkill:
     """
     Attach geographic metadata to camera records lacking coordinates.
 
-    Fallback chain (stops at first successful result):
+    When ``settings.use_llm_geodecode`` is ``True`` (default) the LLM path is
+    taken: the camera location string is sent to Ollama and the model returns
+    structured coordinates.  Nominatim is disabled in this mode.
+
+    When ``use_llm_geodecode`` is ``False`` the original Nominatim fallback
+    chain is used:
     1. City + country geocoding via Nominatim
     2. Label text geocoding (may contain place names like "Eiffel Tower Paris")
     3. IP geolocation of the camera hostname via ip-api.com
@@ -444,28 +470,51 @@ class GeoEnrichmentSkill:
     _NOMINATIM_INTERVAL: float = 1.1  # seconds between requests
 
     # Process-wide geocoding cache shared across all GeoEnrichmentSkill instances.
-    # Avoids redundant Nominatim / ip-api calls when the same city+country, label,
-    # or host is encountered across different candidates or pipeline runs.
+    # Avoids redundant Nominatim / ip-api / LLM calls when the same location is
+    # encountered across different candidates or pipeline runs.
     _geo_cache: dict[str, Optional[GeoEnrichmentOutput]] = {}
 
     def __init__(self) -> None:
-        """Initialize geocoder with a polite user-agent."""
-        self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0", timeout=5)
+        """Initialize geocoder.  Nominatim is created only when LLM mode is off."""
+        self._use_llm = settings.use_llm_geodecode
+        if not self._use_llm:
+            self._geocoder = Nominatim(user_agent="webcam_discovery_bot/1.0", timeout=5)
 
     async def run(self, input: GeoEnrichmentInput) -> GeoEnrichmentOutput:
         """
-        Resolve coordinates via a multi-strategy fallback chain.
+        Resolve coordinates via LLM (default) or Nominatim fallback chain.
 
         Args:
             input: GeoEnrichmentInput with any combination of city, country, label, url.
 
         Returns:
-            GeoEnrichmentOutput with coordinates and geographic metadata, or empty
-            GeoEnrichmentOutput if all strategies fail.
+            GeoEnrichmentOutput with location, coordinates and geographic metadata,
+            or empty GeoEnrichmentOutput if all strategies fail.
         """
         city    = (input.city    or "").strip()
         country = (input.country or "").strip()
         label   = (input.label   or "").strip()
+
+        # ── LLM geocoding path (USE_LLM_GEODECODE = True) ─────────────────────
+        if self._use_llm:
+            # Build a best-effort location string from available metadata
+            parts: list[str] = []
+            if label and label.lower() not in ("unknown", ""):
+                parts.append(label)
+            elif city and city.lower() not in ("unknown", ""):
+                parts.append(city)
+            if country and country.lower() not in ("unknown", ""):
+                parts.append(country)
+
+            location_str = ", ".join(parts) if parts else ""
+            if not location_str:
+                logger.debug("GeoEnrichmentSkill: no location data to geocode via LLM")
+                return GeoEnrichmentOutput()
+
+            cache_key = f"llm:{location_str.lower()}"
+            return await self._geocode_with_llm(location_str, cache_key=cache_key)
+
+        # ── Nominatim fallback chain (USE_LLM_GEODECODE = False) ──────────────
 
         # Normalize slugified/concatenated place tokens (e.g. "Lasvegas" → "Las Vegas")
         city_norm    = self._normalize_place_query(city)    if city    else city
@@ -515,6 +564,108 @@ class GeoEnrichmentSkill:
         return GeoEnrichmentOutput()
 
     # ── Private helpers ────────────────────────────────────────────────────────
+
+    async def _geocode_with_llm(
+        self, location_str: str, cache_key: Optional[str] = None
+    ) -> GeoEnrichmentOutput:
+        """
+        Geocode a location string using an Ollama LLM via the OpenAI-compatible API.
+
+        Sends ``location_str`` to the configured Ollama model and asks it to return
+        a JSON object containing ``location``, ``latitude``, ``longitude``,
+        ``country``, ``region``, and ``continent``.  Results are cached
+        process-wide to avoid redundant API calls.
+
+        Args:
+            location_str: Human-readable camera location (e.g. "Eiffel Tower, Paris, France").
+            cache_key: Optional explicit cache key; defaults to ``"llm:<location_str>"``.
+
+        Returns:
+            GeoEnrichmentOutput populated from the LLM response, or an empty
+            GeoEnrichmentOutput when the model cannot determine coordinates.
+        """
+        key = cache_key or f"llm:{location_str.lower()}"
+        if key in GeoEnrichmentSkill._geo_cache:
+            cached = GeoEnrichmentSkill._geo_cache[key]
+            return cached if cached is not None else GeoEnrichmentOutput()
+
+        api_key  = _get_ollama_api_key()
+        base_url = settings.ollama_base_url.rstrip("/")
+        model    = settings.ollama_model
+
+        prompt = (
+            f'Given the camera location "{location_str}", provide the geographic coordinates.\n'
+            "Return ONLY a valid JSON object with these exact fields:\n"
+            '{\n'
+            '  "location": "<normalized place name>",\n'
+            '  "latitude": <float or null>,\n'
+            '  "longitude": <float or null>,\n'
+            '  "country": "<country name or null>",\n'
+            '  "region": "<state/region name or null>",\n'
+            '  "continent": "<continent name or null>"\n'
+            '}\n'
+            "If you cannot determine the location, set latitude and longitude to null.\n"
+            "Return ONLY the JSON object — no markdown fences, no extra text."
+        )
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+                resp = await client.post(
+                    f"{base_url}/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            content: str = data["choices"][0]["message"]["content"].strip()
+
+            # Strip optional markdown code fences the model may add
+            content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"\s*```$", "", content)
+
+            geo = json.loads(content)
+            lat = geo.get("latitude")
+            lon = geo.get("longitude")
+            country   = geo.get("country") or ""
+            region    = geo.get("region") or None
+            continent = geo.get("continent") or (_country_to_continent(country) if country else None)
+            location  = geo.get("location") or location_str
+
+            if lat is None or lon is None:
+                logger.debug("GeoEnrichmentSkill LLM: no coordinates for '{}'", location_str)
+                GeoEnrichmentSkill._geo_cache[key] = None
+                return GeoEnrichmentOutput()
+
+            result = GeoEnrichmentOutput(
+                latitude=float(lat),
+                longitude=float(lon),
+                country=country or None,
+                region=region,
+                continent=continent,
+                confidence="high" if country else "medium",
+            )
+            GeoEnrichmentSkill._geo_cache[key] = result
+            logger.debug(
+                "GeoEnrichmentSkill LLM: '{}' → '{}' ({:.4f}, {:.4f}) {}",
+                location_str, location, result.latitude, result.longitude, country,
+            )
+            return result
+
+        except Exception as exc:
+            logger.warning("GeoEnrichmentSkill LLM error for '{}': {}", location_str, exc)
+            GeoEnrichmentSkill._geo_cache[key] = None
+            return GeoEnrichmentOutput()
 
     @staticmethod
     def _extract_label_location(text: str) -> str:
