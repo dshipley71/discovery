@@ -135,12 +135,20 @@ class FeedValidationSkill:
     avoids overwhelming servers.
     """
 
-    async def run(self, urls: list[str]) -> list[ValidationResult]:
+    async def run(
+        self,
+        urls: list[str],
+        referers: Optional[dict[str, str]] = None,
+    ) -> list[ValidationResult]:
         """
         Probe each URL and return a ValidationResult.
 
         Args:
-            urls: Candidate URLs to validate (only .m3u8 URLs will be probed).
+            urls:     Candidate URLs to validate.
+            referers: Optional mapping of url → Referer header value.  When
+                      provided, the Referer is sent with HLS requests so that
+                      CDN hotlink-protection rules (which gate .m3u8 delivery
+                      to the originating webcam site) pass correctly.
 
         Returns:
             list[ValidationResult] in the same order as urls.
@@ -154,6 +162,7 @@ class FeedValidationSkill:
             pool=5.0,
         )
         sem = asyncio.Semaphore(settings.validation_concurrency)
+        _referers: dict[str, str] = referers or {}
 
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -161,7 +170,7 @@ class FeedValidationSkill:
             max_redirects=3,
             headers={"User-Agent": _BROWSER_UA},
         ) as client:
-            tasks = [self._probe(client, url, sem) for url in urls]
+            tasks = [self._probe(client, url, sem, _referers.get(url)) for url in urls]
             return list(await tqdm_asyncio.gather(
                 *tasks,
                 desc="Probing URLs",
@@ -170,18 +179,27 @@ class FeedValidationSkill:
             ))
 
     async def _probe(
-        self, client: httpx.AsyncClient, url: str, sem: asyncio.Semaphore
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        sem: asyncio.Semaphore,
+        referer: Optional[str] = None,
     ) -> ValidationResult:
         """Acquire semaphore, dispatch, retry once on timeout."""
         async with sem:
-            result = await self._dispatch(client, url)
+            result = await self._dispatch(client, url, referer=referer)
             if result.fail_reason == "timeout":
                 logger.debug("FeedValidationSkill: retrying {} after timeout", url)
                 await asyncio.sleep(2.0)
-                result = await self._dispatch(client, url)
+                result = await self._dispatch(client, url, referer=referer)
         return result
 
-    async def _dispatch(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
+    async def _dispatch(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        referer: Optional[str] = None,
+    ) -> ValidationResult:
         """
         Route each URL to the appropriate prober.
 
@@ -195,20 +213,31 @@ class FeedValidationSkill:
                 fail_reason="auth_url_pattern",
             )
         if _HLS_URL_RE.search(url):
-            return await self._probe_hls(client, url)
+            return await self._probe_hls(client, url, referer=referer)
         if _MJPEG_URL_RE.search(url):
             return await self._probe_mjpeg(client, url)
         return await self._probe_generic(client, url)
 
-    async def _probe_hls(self, client: httpx.AsyncClient, url: str) -> ValidationResult:
+    async def _probe_hls(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        referer: Optional[str] = None,
+    ) -> ValidationResult:
         """
         Fetch HLS playlist, verify #EXTM3U magic, and classify as master or media.
 
         Master playlist (#EXT-X-STREAM-INF) → playlist_type='master', variant_streams extracted.
         Media playlist  (#EXTINF / #EXT-X-TARGETDURATION) → playlist_type='media'.
+
+        Args:
+            referer: If provided, sent as the HTTP ``Referer`` header so that
+                     CDN hotlink-protection rules (which restrict .m3u8 delivery
+                     to requests originating from the source webcam site) pass.
         """
+        extra_headers = {"Referer": referer} if referer else {}
         try:
-            async with client.stream("GET", url) as resp:
+            async with client.stream("GET", url, headers=extra_headers) as resp:
                 ct = resp.headers.get("content-type", "")
                 if resp.status_code not in range(200, 207):
                     return ValidationResult(
