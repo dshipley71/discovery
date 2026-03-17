@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -455,39 +456,30 @@ class GeoEnrichmentSkill:
         """
         city    = (input.city    or "").strip()
         country = (input.country or "").strip()
-        label   = (input.label   or "").strip()
+        label = (input.label or "").strip()
 
-        # Normalize slug-style names so Nominatim can match them.
-        # e.g. 'TerminalTower' → 'Terminal Tower', 'LasVegas' → 'Las Vegas'.
-        # All-lowercase slugs (e.g. 'lasvegas') are passed as-is; Nominatim
-        # handles many of them (it resolved 'kansascity' correctly).
-        city_norm    = _normalize_place_name(city)    if city    else ""
-        country_norm = _normalize_place_name(country) if country else ""
+        # Normalize slugified/concatenated place tokens (e.g. "Lasvegas" → "Las Vegas")
+        city_norm = self._normalize_place_query(city) if city else city
 
-        # Strategy 1: normalized city + normalized country.
-        # Cache key uses raw values so Phase 1 pre-warming in ValidationAgent
-        # stays coherent with Phase 3 lookups.
+        # Strategy 1: normalized city + country
         if city_norm and city_norm.lower() not in ("unknown", ""):
-            query = f"{city_norm}, {country_norm}" if country_norm else city_norm
-            result = await self._geocode_nominatim(query, cache_key=f"city:{city}|{country}")
+            query = f"{city_norm}, {country}" if country else city_norm
+            result = await self._geocode_nominatim(query, cache_key=f"city:{city_norm}|{country}")
             if result.latitude is not None:
                 return result
 
-        # Strategy 1b: country field used as a standalone place name.
-        # Directory crawlers sometimes populate the country field with a city
-        # name (e.g. city='Cntower', country='Toronto') because the URL path
-        # segment ordering is landmark/city rather than city/country.
-        # Trying country_norm alone recovers coordinates for those cases.
-        if country_norm and country_norm.lower() not in ("unknown", ""):
-            result = await self._geocode_nominatim(
-                country_norm, cache_key=f"place:{country_norm}"
-            )
-            if result.latitude is not None:
-                return result
+            # Strategy 1b: bare normalized city without country (handles landmark-as-city tokens)
+            if country:
+                result = await self._geocode_nominatim(
+                    city_norm, cache_key=f"city:{city_norm}|"
+                )
+                if result.latitude is not None:
+                    return result
 
         # Strategy 2: label text (may encode a landmark or place name)
         if label and label.lower() not in ("unknown", ""):
-            result = await self._geocode_nominatim(label, cache_key=f"label:{label}")
+            label_norm = self._normalize_place_query(label)
+            result = await self._geocode_nominatim(label_norm, cache_key=f"label:{label_norm}")
             if result.latitude is not None:
                 return result
 
@@ -508,6 +500,45 @@ class GeoEnrichmentSkill:
         return GeoEnrichmentOutput()
 
     # ── Private helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_place_query(text: str) -> str:
+        """
+        Expand slugified / concatenated place tokens into spaced words.
+
+        Handles three common patterns found in webcam metadata:
+        - All-lowercase run-ons: ``lasvegas`` → ``Las Vegas``
+        - CamelCase tokens:      ``CnTower``  → ``Cn Tower``
+        - Digits mixed in:       ``Area51``   → ``Area 51``
+
+        The function applies a small curated alias table for well-known tokens
+        that a simple space-insertion rule cannot fix, then title-cases the
+        result so Nominatim's string matching works reliably.
+        """
+        _ALIASES: dict[str, str] = {
+            "lasvegas": "Las Vegas",
+            "newyork": "New York",
+            "newyorkcity": "New York City",
+            "losangeles": "Los Angeles",
+            "sanfrancisco": "San Francisco",
+            "kansascity": "Kansas City",
+            "oklahomacity": "Oklahoma City",
+            "saltlakecity": "Salt Lake City",
+            "cntower": "CN Tower Toronto",
+            "terminaltower": "Terminal Tower Cleveland",
+            "skydeck": "Skydeck Chicago",
+        }
+
+        token = text.strip().lower().replace(" ", "")
+        if token in _ALIASES:
+            return _ALIASES[token]
+
+        # Insert spaces before uppercase letters that follow lowercase ones (CamelCase)
+        spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text.strip())
+        # Insert spaces before digit runs (e.g. "Area51" → "Area 51")
+        spaced = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", spaced)
+        spaced = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", spaced)
+        return spaced.strip()
 
     async def _geocode_nominatim(
         self, query: str, cache_key: Optional[str] = None
