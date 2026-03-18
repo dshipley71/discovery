@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # LLM geocoding via Ollama — replaces Nominatim when enabled (default: True)
     use_llm_geodecode: bool = True
     ollama_api_key:    str  = ""                          # set via env or Colab secrets
-    ollama_base_url:   str  = "https://api.ollama.com"   # Ollama cloud endpoint
+    ollama_base_url:   str  = "https://ollama.com"        # Ollama cloud endpoint (api.ollama.com 301-redirects here)
     ollama_model:      str  = "llama3.2"                  # model for geocoding
 
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
