@@ -693,9 +693,10 @@ class GeoEnrichmentSkill:
                     confidence="high" if country else "medium",
                 )
                 GeoEnrichmentSkill._geo_cache[key] = result
-                logger.debug(
-                    "GeoEnrichmentSkill LLM: '{}' → '{}' ({:.4f}, {:.4f}) {}",
-                    location_str, location, result.latitude, result.longitude, country,
+                logger.info(
+                    "GeoEnrichmentSkill LLM: '{}' → ({:.4f}, {:.4f}) {} / {} / {}",
+                    location_str, result.latitude, result.longitude,
+                    location, country, continent or "?",
                 )
                 return result
 
