@@ -470,15 +470,24 @@ class GeoEnrichmentSkill:
     _NOMINATIM_INTERVAL: float = 1.1  # seconds between requests
 
     # LLM (Ollama) rate limiting — serialise requests to avoid 429 responses.
-    # One request per _LLM_INTERVAL seconds across ALL GeoEnrichmentSkill instances.
-    _llm_lock: threading.Lock = threading.Lock()
+    # asyncio.Semaphore(1) is held for the *entire* HTTP request (not just the
+    # wait), so only one LLM request is ever in-flight at a time.  Lazy init
+    # avoids creating the Semaphore outside a running event loop.
+    _llm_semaphore: Optional[asyncio.Semaphore] = None
     _llm_last_req: float = 0.0
-    _LLM_INTERVAL: float = 1.0  # seconds between LLM requests
+    _LLM_INTERVAL: float = 1.0  # minimum seconds between LLM requests
 
     # Process-wide geocoding cache shared across all GeoEnrichmentSkill instances.
     # Avoids redundant Nominatim / ip-api / LLM calls when the same location is
     # encountered across different candidates or pipeline runs.
     _geo_cache: dict[str, Optional[GeoEnrichmentOutput]] = {}
+
+    @classmethod
+    def _get_llm_semaphore(cls) -> asyncio.Semaphore:
+        """Return (or lazily create) the class-level asyncio.Semaphore(1)."""
+        if cls._llm_semaphore is None:
+            cls._llm_semaphore = asyncio.Semaphore(1)
+        return cls._llm_semaphore
 
     def __init__(self) -> None:
         """Initialize geocoder.  Nominatim is created only when LLM mode is off."""
@@ -507,7 +516,7 @@ class GeoEnrichmentSkill:
             parts: list[str] = []
             if label and label.lower() not in ("unknown", ""):
                 parts.append(label)
-            elif city and city.lower() not in ("unknown", ""):
+            if city and city.lower() not in ("unknown", ""):
                 parts.append(city)
             if country and country.lower() not in ("unknown", ""):
                 parts.append(country)
@@ -625,77 +634,78 @@ class GeoEnrichmentSkill:
         }
 
         # ── Rate limiting ─────────────────────────────────────────────────────
-        # Serialise LLM requests via a class-level threading.Lock to avoid 429
-        # responses.  The lock is acquired in a thread executor (same pattern as
-        # Nominatim) so the asyncio event loop is not blocked during the wait.
-        def _rate_limited_wait() -> None:
-            with GeoEnrichmentSkill._llm_lock:
-                wait = GeoEnrichmentSkill._LLM_INTERVAL - (
-                    time.monotonic() - GeoEnrichmentSkill._llm_last_req
+        # asyncio.Semaphore(1) is held for the *entire* HTTP request so that
+        # only one LLM request is ever in-flight at a time.  This prevents the
+        # "start 1 req/s but keep 30 in-flight" pattern that caused timeouts
+        # (empty exception messages) and eventual 429 bursts.
+        async with GeoEnrichmentSkill._get_llm_semaphore():
+            elapsed = time.monotonic() - GeoEnrichmentSkill._llm_last_req
+            wait = GeoEnrichmentSkill._LLM_INTERVAL - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            GeoEnrichmentSkill._llm_last_req = time.monotonic()
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(30.0), follow_redirects=True
+                ) as client:
+                    resp = await client.post(
+                        f"{base_url}/v1/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                content: str = data["choices"][0]["message"]["content"].strip()
+
+                # Extract the first JSON object from the response.  The model may
+                # wrap the object in markdown fences, add a preamble sentence, or
+                # append a postamble — re.search finds {…} regardless of context.
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if not json_match:
+                    logger.warning(
+                        "GeoEnrichmentSkill LLM: no JSON object in response for '{}': {!r}",
+                        location_str, content[:200],
+                    )
+                    GeoEnrichmentSkill._geo_cache[key] = None
+                    return GeoEnrichmentOutput()
+
+                geo = json.loads(json_match.group(0))
+                lat = geo.get("latitude")
+                lon = geo.get("longitude")
+                country   = geo.get("country") or ""
+                region    = geo.get("region") or None
+                continent = geo.get("continent") or (_country_to_continent(country) if country else None)
+                location  = geo.get("location") or location_str
+
+                if lat is None or lon is None:
+                    logger.debug("GeoEnrichmentSkill LLM: no coordinates for '{}'", location_str)
+                    GeoEnrichmentSkill._geo_cache[key] = None
+                    return GeoEnrichmentOutput()
+
+                result = GeoEnrichmentOutput(
+                    latitude=float(lat),
+                    longitude=float(lon),
+                    country=country or None,
+                    region=region,
+                    continent=continent,
+                    confidence="high" if country else "medium",
                 )
-                if wait > 0:
-                    time.sleep(wait)
-                GeoEnrichmentSkill._llm_last_req = time.monotonic()
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _rate_limited_wait)
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-                resp = await client.post(
-                    f"{base_url}/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
+                GeoEnrichmentSkill._geo_cache[key] = result
+                logger.debug(
+                    "GeoEnrichmentSkill LLM: '{}' → '{}' ({:.4f}, {:.4f}) {}",
+                    location_str, location, result.latitude, result.longitude, country,
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                return result
 
-            content: str = data["choices"][0]["message"]["content"].strip()
-
-            # Extract the first JSON object from the response.  The model may
-            # wrap the object in markdown fences, add a preamble sentence, or
-            # append a postamble — re.search finds {…} regardless of context.
-            json_match = re.search(r"\{.*\}", content, re.DOTALL)
-            if not json_match:
+            except Exception as exc:
                 logger.warning(
-                    "GeoEnrichmentSkill LLM: no JSON object in response for '{}': {!r}",
-                    location_str, content[:200],
+                    "GeoEnrichmentSkill LLM error for '{}': {}: {}",
+                    location_str, type(exc).__name__, exc,
                 )
                 GeoEnrichmentSkill._geo_cache[key] = None
                 return GeoEnrichmentOutput()
-
-            geo = json.loads(json_match.group(0))
-            lat = geo.get("latitude")
-            lon = geo.get("longitude")
-            country   = geo.get("country") or ""
-            region    = geo.get("region") or None
-            continent = geo.get("continent") or (_country_to_continent(country) if country else None)
-            location  = geo.get("location") or location_str
-
-            if lat is None or lon is None:
-                logger.debug("GeoEnrichmentSkill LLM: no coordinates for '{}'", location_str)
-                GeoEnrichmentSkill._geo_cache[key] = None
-                return GeoEnrichmentOutput()
-
-            result = GeoEnrichmentOutput(
-                latitude=float(lat),
-                longitude=float(lon),
-                country=country or None,
-                region=region,
-                continent=continent,
-                confidence="high" if country else "medium",
-            )
-            GeoEnrichmentSkill._geo_cache[key] = result
-            logger.debug(
-                "GeoEnrichmentSkill LLM: '{}' → '{}' ({:.4f}, {:.4f}) {}",
-                location_str, location, result.latitude, result.longitude, country,
-            )
-            return result
-
-        except Exception as exc:
-            logger.warning("GeoEnrichmentSkill LLM error for '{}': {}", location_str, exc)
-            GeoEnrichmentSkill._geo_cache[key] = None
-            return GeoEnrichmentOutput()
 
     @staticmethod
     def _extract_label_location(text: str) -> str:
