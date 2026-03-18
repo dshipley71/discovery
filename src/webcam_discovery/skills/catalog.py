@@ -652,11 +652,19 @@ class GeoEnrichmentSkill:
 
             content: str = data["choices"][0]["message"]["content"].strip()
 
-            # Strip optional markdown code fences the model may add
-            content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
-            content = re.sub(r"\s*```$", "", content)
+            # Extract the first JSON object from the response.  The model may
+            # wrap the object in markdown fences, add a preamble sentence, or
+            # append a postamble — re.search finds {…} regardless of context.
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if not json_match:
+                logger.warning(
+                    "GeoEnrichmentSkill LLM: no JSON object in response for '{}': {!r}",
+                    location_str, content[:200],
+                )
+                GeoEnrichmentSkill._geo_cache[key] = None
+                return GeoEnrichmentOutput()
 
-            geo = json.loads(content)
+            geo = json.loads(json_match.group(0))
             lat = geo.get("latitude")
             lon = geo.get("longitude")
             country   = geo.get("country") or ""
@@ -722,19 +730,11 @@ class GeoEnrichmentSkill:
         Clean and expand place name tokens before sending to Nominatim.
 
         Handles patterns found in scraped webcam metadata:
-        - File extensions:       ``San Candido.Html`` → ``San Candido``
-        - All-lowercase run-ons: ``lasvegas``         → ``Las Vegas``
-        - CamelCase tokens:      ``CnTower``          → ``Cn Tower``
-        - Digits mixed in:       ``Area51``           → ``Area 51``
-
-        The function applies a small curated alias table for well-known tokens
-        that a simple space-insertion rule cannot fix, then title-cases the
-        result so Nominatim's string matching works reliably.
+        - File extensions:  ``San Candido.Html`` → ``San Candido``
+        - CamelCase tokens: ``CnTower``           → ``Cn Tower``
+        - Digits mixed in:  ``Area51``            → ``Area 51``
         """
         # Strip file extensions left over from URL path scraping.
-        # Lookahead (?=\s*(?:,|$)) matches the extension whether it appears
-        # at the end of the string or immediately before a comma separator,
-        # so both "San Candido.Html" and "San Candido.Html, Bolzano" are cleaned.
         text = re.sub(
             r"\.(html?|php|asp|aspx|jsp|cfm|cgi)(?=\s*(?:,|$))",
             "",
@@ -742,24 +742,6 @@ class GeoEnrichmentSkill:
             flags=re.IGNORECASE,
         )
         text = text.strip()
-
-        _ALIASES: dict[str, str] = {
-            "lasvegas": "Las Vegas",
-            "newyork": "New York",
-            "newyorkcity": "New York City",
-            "losangeles": "Los Angeles",
-            "sanfrancisco": "San Francisco",
-            "kansascity": "Kansas City",
-            "oklahomacity": "Oklahoma City",
-            "saltlakecity": "Salt Lake City",
-            "cntower": "CN Tower Toronto",
-            "terminaltower": "Terminal Tower Cleveland",
-            "skydeck": "Skydeck Chicago",
-        }
-
-        token = text.strip().lower().replace(" ", "")
-        if token in _ALIASES:
-            return _ALIASES[token]
 
         # Insert spaces before uppercase letters that follow lowercase ones (CamelCase)
         spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text.strip())
