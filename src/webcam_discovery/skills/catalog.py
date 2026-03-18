@@ -647,7 +647,7 @@ class GeoEnrichmentSkill:
 
             try:
                 async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(30.0), follow_redirects=True
+                    timeout=httpx.Timeout(30.0)
                 ) as client:
                     resp = await client.post(
                         f"{base_url}/v1/chat/completions",
