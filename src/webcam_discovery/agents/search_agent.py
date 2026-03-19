@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import AsyncGenerator
 from urllib.parse import quote_plus, urlparse
 
 import httpx
@@ -173,6 +174,52 @@ class SearchAgent:
             tier, len(unique_candidates), len(cities),
         )
         return unique_candidates
+
+    async def stream(self, tier: int = 1) -> AsyncGenerator[CameraCandidate, None]:
+        """
+        Yield CameraCandidate objects incrementally as each city's searches complete.
+
+        This is the streaming counterpart to ``run()``.  Results are emitted
+        city-by-city, allowing the caller to begin validating early candidates
+        while the remaining cities are still being searched.
+
+        Args:
+            tier: City tier to search (1 = Tier 1 cities only).
+
+        Yields:
+            CameraCandidate objects, deduplicated by URL across all emitted cities.
+        """
+        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
+        query_skill = QueryGenerationSkill()
+        non_hls = SourcesRegistry().non_hls_domains
+        if non_hls:
+            logger.info("SearchAgent.stream: excluding {} non-HLS source domains", len(non_hls))
+
+        semaphore = asyncio.Semaphore(self.CONCURRENCY)
+        seen_urls: set[str] = set()
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=True,
+        ) as client:
+            for city in cities:
+                try:
+                    city_candidates = await self._search_city(
+                        client, city, query_skill, semaphore, non_hls
+                    )
+                except Exception as exc:
+                    logger.warning("SearchAgent.stream: error for city '{}': {}", city, exc)
+                    continue
+
+                for c in city_candidates:
+                    if c.url not in seen_urls:
+                        seen_urls.add(c.url)
+                        yield c
+
+        logger.info(
+            "SearchAgent.stream: finished — {} unique candidates emitted from {} cities",
+            len(seen_urls), len(cities),
+        )
 
     async def _search_city(
         self,

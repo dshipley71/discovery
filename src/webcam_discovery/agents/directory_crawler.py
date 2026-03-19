@@ -22,7 +22,7 @@ import argparse
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import AsyncGenerator, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -391,6 +391,94 @@ class DirectoryAgent:
             tier, len(unique),
         )
         return unique
+
+    async def stream(
+        self, tier: int = 1, hls_only: bool = False
+    ) -> AsyncGenerator[CameraCandidate, None]:
+        """
+        Yield CameraCandidate objects incrementally as each source batch completes.
+
+        This is the streaming counterpart to ``run()``.  The caller receives
+        candidates as soon as each group of BATCH_SIZE sources is traversed and
+        feed-extracted, so downstream validation can begin while the remaining
+        sources are still being crawled.
+
+        Args:
+            tier:     Maximum tier to crawl (1 = Tier 1 only, 5 = all tiers 1–5).
+            hls_only: When True, skip non-HLS source sites and drop non-.m3u8 URLs.
+
+        Yields:
+            CameraCandidate objects, deduplicated by URL across all emitted batches.
+        """
+        registry = SourcesRegistry()
+        sources = registry.sources_for_tier(tier, hls_only=hls_only)
+        blocked = registry.blocked_domains
+
+        if not sources:
+            logger.warning("DirectoryAgent.stream: no sources loaded for tier={}", tier)
+            return
+
+        logger.info(
+            "DirectoryAgent.stream: tier={} → {} sources",
+            tier, len(sources),
+        )
+
+        filtered: list[str] = []
+        for url in sources:
+            domain = _domain_of(url)
+            if any(domain == b or domain.endswith("." + b) for b in blocked):
+                logger.info("DirectoryAgent.stream: skipping blocked source {}", domain)
+            else:
+                filtered.append(url)
+
+        robots_skill = RobotsPolicySkill()
+
+        async def _check_robots(source_url: str) -> Optional[str]:
+            domain = _domain_of(source_url)
+            try:
+                result = await robots_skill.run(RobotsPolicyInput(domain=domain))
+                return source_url if result.allowed else None
+            except Exception:
+                return source_url  # default-allow on error
+
+        robots_results = await asyncio.gather(*[_check_robots(url) for url in filtered])
+        allowed_sources = [url for url in robots_results if url is not None]
+
+        traversal_skill = DirectoryTraversalSkill()
+        seen_urls: set[str] = set()
+        _hls_re = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
+
+        for i in range(0, len(allowed_sources), self.BATCH_SIZE):
+            batch = allowed_sources[i : i + self.BATCH_SIZE]
+            for url in batch:
+                logger.info("DirectoryAgent.stream: crawling {}", _domain_of(url))
+
+            tasks = [
+                traversal_skill.run(TraversalInput(base_url=url, max_depth=self.MAX_DEPTH))
+                for url in batch
+            ]
+            raw_batch: list[CameraCandidate] = []
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result, source_url in zip(results, batch):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "DirectoryAgent.stream: traversal error for {}: {}", source_url, result
+                    )
+                else:
+                    raw_batch.extend(result.candidates)
+
+            resolved = await self._resolve_feed_urls(raw_batch)
+
+            for c in resolved:
+                if hls_only and not _hls_re.search(c.url):
+                    continue
+                if c.url not in seen_urls:
+                    seen_urls.add(c.url)
+                    yield c
+
+        logger.info(
+            "DirectoryAgent.stream: finished — {} unique candidates emitted", len(seen_urls)
+        )
 
     async def _resolve_feed_urls(
         self, candidates: list[CameraCandidate]

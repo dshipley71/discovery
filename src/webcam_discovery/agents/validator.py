@@ -302,6 +302,67 @@ class ValidationAgent:
         )
         return records
 
+    async def run_from_queue(
+        self,
+        queue: asyncio.Queue,
+        batch_size: int = 100,
+    ) -> list[CameraRecord]:
+        """
+        Validate candidates delivered via an ``asyncio.Queue``, processing them
+        in batches as they arrive.
+
+        Used by the streaming pipeline so that validation overlaps with discovery:
+        candidates produced by DirectoryAgent / SearchAgent are validated
+        immediately rather than waiting for all discovery to finish.
+
+        The queue must be closed by the producer(s) sending a single ``None``
+        sentinel value after all items have been put.
+
+        Args:
+            queue:      Shared ``asyncio.Queue[CameraCandidate | None]``.
+                        ``None`` is the end-of-stream sentinel.
+            batch_size: Number of candidates to accumulate before triggering a
+                        validation pass.  Smaller values reduce latency at the
+                        cost of more per-batch overhead (extra robots/HTTP round-
+                        trips).  Default: 100.
+
+        Returns:
+            list[CameraRecord] — combined results from all batches.
+        """
+        pending: list[CameraCandidate] = []
+        all_records: list[CameraRecord] = []
+        seen_urls: set[str] = set()  # cross-agent deduplication
+
+        async def flush() -> None:
+            if not pending:
+                return
+            logger.info(
+                "ValidationAgent.run_from_queue: flushing batch of {} candidates", len(pending)
+            )
+            batch_records = await self.run(candidates=list(pending))
+            all_records.extend(batch_records)
+            pending.clear()
+
+        while True:
+            item: CameraCandidate | None = await queue.get()
+            if item is None:
+                # End-of-stream sentinel — flush whatever remains and stop.
+                await flush()
+                break
+
+            if item.url not in seen_urls:
+                seen_urls.add(item.url)
+                pending.append(item)
+
+            if len(pending) >= batch_size:
+                await flush()
+
+        logger.info(
+            "ValidationAgent.run_from_queue: complete — {} records from {} unique candidates",
+            len(all_records), len(seen_urls),
+        )
+        return all_records
+
     # ── Concurrency helpers ───────────────────────────────────────────────────
 
     async def _batch_geo_enrich(
