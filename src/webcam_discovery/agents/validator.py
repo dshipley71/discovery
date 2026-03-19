@@ -182,6 +182,60 @@ class ValidationAgent:
             breakdown = "  ".join(f"{reason}={n}" for reason, n in fail_reasons.most_common())
             logger.info("ValidationAgent: failure reasons — {}", breakdown)
 
+        # ── Step 2b: browser second-pass (optional) ───────────────────────────
+        # Many webcam sites load stream URLs via JavaScript fetch/XHR after the
+        # page renders — they are never in the static HTML so _probe_generic
+        # classifies them as "dead" (no_stream_found_in_html).  This pass opens
+        # those pages in headless Chromium, intercepts network responses, clicks
+        # play buttons, and retrieves the actual .m3u8 URL.
+        #
+        # _browser_stream_map: page_url → direct stream_url discovered by browser
+        _browser_stream_map: dict[str, str] = {}
+
+        if settings.use_browser_validation:
+            # Target HTML-page URLs that the static prober could not confirm live.
+            browser_targets = [
+                c.url for c in allowed
+                if not c.url.lower().endswith(".m3u8")
+                and ".m3u8" not in c.url.lower()
+                and ".mjpeg" not in c.url.lower()
+                and ".mjpg" not in c.url.lower()
+                and url_to_val.get(c.url) is not None
+                and url_to_val[c.url].status != "live"
+            ]
+            if browser_targets:
+                from webcam_discovery.skills.browser_validation import (
+                    BrowserValidationSkill,
+                )
+                browser_output = await BrowserValidationSkill().run(browser_targets)
+
+                if browser_output.stream_map:
+                    # Re-probe each discovered stream URL with the standard prober
+                    # so we get proper HLS magic / content-type validation.
+                    new_stream_urls = list(browser_output.stream_map.values())
+                    new_referers = {
+                        stream_url: page_url
+                        for page_url, stream_url in browser_output.stream_map.items()
+                    }
+                    new_results = await feed_skill.run(new_stream_urls, referers=new_referers)
+                    new_url_to_val = {r.url: r for r in new_results}
+
+                    upgraded = 0
+                    for page_url, stream_url in browser_output.stream_map.items():
+                        stream_result = new_url_to_val.get(stream_url)
+                        if stream_result and stream_result.status == "live":
+                            # Replace the failed page-probe result with the live
+                            # stream-probe result, keyed by the original page URL.
+                            url_to_val[page_url] = stream_result
+                            _browser_stream_map[page_url] = stream_url
+                            upgraded += 1
+
+                    logger.info(
+                        "ValidationAgent: browser pass upgraded {}/{} pages to live",
+                        upgraded,
+                        len(browser_output.stream_map),
+                    )
+
         # ── Step 3: filter by legitimacy ──────────────────────────────────────
         # status="unknown" with min_legitimacy="low" is kept: a 200 OK that
         # lacked #EXTM3U magic may still be a valid stream (e.g. no-magic CDN
@@ -224,8 +278,13 @@ class ValidationAgent:
 
         # ── Step 5: build CameraRecord objects ────────────────────────────────
         for (candidate, v), geo in zip(to_enrich, geo_results):
+            # If the browser second-pass discovered a direct stream URL for this
+            # page, store that as the record URL and preserve the original page
+            # URL in source_refs so it remains traceable.
+            effective_url = _browser_stream_map.get(candidate.url, candidate.url)
+            # Use effective_url (stream URL) for feed-type classification
             feed_type_result = type_skill.run(FeedTypeInput(
-                url=candidate.url,
+                url=effective_url,
                 content_type=v.content_type,
                 playlist_type=v.playlist_type,
             ))
@@ -249,13 +308,17 @@ class ValidationAgent:
                 if geo.country:
                     country = geo.country
 
-            record_id = _make_slug(city, label) or _make_slug("camera", candidate.url[-30:])
+            record_id = _make_slug(city, label) or _make_slug("camera", effective_url[-30:])
 
             notes = candidate.notes or ""
             if latitude is None:
                 notes = f"{notes} location_unknown".strip()
 
             source_refs = list(candidate.source_refs) if candidate.source_refs else []
+            # If the browser found a stream URL, preserve the original page URL
+            # as the first source reference so operators can trace the source.
+            if effective_url != candidate.url and candidate.url not in source_refs:
+                source_refs.insert(0, candidate.url)
 
             try:
                 record = CameraRecord(
@@ -267,12 +330,12 @@ class ValidationAgent:
                     continent=continent,
                     latitude=latitude,
                     longitude=longitude,
-                    url=candidate.url,
+                    url=effective_url,
                     feed_type=feed_type_result.feed_type,
                     playlist_type=v.playlist_type,
                     variant_streams=v.variant_streams,
                     source_directory=candidate.source_directory,
-                    source_refs=source_refs or [candidate.url],
+                    source_refs=source_refs or [effective_url],
                     legitimacy_score=v.legitimacy_score,
                     status=v.status,
                     last_verified=None,
@@ -286,7 +349,7 @@ class ValidationAgent:
                     v.playlist_type or "—",
                     v.legitimacy_score,
                     f"{latitude:.3f},{longitude:.3f}" if latitude is not None else "none",
-                    candidate.url,
+                    effective_url,
                 )
             except Exception as exc:
                 logger.warning(

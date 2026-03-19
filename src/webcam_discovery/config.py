@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     ollama_base_url:   str  = "https://ollama.com"        # Ollama cloud endpoint (api.ollama.com 301-redirects here)
     ollama_model:      str  = "llama3.2"                  # model for geocoding
 
+    # Browser-based stream URL discovery via Playwright (opt-in)
+    # Many webcam sites load .m3u8 URLs via JavaScript fetch/XHR — static HTML probing
+    # misses these.  Enable to run a headless-Chromium second pass on pages that the
+    # static prober marks as dead/unknown.  Requires: playwright install chromium.
+    use_browser_validation:          bool = False
+    browser_validation_concurrency:  int  = 3    # simultaneous browser sessions (heavy)
+    browser_validation_timeout:      int  = 15   # seconds to wait for stream URL per page
+
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
 
     def ensure_dirs(self) -> None:
