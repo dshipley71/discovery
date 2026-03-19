@@ -105,8 +105,36 @@ _AUTH_URL_RE    = re.compile(
 )
 
 # Broad catch-all patterns for scanning raw HTML bodies.
-_BROAD_HLS_RE   = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
-_BROAD_MJPEG_RE = re.compile(r"""['"]([^'"]{4,500}\.mjpe?g[^'"]{0,100})['"]""", re.IGNORECASE)
+# 1. Quoted string containing a stream URL (original)
+_BROAD_HLS_RE    = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
+_BROAD_MJPEG_RE  = re.compile(r"""['"]([^'"]{4,500}\.mjpe?g[^'"]{0,100})['"]""", re.IGNORECASE)
+_BROAD_DASH_RE   = re.compile(r"""['"]([^'"]{4,500}\.mpd[^'"]{0,100})['"]""",   re.IGNORECASE)
+# 2. JSON key-value pairs: "hlsUrl": "https://..." or 'streamUrl': '...'
+_JSON_HLS_RE     = re.compile(
+    r'"(?:url|src|stream|hls|hlsUrl|hlsSrc|m3u8|streamUrl|videoUrl|liveUrl|'
+    r'feedUrl|playbackUrl|mediaUrl|contentUrl|manifestUrl)"\s*:\s*"([^"]{4,500}\.m3u8[^"]{0,100})"',
+    re.IGNORECASE,
+)
+# 3. data-* HTML attribute values
+_DATA_ATTR_HLS_RE = re.compile(
+    r'data-(?:src|stream|url|hls|m3u8|video|live|feed|manifest)\s*=\s*["\']([^"\']{4,500}\.m3u8[^"\']{0,100})["\']',
+    re.IGNORECASE,
+)
+# 4. Bare JS variable assignments: var hlsUrl = "https://..."
+_JS_VAR_HLS_RE   = re.compile(
+    r'(?:var|let|const)\s+\w*(?:hls|stream|url|src|m3u8|video|live|feed)\w*\s*=\s*["\']([^"\']{4,500}\.m3u8[^"\']{0,100})["\']',
+    re.IGNORECASE,
+)
+
+# Text markers that indicate a camera is currently offline / unavailable.
+# Detect these to avoid wasting time probing dead cameras and to give a clearer fail_reason.
+_OFFLINE_MARKERS_RE = re.compile(
+    r'\b(?:camera\s+(?:is\s+)?(?:offline|unavailable|disabled|not\s+available)|'
+    r'stream\s+(?:is\s+)?(?:offline|unavailable)|'
+    r'no\s+signal|temporarily\s+unavailable|currently\s+unavailable|'
+    r'webcam\s+(?:is\s+)?(?:offline|unavailable))\b',
+    re.IGNORECASE,
+)
 
 # Content-type substrings that indicate a live stream is being served directly.
 _LIVE_CONTENT_TYPES = (
@@ -115,6 +143,7 @@ _LIVE_CONTENT_TYPES = (
     "application/x-mpegurl",
     "application/vnd.apple.mpegurl",
     "video/x-motion-jpeg",
+    "application/dash+xml",
 )
 
 
@@ -345,11 +374,22 @@ class FeedValidationSkill:
         """
         Probe an HTML embed page for embedded stream URLs.
 
-        Reads up to 32 KB of the response body and:
+        Reads up to 64 KB of the response body (increased from 32 KB to
+        capture late-document JSON blobs and JavaScript variable assignments)
+        and applies multiple extraction patterns:
+
         1. Returns live immediately if the content-type signals a direct stream
-           (multipart/x-mixed-replace, video/*, application/x-mpegurl, …).
-        2. For text/html responses, scans the body for quoted .m3u8 and .mjpeg
-           URLs and probes each in turn, returning on the first live result.
+           (multipart/x-mixed-replace, video/*, application/x-mpegurl, DASH …).
+        2. For text/html responses:
+           a. Detects offline-marker text and returns ``unknown`` with
+              ``fail_reason="offline_marker"`` without probing further.
+           b. Applies five URL-extraction patterns in priority order:
+              - JSON key-value pairs (``"hlsUrl":"…"`` etc.)
+              - data-* HTML attributes (``data-src``, ``data-stream`` etc.)
+              - Bare JavaScript variable assignments
+              - Standard quoted-string scan
+              - MJPEG / MPEG-DASH URLs (same multi-pattern approach)
+           c. Each candidate is probed; returns on the first live result.
         3. Returns dead (no_stream_found_in_html) if nothing live is found.
         """
         try:
@@ -377,27 +417,51 @@ class FeedValidationSkill:
                         fail_reason="non_stream_content",
                     )
 
-                # HTML — read up to 32 KB to scan for embedded stream URLs
+                # HTML — read up to 64 KB to scan for embedded stream URLs.
+                # 64 KB catches late-document JSON blobs and JS variable assignments
+                # that a 32 KB read would miss on larger pages.
                 buf = b""
                 async for chunk in resp.aiter_bytes():
                     buf += chunk
-                    if len(buf) >= 32768:
+                    if len(buf) >= 65536:
                         break
 
             body = buf.decode("utf-8", errors="replace")
 
-            # Probe any .m3u8 URLs found in the page
-            hls_seen: set[str] = set()
-            for m in _BROAD_HLS_RE.finditer(body):
-                raw = m.group(1)
-                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
-                if abs_url not in hls_seen:
-                    hls_seen.add(abs_url)
-                    result = await self._probe_hls(client, abs_url)
-                    if result.status == "live":
-                        return result
+            # Check for offline / unavailable markers before probing.
+            # Avoids wasting HTTP requests on cameras that are explicitly offline.
+            if _OFFLINE_MARKERS_RE.search(body):
+                return ValidationResult(
+                    url=url, status_code=200, content_type=ct or None,
+                    legitimacy_score="low", status="unknown",
+                    fail_reason="offline_marker",
+                )
 
-            # Probe any .mjpg/.mjpeg URLs found in the page
+            # Collect HLS candidate URLs from all patterns (deduped, ordered by
+            # priority: JSON keys > data-* attrs > JS vars > quoted strings).
+            hls_seen: set[str] = set()
+
+            def _collect_hls(pattern: re.Pattern) -> list[str]:
+                result: list[str] = []
+                for m in pattern.finditer(body):
+                    raw = m.group(1)
+                    abs_url = raw if raw.startswith("http") else urljoin(url, raw)
+                    if abs_url not in hls_seen:
+                        hls_seen.add(abs_url)
+                        result.append(abs_url)
+                return result
+
+            for hls_url in (
+                _collect_hls(_JSON_HLS_RE)
+                + _collect_hls(_DATA_ATTR_HLS_RE)
+                + _collect_hls(_JS_VAR_HLS_RE)
+                + _collect_hls(_BROAD_HLS_RE)
+            ):
+                result = await self._probe_hls(client, hls_url, referer=url)
+                if result.status == "live":
+                    return result
+
+            # MJPEG candidates
             mjpeg_seen: set[str] = set()
             for m in _BROAD_MJPEG_RE.finditer(body):
                 raw = m.group(1)
