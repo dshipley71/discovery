@@ -42,8 +42,9 @@ _BROWSER_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_HLS_RE   = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
+_HLS_RE   = re.compile(r"\.m3u8(\?|$|/)", re.IGNORECASE)
 _MJPEG_RE = re.compile(r"\.mjpe?g(\?|$)", re.IGNORECASE)
+_DASH_RE  = re.compile(r"\.mpd(\?|$)", re.IGNORECASE)
 
 # Content-type substrings that signal a live video stream in a network response.
 _STREAM_CONTENT_TYPES = (
@@ -52,6 +53,22 @@ _STREAM_CONTENT_TYPES = (
     "video/mp2t",
     "multipart/x-mixed-replace",
     "video/x-motion-jpeg",
+    "application/dash+xml",
+)
+
+# Text markers indicating camera is offline — detected in rendered page content.
+_OFFLINE_MARKERS = (
+    "camera offline",
+    "camera unavailable",
+    "camera is offline",
+    "stream unavailable",
+    "stream offline",
+    "no signal",
+    "temporarily unavailable",
+    "currently unavailable",
+    "webcam offline",
+    "webcam unavailable",
+    "not available",
 )
 
 # CSS selectors tried in order when looking for a play button.
@@ -84,6 +101,8 @@ class BrowserValidationInput(BaseModel):
 class BrowserValidationOutput(BaseModel):
     """Maps each probed page URL to the discovered direct stream URL, when found."""
     stream_map: dict[str, str] = {}
+    offline_pages: list[str] = []
+    """Page URLs where offline/unavailable markers were detected in rendered content."""
 
 
 # ── BrowserValidationSkill ────────────────────────────────────────────────────
@@ -144,6 +163,7 @@ class BrowserValidationSkill:
 
         sem = asyncio.Semaphore(settings.browser_validation_concurrency)
         stream_map: dict[str, str] = {}
+        offline_pages: list[str] = []
 
         from playwright.async_api import async_playwright
         async with async_playwright() as playwright:
@@ -163,7 +183,8 @@ class BrowserValidationSkill:
                 self._probe_page(browser, url, sem, settings.browser_validation_timeout)
                 for url in html_urls
             ]
-            results: list[Optional[str]] = list(await tqdm_asyncio.gather(
+            # Each result is (stream_url_or_None, is_offline)
+            results: list[tuple[Optional[str], bool]] = list(await tqdm_asyncio.gather(
                 *tasks,
                 desc="Browser probing",
                 unit="page",
@@ -172,16 +193,19 @@ class BrowserValidationSkill:
 
             await browser.close()
 
-        for url, stream_url in zip(html_urls, results):
+        for url, (stream_url, is_offline) in zip(html_urls, results):
             if stream_url:
                 stream_map[url] = stream_url
+            elif is_offline:
+                offline_pages.append(url)
 
         logger.info(
-            "BrowserValidationSkill: found stream URLs for {}/{} pages",
+            "BrowserValidationSkill: found stream URLs for {}/{} pages; {} marked offline",
             len(stream_map),
             len(html_urls),
+            len(offline_pages),
         )
-        return BrowserValidationOutput(stream_map=stream_map)
+        return BrowserValidationOutput(stream_map=stream_map, offline_pages=offline_pages)
 
     async def _probe_page(
         self,
@@ -189,25 +213,31 @@ class BrowserValidationSkill:
         page_url: str,
         sem: asyncio.Semaphore,
         timeout_s: int,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], bool]:
         """
-        Open one page in the browser and return the first live stream URL found.
+        Open one page in the browser and return (stream_url_or_None, is_offline).
 
         Strategy:
-        1. Navigate to the page (wait for domcontentloaded to save time).
-        2. Intercept all network responses; collect URLs that look like streams.
-        3. Try clicking common play-button selectors (first match wins).
-        4. Wait ``timeout_s`` seconds (capped at 6 s) for stream URLs to appear.
-        5. Return first HLS URL found; fall back to MJPEG; return None if nothing.
+        1. Navigate to the page waiting for ``networkidle`` (catches async XHR/fetch
+           calls that fire after initial DOM load) — falls back to ``domcontentloaded``
+           on timeout so we still process pages that never fully settle.
+        2. Intercept all network responses; collect URLs that look like streams
+           (HLS .m3u8, MJPEG .mjpeg, MPEG-DASH .mpd, or matching content-types).
+        3. Extract ``currentSrc`` / ``src`` from ``<video>`` and ``<source>`` DOM
+           elements — many players set these attributes without a network request.
+        4. Try clicking common play-button selectors to trigger stream initialisation.
+        5. Wait up to ``timeout_s`` seconds for stream URLs to appear in network traffic.
+        6. Check rendered page text for offline / unavailable markers.
+        7. Return (first_hls_url, False) | (first_other_url, False) | (None, is_offline).
 
         Args:
             browser:   Shared Playwright Browser instance.
             page_url:  HTML page to open.
             sem:       Semaphore bounding concurrent browser sessions.
-            timeout_s: Maximum seconds to wait for a stream URL.
+            timeout_s: Maximum seconds to wait for a stream URL after click.
 
         Returns:
-            Direct stream URL string, or None if nothing was discovered.
+            Tuple of (direct stream URL or None, offline flag).
         """
         async with sem:
             context = await browser.new_context(
@@ -221,59 +251,127 @@ class BrowserValidationSkill:
             def on_response(response) -> None:
                 """Collect stream URLs from intercepted network responses."""
                 try:
-                    url = response.url
+                    resp_url = response.url
                     ct = response.headers.get("content-type", "").lower()
                     if (
-                        _HLS_RE.search(url)
-                        or _MJPEG_RE.search(url)
+                        _HLS_RE.search(resp_url)
+                        or _MJPEG_RE.search(resp_url)
+                        or _DASH_RE.search(resp_url)
                         or any(k in ct for k in _STREAM_CONTENT_TYPES)
                     ):
-                        found.append(url)
+                        found.append(resp_url)
                         logger.debug(
                             "BrowserValidationSkill: intercepted stream {} on {}",
-                            url, page_url,
+                            resp_url, page_url,
                         )
                 except Exception:
                     pass
 
             page.on("response", on_response)
+            is_offline = False
 
             try:
-                await page.goto(
-                    page_url,
-                    wait_until="domcontentloaded",
-                    timeout=15_000,
-                )
-
-                # Try clicking a play button — many cameras only start streaming
-                # after user interaction with the play button.
-                for selector in _PLAY_SELECTORS:
+                # Prefer networkidle — waits until no network activity for 500 ms,
+                # which catches async XHR/fetch calls that fire after DOM load.
+                # Fall back to domcontentloaded if the page never settles.
+                try:
+                    await page.goto(
+                        page_url,
+                        wait_until="networkidle",
+                        timeout=min(timeout_s * 1_000, 20_000),
+                    )
+                except Exception:
+                    # networkidle timed out; try again with a lighter wait condition
                     try:
-                        await page.click(selector, timeout=1_500, force=True)
-                        logger.debug(
-                            "BrowserValidationSkill: clicked '{}' on {}",
-                            selector, page_url,
+                        await page.goto(
+                            page_url,
+                            wait_until="domcontentloaded",
+                            timeout=10_000,
                         )
-                        break
-                    except Exception:
-                        pass
+                    except Exception as exc2:
+                        logger.debug(
+                            "BrowserValidationSkill: navigation error for {}: {}",
+                            page_url, str(exc2)[:120],
+                        )
 
-                # Wait for the stream to start appearing in network traffic.
-                # Cap at 6 s to keep per-page overhead reasonable.
-                wait_ms = min(timeout_s * 1_000, 6_000)
-                await page.wait_for_timeout(wait_ms)
+                # ── DOM extraction: currentSrc / src on <video> and <source> ──
+                # Many players set the video src attribute without making a new
+                # network request that the response interceptor would catch.
+                try:
+                    dom_urls: list[str] = await page.eval_on_selector_all(
+                        "video, video source, source",
+                        """els => els.flatMap(el => [
+                            el.currentSrc,
+                            el.src,
+                            el.getAttribute('src'),
+                            el.getAttribute('data-src'),
+                            el.getAttribute('data-stream'),
+                            el.getAttribute('data-hls'),
+                        ]).filter(u => u && u.startsWith('http'))""",
+                    )
+                    for dom_url in dom_urls:
+                        if (
+                            _HLS_RE.search(dom_url)
+                            or _MJPEG_RE.search(dom_url)
+                            or _DASH_RE.search(dom_url)
+                        ) and dom_url not in found:
+                            found.append(dom_url)
+                            logger.debug(
+                                "BrowserValidationSkill: found stream in DOM {} on {}",
+                                dom_url, page_url,
+                            )
+                except Exception:
+                    pass
+
+                # ── Offline marker detection ────────────────────────────────────
+                # Check the visible rendered text before attempting to click play,
+                # so we avoid wasting time on cameras that are explicitly offline.
+                try:
+                    page_text = (await page.inner_text("body")).lower()
+                    if any(marker in page_text for marker in _OFFLINE_MARKERS):
+                        is_offline = True
+                        logger.debug(
+                            "BrowserValidationSkill: offline marker detected on {}",
+                            page_url,
+                        )
+                except Exception:
+                    pass
+
+                # ── Click play button (skip if already offline) ─────────────────
+                if not is_offline and not found:
+                    for selector in _PLAY_SELECTORS:
+                        try:
+                            await page.click(selector, timeout=1_500, force=True)
+                            logger.debug(
+                                "BrowserValidationSkill: clicked '{}' on {}",
+                                selector, page_url,
+                            )
+                            break
+                        except Exception:
+                            pass
+
+                    # Wait for stream URLs to appear in network traffic after click.
+                    wait_ms = min(timeout_s * 1_000, 8_000)
+                    await page.wait_for_timeout(wait_ms)
 
             except Exception as exc:
                 logger.debug(
-                    "BrowserValidationSkill: navigation error for {}: {}",
+                    "BrowserValidationSkill: page error for {}: {}",
                     page_url, str(exc)[:120],
                 )
             finally:
                 await context.close()
 
-            # Prefer HLS (.m3u8) streams over MJPEG — wider browser support.
-            hls_urls = [u for u in found if _HLS_RE.search(u)]
-            return hls_urls[0] if hls_urls else (found[0] if found else None)
+            # Prefer HLS (.m3u8) > DASH (.mpd) > MJPEG > anything else.
+            hls_urls  = [u for u in found if _HLS_RE.search(u)]
+            dash_urls = [u for u in found if _DASH_RE.search(u)]
+            if hls_urls:
+                return hls_urls[0], False
+            if dash_urls:
+                return dash_urls[0], False
+            if found:
+                return found[0], False
+            return None, is_offline
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────

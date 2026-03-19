@@ -64,6 +64,11 @@ from webcam_discovery.skills.browser_validation import (
     BrowserValidationOutput,
 )
 
+from webcam_discovery.skills.ffprobe_validation import (
+    FfprobeValidationSkill,
+    FfprobeResult,
+)
+
 __all__ = [
     # traversal
     "DirectoryTraversalSkill",
@@ -115,4 +120,7 @@ __all__ = [
     "BrowserValidationSkill",
     "BrowserValidationInput",
     "BrowserValidationOutput",
+    # ffprobe_validation
+    "FfprobeValidationSkill",
+    "FfprobeResult",
 ]

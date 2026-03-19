@@ -230,11 +230,87 @@ class ValidationAgent:
                             _browser_stream_map[page_url] = stream_url
                             upgraded += 1
 
+                    # Mark pages where the browser detected offline/unavailable
+                    # markers as definitively dead so they are excluded from records.
+                    for page_url in browser_output.offline_pages:
+                        existing = url_to_val.get(page_url)
+                        if existing is not None:
+                            url_to_val[page_url] = existing.model_copy(
+                                update={"status": "dead", "fail_reason": "browser_offline_marker"}
+                            )
+
                     logger.info(
-                        "ValidationAgent: browser pass upgraded {}/{} pages to live",
+                        "ValidationAgent: browser pass upgraded {}/{} pages to live; "
+                        "{} pages marked offline",
                         upgraded,
                         len(browser_output.stream_map),
+                        len(browser_output.offline_pages),
                     )
+
+        # ── Step 2c: ffprobe frame-level verification (optional) ─────────────
+        # After the HTTP probe and optional browser second-pass, run ffprobe on
+        # confirmed-live HLS streams to catch blank/frozen feeds (cameras that
+        # serve a valid playlist but are physically offline or covered).
+        #
+        # Outcomes:
+        #   active_streaming → status stays "live"
+        #   active_blank     → downgrade to "unknown" (stream exists but no content)
+        #   disabled         → downgrade to "dead"    (playlist is unreachable at frame level)
+        #   None             → ffprobe unavailable or non-HLS URL — no change
+        if settings.use_ffprobe_validation:
+            from webcam_discovery.skills.ffprobe_validation import FfprobeValidationSkill
+
+            live_hls_urls = [
+                c.url for c in allowed
+                if ".m3u8" in c.url.lower()
+                and url_to_val.get(c.url) is not None
+                and url_to_val[c.url].status == "live"
+            ]
+            # Also check stream URLs discovered by the browser second-pass
+            live_hls_urls += [
+                stream_url for stream_url in _browser_stream_map.values()
+                if ".m3u8" in stream_url.lower()
+            ]
+            live_hls_urls = list(dict.fromkeys(live_hls_urls))  # dedupe, preserve order
+
+            if live_hls_urls:
+                ffprobe_skill = FfprobeValidationSkill(
+                    concurrency=settings.ffprobe_concurrency
+                )
+                ffprobe_results = await ffprobe_skill.run(live_hls_urls)
+                ffprobe_by_url = {r.url: r for r in ffprobe_results}
+
+                upgraded = downgraded_blank = downgraded_disabled = 0
+                for page_url, stream_url in list(_browser_stream_map.items()) + [
+                    (u, u) for u in live_hls_urls if u not in _browser_stream_map.values()
+                ]:
+                    fp = ffprobe_by_url.get(stream_url)
+                    if fp is None or fp.stream_status is None:
+                        continue
+                    # Key in url_to_val is the original candidate URL (page_url
+                    # for browser-upgraded entries, direct stream URL otherwise).
+                    val_key = page_url if page_url in url_to_val else stream_url
+                    existing = url_to_val.get(val_key)
+                    if existing is None:
+                        continue
+                    if fp.stream_status == "active_blank":
+                        url_to_val[val_key] = existing.model_copy(
+                            update={"status": "unknown", "fail_reason": "ffprobe_blank_or_frozen"}
+                        )
+                        downgraded_blank += 1
+                    elif fp.stream_status == "disabled":
+                        url_to_val[val_key] = existing.model_copy(
+                            update={"status": "dead", "fail_reason": "ffprobe_disabled"}
+                        )
+                        downgraded_disabled += 1
+
+                logger.info(
+                    "ValidationAgent: ffprobe checked {} live HLS URLs — "
+                    "blank/frozen={} disabled={}",
+                    len(live_hls_urls),
+                    downgraded_blank,
+                    downgraded_disabled,
+                )
 
         # ── Step 3: filter by legitimacy ──────────────────────────────────────
         # status="unknown" with min_legitimacy="low" is kept: a 200 OK that

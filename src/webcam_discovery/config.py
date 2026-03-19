@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     browser_validation_concurrency:  int  = 3    # simultaneous browser sessions (heavy)
     browser_validation_timeout:      int  = 15   # seconds to wait for stream URL per page
 
+    # ffprobe/ffmpeg frame-level validation (opt-in, gracefully skipped if ffmpeg absent)
+    # Runs ffprobe on confirmed-live HLS URLs to detect blank/frozen streams and
+    # downgrades their status (active_blank → "unknown", disabled → "dead").
+    # Requires: apt-get install -y ffmpeg  (or brew install ffmpeg on macOS)
+    use_ffprobe_validation:          bool = False
+    ffprobe_concurrency:             int  = 5    # simultaneous ffprobe subprocess calls
+
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
 
     def ensure_dirs(self) -> None:
