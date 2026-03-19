@@ -58,6 +58,12 @@ from webcam_discovery.skills.map_rendering import (
     MapRenderingOutput,
 )
 
+from webcam_discovery.skills.browser_validation import (
+    BrowserValidationSkill,
+    BrowserValidationInput,
+    BrowserValidationOutput,
+)
+
 __all__ = [
     # traversal
     "DirectoryTraversalSkill",
@@ -105,4 +111,8 @@ __all__ = [
     "MapRenderingSkill",
     "MapRenderingInput",
     "MapRenderingOutput",
+    # browser_validation
+    "BrowserValidationSkill",
+    "BrowserValidationInput",
+    "BrowserValidationOutput",
 ]

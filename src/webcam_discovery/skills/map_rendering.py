@@ -357,6 +357,8 @@ function doSearch() {{
 }}
 
 // ── Modal ──────────────────────────────────────────────────────────────────────
+let _activeHls = null;
+
 function openModal(p) {{
   document.getElementById('modal-title').textContent = p.label || 'Camera';
   document.getElementById('modal-location').textContent =
@@ -364,15 +366,40 @@ function openModal(p) {{
 
   const playerDiv = document.getElementById('modal-player');
   playerDiv.innerHTML = '';
-  if (p.url) {{
-    const video = document.createElement('video');
-    video.controls = true; video.autoplay = false; video.muted = true;
-    if (Hls.isSupported()) {{
-      const hls = new Hls(); hls.loadSource(p.url); hls.attachMedia(video);
-    }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-      video.src = p.url;
+
+  if (p.status === 'dead') {{
+    playerDiv.innerHTML = '<p style="color:#f38ba8;padding:20px">⚠ Camera offline — stream unavailable.</p>';
+  }} else if (p.url) {{
+    const feedType = (p.feed_type || '').toUpperCase();
+    if (feedType === 'MJPEG') {{
+      // MJPEG is multipart/x-mixed-replace — browsers display it natively as <img>
+      const img = document.createElement('img');
+      img.src = p.url;
+      img.style.cssText = 'width:100%;max-height:480px;object-fit:contain;background:#000';
+      img.alt = 'MJPEG camera stream';
+      playerDiv.appendChild(img);
+    }} else {{
+      // HLS or unknown — use <video> with HLS.js
+      const video = document.createElement('video');
+      video.controls = true; video.autoplay = true; video.muted = true;
+      video.style.cssText = 'width:100%;max-height:480px;background:#000';
+      if (Hls.isSupported()) {{
+        const hls = new Hls();
+        _activeHls = hls;
+        hls.loadSource(p.url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {{
+          video.play().catch(e => console.warn('Autoplay blocked:', e));
+        }});
+      }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+        // Safari native HLS
+        video.src = p.url;
+        video.addEventListener('loadedmetadata', () => {{
+          video.play().catch(e => console.warn('Autoplay blocked:', e));
+        }});
+      }}
+      playerDiv.appendChild(video);
     }}
-    playerDiv.appendChild(video);
   }} else {{
     playerDiv.innerHTML = '<p style="color:#888;padding:20px">No stream URL available.</p>';
   }}
@@ -380,7 +407,13 @@ function openModal(p) {{
   const variantLinks = (p.variant_streams || []).map((v, i) =>
     `<a href="${{v}}" target="_blank" rel="noopener" style="color:#89b4fa;font-size:11px">Variant ${{i+1}}</a>`
   ).join(' ');
+  const statusBadge = p.status === 'live'
+    ? '<span style="color:#a6e3a1">&#9679; Live</span>'
+    : p.status === 'dead'
+    ? '<span style="color:#f38ba8">&#9679; Dead</span>'
+    : '<span style="color:#f9e2af">&#9679; Unknown</span>';
   document.getElementById('modal-meta').innerHTML = `
+    <strong>Status:</strong> ${{statusBadge}}<br>
     <strong>Feed Type:</strong> ${{p.feed_type || '—'}}<br>
     <strong>Playlist Type:</strong> ${{p.playlist_type || '—'}}<br>
     ${{variantLinks ? `<strong>Variants:</strong> ${{variantLinks}}<br>` : ''}}
@@ -409,6 +442,10 @@ function openModal(p) {{
 function closeModal() {{
   document.getElementById('modal-overlay').classList.remove('open');
   document.getElementById('modal-player').innerHTML = '';
+  if (_activeHls) {{
+    _activeHls.destroy();
+    _activeHls = null;
+  }}
 }}
 
 document.addEventListener('keydown', e => {{ if(e.key === 'Escape') closeModal(); }});
