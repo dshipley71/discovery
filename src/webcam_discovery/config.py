@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # Many webcam sites load .m3u8 URLs via JavaScript fetch/XHR — static HTML probing
     # misses these.  Enable to run a headless-Chromium second pass on pages that the
     # static prober marks as dead/unknown.  Requires: playwright install chromium.
-    use_browser_validation:          bool = True
+    use_browser_validation:          bool = False
     browser_validation_concurrency:  int  = 3    # simultaneous browser sessions (heavy)
     browser_validation_timeout:      int  = 15   # seconds to wait for stream URL per page
 
