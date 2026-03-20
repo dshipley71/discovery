@@ -9,7 +9,7 @@ and a standalone `main()` function for CLI invocation.
 2. `search_agent.py`      → produces additional `list[CameraCandidate]`
 3. `validator.py`         → produces `list[CameraRecord]`
 4. `catalog.py`           → writes `camera.geojson` + `cameras.md` to project root
-5. `maintenance.py`       → scheduled HEAD checks + pruning on `camera.geojson`
+5. `maintenance.py`       → scheduled status checks + validation-review reporting on `camera.geojson`
 
 ## Inter-agent contract
 - Exchange data as typed Pydantic objects (`CameraCandidate`, `CameraRecord`)
