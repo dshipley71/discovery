@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     use_ffprobe_validation:          bool = True
     ffprobe_concurrency:             int  = 5    # simultaneous ffprobe subprocess calls
 
+    # HLS-only mode — reject non-.m3u8 URLs at validation time (default: True).
+    # When enabled, MJPEG streams, HTML embed pages, and all other URL types are
+    # marked dead (fail_reason="not_hls") without making an HTTP request.
+    # Only direct .m3u8 stream URLs are accepted; these play automatically on
+    # click with no user interaction (no play-button pages, no login walls).
+    hls_only:                        bool = True
+
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
 
     def ensure_dirs(self) -> None:

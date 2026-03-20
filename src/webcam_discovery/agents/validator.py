@@ -133,6 +133,25 @@ class ValidationAgent:
         if not allowed:
             return []
 
+        # ── Step 1b: HLS-only filter ──────────────────────────────────────────
+        # When hls_only=True (the default), discard any candidate whose URL is
+        # not a direct .m3u8 stream.  Such URLs require user interaction (e.g.
+        # clicking a play button on a web page) and are not automatically playable.
+        # This runs before the HTTP probe to avoid wasting requests.
+        if settings.hls_only:
+            hls_allowed = [c for c in allowed if ".m3u8" in c.url.lower()]
+            dropped_non_hls = len(allowed) - len(hls_allowed)
+            if dropped_non_hls:
+                logger.info(
+                    "ValidationAgent: hls_only=True — dropped {} non-HLS candidates "
+                    "(MJPEG / HTML embed pages require user interaction)",
+                    dropped_non_hls,
+                )
+            allowed = hls_allowed
+            if not allowed:
+                logger.warning("ValidationAgent: no HLS (.m3u8) candidates remain after hls_only filter")
+                return []
+
         # ── Step 2: HTTP probe all allowed URLs ───────────────────────────────
         feed_skill = FeedValidationSkill()
         type_skill = FeedTypeClassificationSkill()

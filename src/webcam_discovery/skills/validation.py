@@ -159,9 +159,16 @@ class FeedValidationSkill:
     """
     Validate a list of .m3u8 URLs for liveness.
 
-    Only HLS (.m3u8) stream URLs are accepted. All other URL types are rejected
-    immediately without making an HTTP request. Semaphore-limited concurrency
-    avoids overwhelming servers.
+    When ``settings.hls_only=True`` (the default), only direct HLS (.m3u8)
+    stream URLs are accepted.  MJPEG streams, HTML embed pages, and all other
+    URL types are rejected immediately (status="dead", fail_reason="not_hls")
+    without making an HTTP request.  Direct .m3u8 URLs play automatically on
+    click with no user interaction required.
+
+    When ``hls_only=False``, the prober also handles MJPEG streams and HTML
+    embed pages that may contain embedded stream URLs.
+
+    Semaphore-limited concurrency avoids overwhelming servers.
     """
 
     async def run(
@@ -232,10 +239,17 @@ class FeedValidationSkill:
         """
         Route each URL to the appropriate prober.
 
-        .m3u8  → _probe_hls    (HLS playlist validation)
-        .mjpg  → _probe_mjpeg  (MJPEG stream header check)
-        other  → _probe_generic (HTML embed page scan for embedded streams)
+        When ``settings.hls_only=True`` (the default):
+          .m3u8  → _probe_hls    (HLS playlist validation)
+          other  → dead, fail_reason="not_hls"
+
+        When ``settings.hls_only=False``:
+          .m3u8  → _probe_hls    (HLS playlist validation)
+          .mjpg  → _probe_mjpeg  (MJPEG stream header check)
+          other  → _probe_generic (HTML embed page scan for embedded streams)
         """
+        from webcam_discovery.config import settings
+
         if _has_auth_path(url):
             return ValidationResult(
                 url=url, legitimacy_score="low", status="dead",
@@ -243,6 +257,12 @@ class FeedValidationSkill:
             )
         if _HLS_URL_RE.search(url):
             return await self._probe_hls(client, url, referer=referer)
+        # Non-HLS URL: reject immediately when hls_only is enabled
+        if settings.hls_only:
+            return ValidationResult(
+                url=url, legitimacy_score="low", status="dead",
+                fail_reason="not_hls",
+            )
         if _MJPEG_URL_RE.search(url):
             return await self._probe_mjpeg(client, url)
         return await self._probe_generic(client, url)
