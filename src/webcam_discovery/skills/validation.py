@@ -250,6 +250,15 @@ class FeedValidationSkill:
         """
         from webcam_discovery.config import settings
 
+        # Reject URLs without a valid HTTP/HTTPS scheme — httpx raises a
+        # ValueError ("Request URL is missing an 'http://' or 'https://' protocol")
+        # for protocol-relative (//…) or bare paths, which would otherwise appear
+        # as cryptic failures in the fail_reason breakdown.
+        if not url.lower().startswith(("http://", "https://")):
+            return ValidationResult(
+                url=url, legitimacy_score="low", status="dead",
+                fail_reason="missing_protocol",
+            )
         if _has_auth_path(url):
             return ValidationResult(
                 url=url, legitimacy_score="low", status="dead",
@@ -257,7 +266,7 @@ class FeedValidationSkill:
             )
         if _HLS_URL_RE.search(url):
             return await self._probe_hls(client, url, referer=referer)
-        # Non-HLS URL: reject immediately when hls_only is enabled
+        # Non-HLS URL: reject immediately (HLS-only is the system default)
         if settings.hls_only:
             return ValidationResult(
                 url=url, legitimacy_score="low", status="dead",

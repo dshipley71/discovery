@@ -139,17 +139,21 @@ class ValidationAgent:
         # clicking a play button on a web page) and are not automatically playable.
         # This runs before the HTTP probe to avoid wasting requests.
         if settings.hls_only:
-            hls_allowed = [c for c in allowed if ".m3u8" in c.url.lower()]
+            hls_allowed = [
+                c for c in allowed
+                if ".m3u8" in c.url.lower()
+                and c.url.lower().startswith(("http://", "https://"))
+            ]
             dropped_non_hls = len(allowed) - len(hls_allowed)
             if dropped_non_hls:
                 logger.info(
-                    "ValidationAgent: hls_only=True — dropped {} non-HLS candidates "
-                    "(MJPEG / HTML embed pages require user interaction)",
+                    "ValidationAgent: hls_only=True — dropped {} non-HLS / invalid-protocol "
+                    "candidates (only direct .m3u8 streams accepted)",
                     dropped_non_hls,
                 )
             allowed = hls_allowed
             if not allowed:
-                logger.warning("ValidationAgent: no HLS (.m3u8) candidates remain after hls_only filter")
+                logger.warning("ValidationAgent: no valid HLS (.m3u8) candidates remain after hls_only filter")
                 return []
 
         # ── Step 2: HTTP probe all allowed URLs ───────────────────────────────
@@ -299,6 +303,27 @@ class ValidationAgent:
                 ffprobe_results = await ffprobe_skill.run(live_hls_urls)
                 ffprobe_by_url = {r.url: r for r in ffprobe_results}
 
+                # Per-URL ffprobe result logging so operators can see exactly
+                # what ffprobe found for every stream.
+                for fp in ffprobe_results:
+                    if not fp.ffprobe_available:
+                        logger.warning(
+                            "ValidationAgent ffprobe: NOT AVAILABLE — "
+                            "install ffmpeg to enable frame analysis (apt-get install -y ffmpeg)"
+                        )
+                        break
+                    logger.info(
+                        "ValidationAgent ffprobe: {} | stream_status={} | "
+                        "frames={} | brightness={} | entropy={} | diff_max={} | detail={}",
+                        fp.url,
+                        fp.stream_status or "skipped",
+                        fp.frames_decoded,
+                        f"{fp.mean_brightness:.1f}" if fp.mean_brightness is not None else "—",
+                        f"{fp.entropy_avg:.2f}"     if fp.entropy_avg is not None     else "—",
+                        f"{fp.interframe_diff_max:.2f}" if fp.interframe_diff_max is not None else "—",
+                        fp.detail,
+                    )
+
                 upgraded = downgraded_blank = downgraded_disabled = 0
                 for page_url, stream_url in list(_browser_stream_map.items()) + [
                     (u, u) for u in live_hls_urls if u not in _browser_stream_map.values()
@@ -325,43 +350,50 @@ class ValidationAgent:
 
                 logger.info(
                     "ValidationAgent: ffprobe checked {} live HLS URLs — "
-                    "blank/frozen={} disabled={}",
+                    "active_streaming={} blank/frozen={} disabled={}",
                     len(live_hls_urls),
+                    len(live_hls_urls) - downgraded_blank - downgraded_disabled,
                     downgraded_blank,
                     downgraded_disabled,
                 )
 
-        # ── Step 3: filter by legitimacy ──────────────────────────────────────
-        # status="unknown" with min_legitimacy="low" is kept: a 200 OK that
-        # lacked #EXTM3U magic may still be a valid stream (e.g. no-magic CDN
-        # delivery).  Operators can review these via notes="no_m3u8_magic".
-        min_legit = settings.min_legitimacy
+        # ── Step 3: status filter ─────────────────────────────────────────────
+        # When ffprobe validation is active (default), ffprobe is the definitive
+        # arbiter of stream quality — its stream_status already accounts for
+        # blank/frozen/disabled conditions, making the HTTP-probe legitimacy score
+        # redundant.  Accept every non-dead result so no HLS streams are silently
+        # dropped on the basis of an HTTP-level heuristic alone.
+        #
+        # Without ffprobe, fall back to the min_legitimacy gate: unknown results
+        # require min_legitimacy="low" and the score must meet the threshold.
         to_enrich: list[tuple[CameraCandidate, object]] = []
 
         for candidate in allowed:
             v = url_to_val.get(candidate.url)
-            if v is None:
+            if v is None or v.status == "dead":
                 continue
-            # Accept "live" always; accept "unknown" only when min_legitimacy="low"
-            if v.status == "dead":
-                continue
-            if v.status == "unknown" and min_legit != "low":
-                logger.debug(
-                    "ValidationAgent: drop {} — status=unknown requires min_legitimacy=low",
-                    candidate.url,
-                )
-                continue
-            if not _legit_ok(v.legitimacy_score, min_legit):
-                logger.debug(
-                    "ValidationAgent: drop {} — legit={} < min={}",
-                    candidate.url, v.legitimacy_score, min_legit,
-                )
-                continue
+
+            if not settings.use_ffprobe_validation:
+                # Legacy legitimacy gate (ffprobe disabled)
+                min_legit = settings.min_legitimacy
+                if v.status == "unknown" and min_legit != "low":
+                    logger.debug(
+                        "ValidationAgent: drop {} — status=unknown requires min_legitimacy=low",
+                        candidate.url,
+                    )
+                    continue
+                if not _legit_ok(v.legitimacy_score, min_legit):
+                    logger.debug(
+                        "ValidationAgent: drop {} — legit={} < min={}",
+                        candidate.url, v.legitimacy_score, min_legit,
+                    )
+                    continue
+
             to_enrich.append((candidate, v))
 
         logger.info(
-            "ValidationAgent: {} candidates pass min_legitimacy='{}' filter",
-            len(to_enrich), min_legit,
+            "ValidationAgent: {} candidates pass status filter (ffprobe_validation={})",
+            len(to_enrich), settings.use_ffprobe_validation,
         )
 
         # ── Step 4: geo-enrich (batch async with cache warming) ───────────────
