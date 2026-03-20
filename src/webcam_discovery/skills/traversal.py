@@ -207,7 +207,11 @@ class DirectoryTraversalSkill:
             timeout=httpx.Timeout(10.0),
             follow_redirects=True,
             max_redirects=3,
-            headers={"User-Agent": "WebcamDiscoveryBot/1.0 (+https://github.com/webcam-discovery)"},
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         ) as client:
             pages_fetched_ref = [0]
             new_candidates = await self._fetch_page(
