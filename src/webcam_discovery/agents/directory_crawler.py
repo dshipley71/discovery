@@ -61,21 +61,6 @@ class SourcesRegistry:
     _DOMAIN_RE          = re.compile(r'^[\w.-]+\.[a-zA-Z]{2,}$')
     _FEED_TYPE_HDR_RE   = re.compile(r'feed\s+type', re.IGNORECASE)
 
-    # Domains that must always be blocked regardless of SOURCES.md parse quality.
-    _ALWAYS_BLOCKED: frozenset[str] = frozenset({
-        "shodan.io",
-        "censys.io",
-        "insecam.org",
-        "insecam.com",
-        "opentopia.com",
-        "camhacker.com",
-        "zoomeye.org",
-        "fofa.info",
-        "binaryedge.io",
-        "greynoise.io",
-        "pictimo.com",
-    })
-
     def __init__(self, sources_path: Optional[Path] = None) -> None:
         """
         Initialise registry.
@@ -94,7 +79,7 @@ class SourcesRegistry:
 
         self._path = sources_path
         self._tier_sources: dict[int, list[str]] = {}
-        self._blocked_domains: set[str] = set(self._ALWAYS_BLOCKED)
+        self._blocked_domains: set[str] = set()
         self._feed_types: dict[str, str] = {}  # url → raw feed-types string from SOURCES.md
 
         if self._path and self._path.exists():
