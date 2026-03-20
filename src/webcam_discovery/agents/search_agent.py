@@ -20,7 +20,6 @@ from loguru import logger
 from webcam_discovery.config import settings
 from webcam_discovery.schemas import CameraCandidate
 from webcam_discovery.skills.search import QueryGenerationSkill, QueryGenerationInput
-from webcam_discovery.agents.directory_crawler import SourcesRegistry
 
 
 # ── City lists by tier ────────────────────────────────────────────────────────
@@ -68,25 +67,21 @@ def _domain_of(url: str) -> str:
     return urlparse(url).netloc.removeprefix("www.")
 
 
-def _is_blocked(url: str, extra: frozenset[str] = frozenset()) -> bool:
-    """Check if URL belongs to a blocked domain or a known non-HLS source domain."""
+def _is_blocked(url: str) -> bool:
+    """Check if URL belongs to a blocked domain."""
     domain = _domain_of(url)
-    all_blocked = BLOCKED_DOMAINS | extra
-    return domain in all_blocked or any(b in domain for b in all_blocked)
+    return domain in BLOCKED_DOMAINS or any(b in domain for b in BLOCKED_DOMAINS)
 
 
 async def _duckduckgo_search(
     client: httpx.AsyncClient,
     query: str,
-    extra_blocked: frozenset[str] = frozenset(),
 ) -> list[str]:
     """
     Execute a DuckDuckGo HTML search and return result URLs.
 
     Uses DuckDuckGo's HTML endpoint (no API key required).
 
-    Args:
-        extra_blocked: Additional domains to exclude from results (e.g. non-HLS sources).
     """
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
@@ -105,7 +100,7 @@ async def _duckduckgo_search(
             if match:
                 from urllib.parse import unquote
                 href = unquote(match.group(1))
-            if href.startswith("http") and not _is_blocked(href, extra_blocked):
+            if href.startswith("http") and not _is_blocked(href):
                 urls.append(href)
         return urls
     except Exception as exc:
@@ -125,9 +120,6 @@ class SearchAgent:
         """
         Generate and execute search queries for each Tier-N city.
 
-        Sources listed in SOURCES.md whose feed types do not include HLS are
-        excluded from results, in addition to the static BLOCKED_DOMAINS list.
-
         Args:
             tier: City tier to search (1 = Tier 1 cities only).
 
@@ -138,11 +130,6 @@ class SearchAgent:
         query_skill = QueryGenerationSkill()
         candidates: list[CameraCandidate] = []
 
-        # Exclude known non-HLS source domains from search results
-        non_hls = SourcesRegistry().non_hls_domains
-        if non_hls:
-            logger.info("SearchAgent: excluding {} non-HLS source domains", len(non_hls))
-
         semaphore = asyncio.Semaphore(self.CONCURRENCY)
 
         async with httpx.AsyncClient(
@@ -150,7 +137,7 @@ class SearchAgent:
             follow_redirects=True,
         ) as client:
             tasks = [
-                self._search_city(client, city, query_skill, semaphore, non_hls)
+                self._search_city(client, city, query_skill, semaphore)
                 for city in cities
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -191,10 +178,6 @@ class SearchAgent:
         """
         cities = _CITY_TIERS.get(tier, TIER1_CITIES)
         query_skill = QueryGenerationSkill()
-        non_hls = SourcesRegistry().non_hls_domains
-        if non_hls:
-            logger.info("SearchAgent.stream: excluding {} non-HLS source domains", len(non_hls))
-
         semaphore = asyncio.Semaphore(self.CONCURRENCY)
         seen_urls: set[str] = set()
 
@@ -205,7 +188,7 @@ class SearchAgent:
             for city in cities:
                 try:
                     city_candidates = await self._search_city(
-                        client, city, query_skill, semaphore, non_hls
+                        client, city, query_skill, semaphore
                     )
                 except Exception as exc:
                     logger.warning("SearchAgent.stream: error for city '{}': {}", city, exc)
@@ -227,7 +210,6 @@ class SearchAgent:
         city: str,
         query_skill: QueryGenerationSkill,
         semaphore: asyncio.Semaphore,
-        extra_blocked: frozenset[str] = frozenset(),
     ) -> list[CameraCandidate]:
         """Generate queries for one city and search DuckDuckGo."""
         output = query_skill.run(QueryGenerationInput(city=city, language_codes=["en"]))
@@ -237,11 +219,11 @@ class SearchAgent:
         city_candidates: list[CameraCandidate] = []
         for query in queries:
             async with semaphore:
-                urls = await _duckduckgo_search(client, query, extra_blocked)
+                urls = await _duckduckgo_search(client, query)
                 await asyncio.sleep(0.5)  # polite delay between requests
 
             for url in urls:
-                if _is_blocked(url, extra_blocked):
+                if _is_blocked(url):
                     continue
                 city_candidates.append(CameraCandidate(
                     url=url,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maintenance.py — Scheduled HEAD checks, status updates, and dead-link pruning.
+maintenance.py — Scheduled status checks and validation review reporting.
 Part of the Public Webcam Discovery System.
 """
 from __future__ import annotations
@@ -61,10 +61,11 @@ def _load_failure_counts(log_path: Path) -> dict[str, int]:
             entry = json.loads(line)
             cam_id = entry.get("id")
             if cam_id:
-                if entry.get("event") == "status_change" and entry.get("new_status") == "dead":
-                    failure_counts[cam_id] = failure_counts.get(cam_id, 0) + 1
-                elif entry.get("event") == "status_change" and entry.get("new_status") in ("live", "unknown"):
-                    failure_counts[cam_id] = 0
+                if entry.get("event") in {"status_change", "health_check"}:
+                    if entry.get("new_status") == "dead":
+                        failure_counts[cam_id] = int(entry.get("consecutive_failures") or 0)
+                    elif entry.get("new_status") in ("live", "unknown"):
+                        failure_counts[cam_id] = 0
         except json.JSONDecodeError:
             continue
 
@@ -73,10 +74,12 @@ def _load_failure_counts(log_path: Path) -> dict[str, int]:
 
 class MaintenanceAgent:
     """
-    Performs weekly HEAD checks on all cameras in camera.geojson.
+    Performs weekly status checks on all cameras in camera.geojson.
     Updates status and last_verified in place.
     Writes a timestamped audit trail to logs/maintenance_log.jsonl.
-    Prunes records dead for prune_after_n_failures consecutive checks.
+    It does NOT prune links automatically; dead records are retained and
+    written to a validation review report so they can be re-run through the
+    validation workflow before any manual removal.
     """
 
     async def run(
@@ -85,7 +88,7 @@ class MaintenanceAgent:
         log_path: Optional[Path] = None,
     ) -> None:
         """
-        Run HEAD checks and update camera.geojson in place.
+        Run status checks and update camera.geojson in place.
 
         Args:
             catalog:  Path to camera.geojson (default: project root).
@@ -122,10 +125,12 @@ class MaintenanceAgent:
         # Build result map
         result_map = {r.id: r for r in summary.results}
 
+        review_report_path = log_path.with_name("pending_validation_review.jsonl")
+
         # Update records in place and track changes
         updated_records: list[CameraRecord] = []
-        pruned_ids: list[str] = []
         log_entries: list[dict] = []
+        review_entries: list[dict] = []
 
         for record in records:
             check = result_map.get(record.id)
@@ -145,23 +150,40 @@ class MaintenanceAgent:
 
             consecutive_failures = failure_counts.get(record.id, 0)
 
-            # Prune after N consecutive dead results
+            log_entries.append({
+                "timestamp": now,
+                "event": "health_check",
+                "id": record.id,
+                "label": record.label,
+                "url": record.url,
+                "new_status": new_status,
+                "status_code": check.status_code,
+                "fail_reason": check.fail_reason,
+                "consecutive_failures": consecutive_failures,
+            })
+
+            # Dead records stay in the catalog until a human/operator runs them
+            # back through the validation workflow and explicitly decides to
+            # remove them.
             if consecutive_failures >= settings.prune_after_n_failures:
-                logger.info(
-                    "MaintenanceAgent: pruning '{}' — {} consecutive failures",
-                    record.id, consecutive_failures,
-                )
-                pruned_ids.append(record.id)
-                log_entries.append({
+                review_entry = {
                     "timestamp": now,
-                    "event": "pruned",
+                    "event": "pending_validation_review",
                     "id": record.id,
                     "label": record.label,
                     "url": record.url,
+                    "status": new_status,
                     "consecutive_failures": consecutive_failures,
-                })
-                continue
+                    "fail_reason": check.fail_reason,
+                }
+                review_entries.append(review_entry)
+                log_entries.append(review_entry)
 
+                logger.info(
+                    "MaintenanceAgent: '{}' reached {} consecutive failures — retained "
+                    "for validation review",
+                    record.id, consecutive_failures,
+                )
             # Update record
             updated_record = record.model_copy(update={
                 "status": new_status,
@@ -193,6 +215,16 @@ class MaintenanceAgent:
             for entry in log_entries:
                 f.write(json.dumps(entry, default=str) + "\n")
 
+        if review_entries:
+            with open(review_report_path, "a", encoding="utf-8") as f:
+                for entry in review_entries:
+                    f.write(json.dumps(entry, default=str) + "\n")
+            logger.info(
+                "MaintenanceAgent: wrote {} validation-review entries to '{}'",
+                len(review_entries),
+                review_report_path,
+            )
+
         # Write updated camera.geojson
         export_skill = GeoJSONExportSkill()
         export_skill.run(GeoJSONExportInput(
@@ -201,12 +233,13 @@ class MaintenanceAgent:
         ))
 
         logger.info(
-            "MaintenanceAgent: done — checked={} live={} dead={} unknown={} pruned={}",
+            "MaintenanceAgent: done — checked={} live={} dead={} unknown={} "
+            "pending_validation_review={}",
             summary.total_checked,
             summary.live_count,
             summary.dead_count,
             summary.unknown_count,
-            len(pruned_ids),
+            len(review_entries),
         )
 
 

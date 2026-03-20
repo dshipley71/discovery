@@ -21,6 +21,7 @@ Only HLS (.m3u8) streams are collected — all other URL types are ignored.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Optional
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
@@ -149,6 +150,39 @@ def _absolute(url: str, base: str) -> str:
     return urljoin(base, url)
 
 
+def _normalize_stream_url(raw: str, base_url: str) -> Optional[str]:
+    """
+    Normalise extracted stream URLs before validation.
+
+    Handles common malformed patterns seen in scraped player HTML:
+    - JSON-escaped URLs such as ``https:\\/\\/cdn.example/live.m3u8``
+    - protocol-relative URLs such as ``//cdn.example/live.m3u8``
+    - accidentally quoted strings and whitespace
+    """
+    if not raw:
+        return None
+
+    candidate = raw.strip().strip("'\"")
+    if not candidate:
+        return None
+
+    if "\\/" in candidate:
+        try:
+            candidate = json.loads(f'"{candidate}"')
+        except Exception:
+            candidate = candidate.replace("\\/", "/")
+
+    if candidate.startswith("//"):
+        parsed_base = urlparse(base_url)
+        scheme = parsed_base.scheme or "https"
+        candidate = f"{scheme}:{candidate}"
+
+    if not candidate.startswith(("http://", "https://")):
+        candidate = _absolute(candidate, base_url)
+
+    return candidate.strip()
+
+
 # ── DirectoryTraversalSkill ────────────────────────────────────────────────────
 
 class DirectoryTraversalSkill:
@@ -173,7 +207,11 @@ class DirectoryTraversalSkill:
             timeout=httpx.Timeout(10.0),
             follow_redirects=True,
             max_redirects=3,
-            headers={"User-Agent": "WebcamDiscoveryBot/1.0 (+https://github.com/webcam-discovery)"},
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         ) as client:
             pages_fetched_ref = [0]
             new_candidates = await self._fetch_page(
@@ -520,11 +558,11 @@ class FeedExtractionSkill:
         direct_streams: list[str] = []
 
         def _add_direct(raw: str) -> None:
-            if not raw:
+            normalized = _normalize_stream_url(raw, base_url)
+            if not normalized:
                 return
-            abs_url = _absolute(raw, base_url) if not raw.startswith("http") else raw
-            if _STREAM_EXTENSIONS.search(abs_url) and abs_url not in direct_streams:
-                direct_streams.append(abs_url)
+            if _STREAM_EXTENSIONS.search(normalized) and normalized not in direct_streams:
+                direct_streams.append(normalized)
 
         # 1. <source src> and <video src> — covers both nested <source> and
         #    top-level <video src="..."> which many players use directly.

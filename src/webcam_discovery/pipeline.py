@@ -17,6 +17,10 @@ a shared bounded queue.  ValidationAgent processes candidates in batches of
 ``VALIDATION_BATCH_SIZE`` as they arrive.  A single ``None`` sentinel (put after
 both producers finish) signals end-of-stream to the consumer.
 
+Only direct `.m3u8` candidates are forwarded into the validation queue.
+Other discovered camera-link formats are preserved in
+`candidates/discovery_non_hls.jsonl` for operator review.
+
 CatalogAgent runs only after all records are collected — deduplication requires
 the full record set.
 
@@ -28,6 +32,7 @@ import argparse
 import sys
 from pathlib import Path
 from loguru import logger
+import re
 
 from webcam_discovery.config import settings
 from webcam_discovery.schemas import CameraCandidate
@@ -42,6 +47,7 @@ _QUEUE_MAXSIZE = 500
 # better Nominatim pre-warm coverage); smaller batches reduce latency to first
 # validated result.
 _VALIDATION_BATCH_SIZE = 100
+_HLS_RE = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 
 
 def configure_logging() -> None:
@@ -80,23 +86,67 @@ async def _run_discovery_to_queue(
 
     dir_agent    = DirectoryAgent()
     search_agent = SearchAgent()
+    non_hls_log_path = settings.candidates_dir / "discovery_non_hls.jsonl"
+    non_hls_log_path.parent.mkdir(parents=True, exist_ok=True)
+    non_hls_candidates: list[CameraCandidate] = []
+    seen_non_hls: set[str] = set()
+
+    def _is_processable_hls(candidate: CameraCandidate) -> bool:
+        return (
+            candidate.url.lower().startswith(("http://", "https://"))
+            and bool(_HLS_RE.search(candidate.url))
+        )
+
+    def _log_non_hls(candidate: CameraCandidate) -> None:
+        if candidate.url in seen_non_hls:
+            return
+        seen_non_hls.add(candidate.url)
+        non_hls_candidates.append(candidate)
 
     async def produce_dir() -> None:
-        count = 0
+        hls_count = 0
+        non_hls_count = 0
         async for candidate in dir_agent.stream(tier=tier):
-            await queue.put(candidate)
-            count += 1
-        logger.info("_run_discovery_to_queue: DirectoryAgent done — {} candidates queued", count)
+            if _is_processable_hls(candidate):
+                await queue.put(candidate)
+                hls_count += 1
+            else:
+                _log_non_hls(candidate)
+                non_hls_count += 1
+        logger.info(
+            "_run_discovery_to_queue: DirectoryAgent done — {} HLS candidates queued, "
+            "{} non-HLS logged",
+            hls_count, non_hls_count,
+        )
 
     async def produce_search() -> None:
-        count = 0
+        hls_count = 0
+        non_hls_count = 0
         async for candidate in search_agent.stream(tier=tier):
-            await queue.put(candidate)
-            count += 1
-        logger.info("_run_discovery_to_queue: SearchAgent done — {} candidates queued", count)
+            if _is_processable_hls(candidate):
+                await queue.put(candidate)
+                hls_count += 1
+            else:
+                _log_non_hls(candidate)
+                non_hls_count += 1
+        logger.info(
+            "_run_discovery_to_queue: SearchAgent done — {} HLS candidates queued, "
+            "{} non-HLS logged",
+            hls_count, non_hls_count,
+        )
 
     # Run both discovery agents concurrently; neither depends on the other.
     await asyncio.gather(produce_dir(), produce_search())
+
+    non_hls_log_path.write_text(
+        "\n".join(c.model_dump_json() for c in non_hls_candidates),
+        encoding="utf-8",
+    )
+    logger.info(
+        "_run_discovery_to_queue: logged {} non-HLS candidates to {}",
+        len(non_hls_candidates),
+        non_hls_log_path,
+    )
 
     # Both producers are finished — send end-of-stream sentinel.
     await queue.put(None)
