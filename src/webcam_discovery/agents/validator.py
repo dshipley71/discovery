@@ -270,111 +270,126 @@ class ValidationAgent:
                         len(browser_output.offline_pages),
                     )
 
-        # ── Step 2c: ffprobe frame-level verification (optional) ─────────────
-        # After the HTTP probe and optional browser second-pass, run ffprobe on
-        # confirmed-live HLS streams to catch blank/frozen feeds (cameras that
-        # serve a valid playlist but are physically offline or covered).
+        # ── Step 2c: ffprobe frame-level verification (primary status) ──────────
+        # ffprobe is the authoritative stream-status check.  It runs on EVERY
+        # .m3u8 candidate — not just the ones the HTTP probe confirmed as live.
+        # A CDN that returns HTTP 404 for a playlist GET may still serve valid
+        # segments to ffprobe (CDN quirks, IP restrictions, header differences).
+        # ffprobe result overwrites the HTTP probe status unconditionally.
         #
-        # Outcomes:
-        #   active_streaming → status stays "live"
-        #   active_blank     → downgrade to "unknown" (stream exists but no content)
-        #   disabled         → downgrade to "dead"    (playlist is unreachable at frame level)
-        #   None             → ffprobe unavailable or non-HLS URL — no change
+        # Status mapping (FfprobeResult.stream_status → CameraRecord.status):
+        #   active_streaming → "live"    (frames decoded, real content + motion)
+        #   active_blank     → "unknown" (frames decoded, blank/frozen content)
+        #   disabled         → "dead"    (playlist reachable, no decodable segments)
+        #   does_not_exist   → "dead"    (DNS/404/connection failure at segment level)
+        #   None (unavailable) → keep HTTP probe status (ffprobe not installed)
         if settings.use_ffprobe_validation:
             from webcam_discovery.skills.ffprobe_validation import FfprobeValidationSkill
 
-            live_hls_urls = [
+            # All candidates here are already .m3u8 (enforced by hls_only filter).
+            # Run ffprobe on every URL — HTTP status is irrelevant at this stage.
+            all_hls_urls = [
                 c.url for c in allowed
-                if ".m3u8" in c.url.lower()
-                and url_to_val.get(c.url) is not None
-                and url_to_val[c.url].status == "live"
+                if url_to_val.get(c.url) is not None
             ]
             # Also check stream URLs discovered by the browser second-pass
-            live_hls_urls += [
+            all_hls_urls += [
                 stream_url for stream_url in _browser_stream_map.values()
                 if ".m3u8" in stream_url.lower()
             ]
-            live_hls_urls = list(dict.fromkeys(live_hls_urls))  # dedupe, preserve order
+            all_hls_urls = list(dict.fromkeys(all_hls_urls))  # dedupe, preserve order
 
-            if live_hls_urls:
-                ffprobe_skill = FfprobeValidationSkill(
-                    concurrency=settings.ffprobe_concurrency
-                )
-                ffprobe_results = await ffprobe_skill.run(live_hls_urls)
-                ffprobe_by_url = {r.url: r for r in ffprobe_results}
+            logger.info(
+                "ValidationAgent: running ffprobe on {} HLS URLs "
+                "(concurrency={}) …",
+                len(all_hls_urls),
+                settings.ffprobe_concurrency,
+            )
 
-                # Per-URL ffprobe result logging so operators can see exactly
-                # what ffprobe found for every stream.
-                for fp in ffprobe_results:
-                    if not fp.ffprobe_available:
-                        logger.warning(
-                            "ValidationAgent ffprobe: NOT AVAILABLE — "
-                            "install ffmpeg to enable frame analysis (apt-get install -y ffmpeg)"
-                        )
-                        break
-                    logger.info(
-                        "ValidationAgent ffprobe: {} | stream_status={} | "
-                        "frames={} | brightness={} | entropy={} | diff_max={} | detail={}",
-                        fp.url,
-                        fp.stream_status or "skipped",
-                        fp.frames_decoded,
-                        f"{fp.mean_brightness:.1f}" if fp.mean_brightness is not None else "—",
-                        f"{fp.entropy_avg:.2f}"     if fp.entropy_avg is not None     else "—",
-                        f"{fp.interframe_diff_max:.2f}" if fp.interframe_diff_max is not None else "—",
-                        fp.detail,
+            ffprobe_skill = FfprobeValidationSkill(
+                concurrency=settings.ffprobe_concurrency
+            )
+            ffprobe_results = await ffprobe_skill.run(all_hls_urls)
+            ffprobe_by_url = {r.url: r for r in ffprobe_results}
+
+            # Per-URL result log — visible in the terminal for every stream.
+            for fp in ffprobe_results:
+                if not fp.ffprobe_available:
+                    logger.warning(
+                        "ValidationAgent ffprobe: NOT AVAILABLE — "
+                        "install ffmpeg to enable frame analysis (apt-get install -y ffmpeg)"
                     )
-
-                upgraded = downgraded_blank = downgraded_disabled = 0
-                for page_url, stream_url in list(_browser_stream_map.items()) + [
-                    (u, u) for u in live_hls_urls if u not in _browser_stream_map.values()
-                ]:
-                    fp = ffprobe_by_url.get(stream_url)
-                    if fp is None or fp.stream_status is None:
-                        continue
-                    # Key in url_to_val is the original candidate URL (page_url
-                    # for browser-upgraded entries, direct stream URL otherwise).
-                    val_key = page_url if page_url in url_to_val else stream_url
-                    existing = url_to_val.get(val_key)
-                    if existing is None:
-                        continue
-                    if fp.stream_status == "active_blank":
-                        url_to_val[val_key] = existing.model_copy(
-                            update={"status": "unknown", "fail_reason": "ffprobe_blank_or_frozen"}
-                        )
-                        downgraded_blank += 1
-                    elif fp.stream_status == "disabled":
-                        url_to_val[val_key] = existing.model_copy(
-                            update={"status": "dead", "fail_reason": "ffprobe_disabled"}
-                        )
-                        downgraded_disabled += 1
-
+                    break
                 logger.info(
-                    "ValidationAgent: ffprobe checked {} live HLS URLs — "
-                    "active_streaming={} blank/frozen={} disabled={}",
-                    len(live_hls_urls),
-                    len(live_hls_urls) - downgraded_blank - downgraded_disabled,
-                    downgraded_blank,
-                    downgraded_disabled,
+                    "ValidationAgent ffprobe: {} | stream_status={} | "
+                    "frames={} | brightness={} | entropy={} | diff_max={} | detail={}",
+                    fp.url,
+                    fp.stream_status or "skipped",
+                    fp.frames_decoded,
+                    f"{fp.mean_brightness:.1f}" if fp.mean_brightness is not None else "—",
+                    f"{fp.entropy_avg:.2f}"     if fp.entropy_avg is not None     else "—",
+                    f"{fp.interframe_diff_max:.2f}" if fp.interframe_diff_max is not None else "—",
+                    fp.detail,
                 )
 
-        # ── Step 3: status filter ─────────────────────────────────────────────
-        # When ffprobe validation is active (default), ffprobe is the definitive
-        # arbiter of stream quality — its stream_status already accounts for
-        # blank/frozen/disabled conditions, making the HTTP-probe legitimacy score
-        # redundant.  Accept every non-dead result so no HLS streams are silently
-        # dropped on the basis of an HTTP-level heuristic alone.
+            # Apply ffprobe status to url_to_val — this overrides the HTTP status.
+            n_live = n_unknown = n_dead = n_skipped = 0
+            for page_url, stream_url in list(_browser_stream_map.items()) + [
+                (u, u) for u in all_hls_urls if u not in _browser_stream_map.values()
+            ]:
+                fp = ffprobe_by_url.get(stream_url)
+                if fp is None:
+                    continue
+                val_key = page_url if page_url in url_to_val else stream_url
+                existing = url_to_val.get(val_key)
+                if existing is None:
+                    continue
+
+                if fp.stream_status is None:
+                    # ffprobe unavailable or non-HLS — preserve HTTP probe status
+                    n_skipped += 1
+                    continue
+
+                # ffprobe result is authoritative: set the definitive status.
+                camera_status = fp.camera_status or "unknown"
+                fail_reason   = fp.detail if camera_status != "live" else None
+                url_to_val[val_key] = existing.model_copy(
+                    update={"status": camera_status, "fail_reason": fail_reason}
+                )
+                if camera_status == "live":
+                    n_live += 1
+                elif camera_status == "unknown":
+                    n_unknown += 1
+                else:
+                    n_dead += 1
+
+            logger.info(
+                "ValidationAgent: ffprobe results — "
+                "live={} unknown={} dead={} skipped(ffprobe-unavailable)={}",
+                n_live, n_unknown, n_dead, n_skipped,
+            )
+
+        # ── Step 3: build record list ─────────────────────────────────────────
+        # "Do not remove any HLS streams, but flag as active, unknown, or dead."
         #
-        # Without ffprobe, fall back to the min_legitimacy gate: unknown results
-        # require min_legitimacy="low" and the score must meet the threshold.
+        # When ffprobe validation is active (default), ALL .m3u8 candidates are
+        # kept and geo-enriched regardless of their status.  Dead streams are
+        # preserved in the catalog so their health can be tracked over time
+        # and re-checked during maintenance runs.
+        #
+        # Without ffprobe (legacy mode), the traditional legitimacy gate is
+        # applied so that obviously bad HTTP results don't inflate the catalog.
         to_enrich: list[tuple[CameraCandidate, object]] = []
 
         for candidate in allowed:
             v = url_to_val.get(candidate.url)
-            if v is None or v.status == "dead":
+            if v is None:
                 continue
 
             if not settings.use_ffprobe_validation:
-                # Legacy legitimacy gate (ffprobe disabled)
+                # Legacy path: drop dead and low-legitimacy results
+                if v.status == "dead":
+                    continue
                 min_legit = settings.min_legitimacy
                 if v.status == "unknown" and min_legit != "low":
                     logger.debug(
@@ -391,9 +406,13 @@ class ValidationAgent:
 
             to_enrich.append((candidate, v))
 
+        n_live    = sum(1 for _, v in to_enrich if v.status == "live")
+        n_unknown = sum(1 for _, v in to_enrich if v.status == "unknown")
+        n_dead    = sum(1 for _, v in to_enrich if v.status == "dead")
         logger.info(
-            "ValidationAgent: {} candidates pass status filter (ffprobe_validation={})",
-            len(to_enrich), settings.use_ffprobe_validation,
+            "ValidationAgent: {} HLS streams to catalog — live={} unknown={} dead={} "
+            "(ffprobe_validation={})",
+            len(to_enrich), n_live, n_unknown, n_dead, settings.use_ffprobe_validation,
         )
 
         # ── Step 4: geo-enrich (batch async with cache warming) ───────────────
