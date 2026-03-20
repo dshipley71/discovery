@@ -67,7 +67,7 @@ python -m http.server 8000
 2. SearchAgent      (search_agent.py)      → additional CameraCandidate objects
 3. ValidationAgent  (validator.py)         → validated CameraRecord list
 4. CatalogAgent     (catalog.py)           → camera.geojson + cameras.md
-5. MaintenanceAgent (maintenance.py)       → scheduled HEAD checks + pruning
+5. MaintenanceAgent (maintenance.py)       → scheduled status checks + validation-review reporting
 
 ## Code generation rules (from CLAUDE.md — always follow these)
 - Always generate complete, runnable scripts — no pseudocode, no placeholder functions

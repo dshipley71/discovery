@@ -20,7 +20,7 @@ All of the following agent functions are implemented as generated Python code:
 | `SearchAgent` | `search_agent.py` — multi-language query generation and result parsing |
 | `ValidationAgent` | `validator.py` — HTTP validation, feed classification, legitimacy scoring |
 | `CatalogAgent` | `catalog.py` — deduplication, geo-enrichment, JSON/Markdown export |
-| `MaintenanceAgent` | `maintenance.py` — scheduled HEAD checks, status updates, dead-link pruning |
+| `MaintenanceAgent` | `maintenance.py` — scheduled status checks, status updates, and validation-review reporting |
 | `MapAgent` | `map.html` — self-contained Leaflet.js map; loads `camera.geojson` by default or any custom `.geojson` via in-map file picker |
 
 **Required Python libraries:**
@@ -221,17 +221,17 @@ inurl:webcam OR inurl:livecam [city] filetype:html
 
 **Responsibilities:**
 - Run HEAD checks on all catalog entries on a **weekly cadence**
-- Mark feeds dead after 2 consecutive failed checks; remove after 4
+- Mark feeds dead after 2 consecutive failed checks; after 4 consecutive failures, queue them for validation review before any manual removal
 - Re-run `DirectoryAgent` on priority sources monthly to catch new additions
 - Flag feeds that have changed URL structure for human review
 - Log all status changes with timestamps
 
 **Generated Code:** `maintenance.py`
-- Uses `httpx` async for batched weekly HEAD checks with configurable concurrency
+- Uses `httpx` async for batched weekly status checks with configurable concurrency
 - Uses `schedule` library for cron-style execution (weekly full check, monthly re-crawl)
 - Updates `status` and `last_verified` fields in `camera.geojson` in-place, preserving all other feature properties
 - Writes a timestamped `maintenance_log.jsonl` audit trail of all status changes
-- Prunes records dead for 4+ consecutive checks and emits a removal report
+- Writes `pending_validation_review.jsonl` entries for records that have failed repeatedly so removal only happens after explicit validation review
 
 ---
 
