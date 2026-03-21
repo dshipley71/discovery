@@ -125,14 +125,13 @@ _DATA_CAM_RE = re.compile(r"""data-cam-url\s*=\s*['"]([^'"]+)['"]""", re.IGNOREC
 _DATA_STREAM_RE = re.compile(r"""data-stream\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _DATA_SRC_RE = re.compile(r"""data-src\s*=\s*['"]([^'"]+\.m3u8[^'"]*)['"]""", re.IGNORECASE)
 
-# HLS and MJPEG are both accepted as live streams.
-_STREAM_EXTENSIONS = re.compile(r"\.(m3u8|mjpe?g)(\?|$)", re.IGNORECASE)
+# Only HLS (.m3u8) streams are accepted.
+_STREAM_EXTENSIONS = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 
 _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next|p=\d+)[^'"]*)['"]""", re.IGNORECASE)
 
 # Broad catch-all: any quoted stream URL regardless of variable name or context.
 _BROAD_HLS_RE   = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
-_BROAD_MJPEG_RE = re.compile(r"""['"]([^'"]{4,500}\.mjpe?g[^'"]{0,100})['"]""", re.IGNORECASE)
 
 # Per-source traversal limits — prevent runaway crawls on large directories.
 MAX_PAGES_PER_SOURCE   = 100   # total HTTP GETs per source URL
@@ -580,26 +579,20 @@ class FeedExtractionSkill:
             for m in pattern.finditer(html):
                 _add_direct(m.group(1))
 
-        # 4. <img src="...mjpeg..."> — MJPEG streams embedded as image tags
-        for img in soup.find_all("img"):
-            _add_direct(img.get("src", ""))
-
-        # 5. Broad catch-all: any quoted .m3u8 or .mjpeg URL anywhere in HTML.
+        # 4. Broad catch-all: any quoted .m3u8 URL anywhere in HTML.
         #    Runs over the full raw HTML so it catches stream URLs in JSON blobs,
         #    window.__data__ assignments, and any non-standard variable names.
         for m in _BROAD_HLS_RE.finditer(html):
             _add_direct(m.group(1))
-        for m in _BROAD_MJPEG_RE.finditer(html):
-            _add_direct(m.group(1))
 
-        # 6. <a href> with stream extension (listing pages linking directly to streams)
+        # 5. <a href> with stream extension (listing pages linking directly to streams)
         for link in soup.find_all("a", href=True):
             _add_direct(str(link["href"]))
 
         best_direct = direct_streams[0] if direct_streams else None
         feed_hint = None
         if best_direct:
-            feed_hint = "MJPEG" if _STREAM_EXTENSIONS.search(best_direct) and "mjpe" in best_direct.lower() else "HLS"
+            feed_hint = "HLS"
 
         if best_direct:
             return FeedExtractionOutput(

@@ -5,15 +5,12 @@ Part of the Public Webcam Discovery System.
 
 Why this exists
 ---------------
-Static HTML probing (FeedValidationSkill._probe_generic) reads up to 32 KB of
-raw HTML.  The majority of modern webcam sites do NOT embed the stream URL in
-the HTML at all — they load it dynamically via JavaScript fetch() / XHR calls
-triggered by page render or a user clicking the play button.
+Some webcam sites load their .m3u8 URL dynamically via JavaScript fetch() / XHR calls rather than exposing it in static HTML.
 
 This skill opens each candidate page in headless Chromium, intercepts every
 network response, clicks common play-button selectors, waits a few seconds for
-the stream to start, and returns the first HLS (.m3u8) or MJPEG URL that appears
-in the browser's network traffic.
+the stream to start, and returns the first HLS (.m3u8) URL that appears in the
+browser's network traffic.
 
 It is designed as an optional second pass:  run it only on pages that the static
 prober classified as dead / unknown.  Enable it by setting:
@@ -43,17 +40,12 @@ _BROWSER_UA = (
 )
 
 _HLS_RE   = re.compile(r"\.m3u8(\?|$|/)", re.IGNORECASE)
-_MJPEG_RE = re.compile(r"\.mjpe?g(\?|$)", re.IGNORECASE)
-_DASH_RE  = re.compile(r"\.mpd(\?|$)", re.IGNORECASE)
 
 # Content-type substrings that signal a live video stream in a network response.
 _STREAM_CONTENT_TYPES = (
     "application/x-mpegurl",
     "application/vnd.apple.mpegurl",
     "video/mp2t",
-    "multipart/x-mixed-replace",
-    "video/x-motion-jpeg",
-    "application/dash+xml",
 )
 
 # Text markers indicating camera is offline — detected in rendered page content.
@@ -109,13 +101,13 @@ class BrowserValidationOutput(BaseModel):
 
 class BrowserValidationSkill:
     """
-    Discover stream URLs from webcam embed pages using a headless browser.
+    Discover HLS stream URLs from webcam embed pages using a headless browser.
 
     Many modern webcam sites load their .m3u8 stream URL dynamically via
     JavaScript after page render.  This skill opens each page in headless
     Chromium, intercepts all network responses, clicks common play-button
-    selectors, and returns the first HLS or MJPEG URL it observes in the
-    browser's network traffic.
+    selectors, and returns the first HLS URL it observes in the browser's
+    network traffic.
 
     Concurrency is bounded by ``settings.browser_validation_concurrency``
     (default 3) because each browser session is memory-heavy (~100 MB RAM).
@@ -127,7 +119,7 @@ class BrowserValidationSkill:
         Probe each URL in a headless browser and return a mapping of
         page URL → direct stream URL for every page where a stream was found.
 
-        Direct .m3u8 / .mjpeg URLs are silently skipped — they are already
+        Direct .m3u8 URLs are silently skipped — they are already
         handled by FeedValidationSkill and need no browser.
 
         Args:
@@ -149,7 +141,7 @@ class BrowserValidationSkill:
         from webcam_discovery.config import settings
 
         # Only probe HTML pages — direct stream URLs are handled by FeedValidationSkill
-        html_urls = [u for u in urls if not _HLS_RE.search(u) and not _MJPEG_RE.search(u)]
+        html_urls = [u for u in urls if not _HLS_RE.search(u)]
         if not html_urls:
             return BrowserValidationOutput()
 
@@ -222,7 +214,7 @@ class BrowserValidationSkill:
            calls that fire after initial DOM load) — falls back to ``domcontentloaded``
            on timeout so we still process pages that never fully settle.
         2. Intercept all network responses; collect URLs that look like streams
-           (HLS .m3u8, MJPEG .mjpeg, MPEG-DASH .mpd, or matching content-types).
+           (HLS .m3u8 or matching HLS content-types).
         3. Extract ``currentSrc`` / ``src`` from ``<video>`` and ``<source>`` DOM
            elements — many players set these attributes without a network request.
         4. Try clicking common play-button selectors to trigger stream initialisation.
@@ -255,8 +247,6 @@ class BrowserValidationSkill:
                     ct = response.headers.get("content-type", "").lower()
                     if (
                         _HLS_RE.search(resp_url)
-                        or _MJPEG_RE.search(resp_url)
-                        or _DASH_RE.search(resp_url)
                         or any(k in ct for k in _STREAM_CONTENT_TYPES)
                     ):
                         found.append(resp_url)
@@ -312,8 +302,6 @@ class BrowserValidationSkill:
                     for dom_url in dom_urls:
                         if (
                             _HLS_RE.search(dom_url)
-                            or _MJPEG_RE.search(dom_url)
-                            or _DASH_RE.search(dom_url)
                         ) and dom_url not in found:
                             found.append(dom_url)
                             logger.debug(
@@ -362,13 +350,9 @@ class BrowserValidationSkill:
             finally:
                 await context.close()
 
-            # Prefer HLS (.m3u8) > DASH (.mpd) > MJPEG > anything else.
-            hls_urls  = [u for u in found if _HLS_RE.search(u)]
-            dash_urls = [u for u in found if _DASH_RE.search(u)]
+            hls_urls = [u for u in found if _HLS_RE.search(u)]
             if hls_urls:
                 return hls_urls[0], False
-            if dash_urls:
-                return dash_urls[0], False
             if found:
                 return found[0], False
             return None, is_offline

@@ -1,6 +1,6 @@
 # Public Webcam Discovery System
 
-Discovers, validates, and maps publicly accessible webcams worldwide — no credentials, no logins, no private feeds.
+Discovers, validates, and maps publicly accessible HLS (.m3u8) webcams worldwide — no credentials, no logins, no private feeds.
 
 ## Quick Start
 
@@ -42,3 +42,5 @@ See `docs/DIRECTORY_STRUCTURE.md` for the full layout and rationale.
 - HLS discovery targets the standard `.m3u8` playlist extension. Inputs or docs that mention `.h3u8` should be treated as a typo, not a supported stream type.
 - `ValidationAgent` uses HTTP probing plus `ffprobe`/`ffmpeg` frame analysis to classify streams as `live`, `unknown`, or `dead`.
 - `MaintenanceAgent` keeps repeatedly failing links in the catalog and writes them to a validation-review queue instead of auto-pruning them.
+
+- The pipeline is HLS-only: discovery, validation, maintenance, and map playback all require direct `.m3u8` URLs.

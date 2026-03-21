@@ -71,7 +71,7 @@ class MapRenderingSkill:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Public Webcam Map</title>
+<title>Public HLS Webcam Map</title>
 
 <!-- Leaflet.js 1.9.x -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -156,7 +156,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 #modal-title {{ font-size: 18px; font-weight: bold; color: #89b4fa; margin-bottom: 4px; }}
 #modal-location {{ font-size: 13px; color: #aaa; margin-bottom: 12px; }}
 #modal-player {{ margin-bottom: 16px; }}
-#modal-player video, #modal-player img, #modal-player iframe {{
+#modal-player video {{
   width: 100%; max-height: 480px; border-radius: 4px; border: none; background: #000;
 }}
 #modal-meta {{ font-size: 12px; color: #aaa; line-height: 1.8; }}
@@ -183,7 +183,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 <body>
 
 <div id="stats-bar">
-  <strong>🌍 Public Webcam Map</strong>
+  <strong>🌍 Public HLS Webcam Map</strong>
   <span>Total: <span class="stat-total" id="stat-total">0</span></span>
   <span>Live: <span class="stat-live" id="stat-live">0</span></span>
   <span>Unknown: <span class="stat-unknown" id="stat-unknown">0</span></span>
@@ -204,7 +204,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 <div id="map-container">
   <div id="map">
     <div id="empty-overlay">
-      <p>No camera data loaded.</p>
+      <p>No HLS camera data loaded.</p>
       <p style="font-size:13px;color:#666">Click 📂 Load GeoJSON above or place camera.geojson alongside map.html</p>
     </div>
   </div>
@@ -370,36 +370,24 @@ function openModal(p) {{
   if (p.status === 'dead') {{
     playerDiv.innerHTML = '<p style="color:#f38ba8;padding:20px">⚠ Camera offline — stream unavailable.</p>';
   }} else if (p.url) {{
-    const feedType = (p.feed_type || '').toUpperCase();
-    if (feedType === 'MJPEG') {{
-      // MJPEG is multipart/x-mixed-replace — browsers display it natively as <img>
-      const img = document.createElement('img');
-      img.src = p.url;
-      img.style.cssText = 'width:100%;max-height:480px;object-fit:contain;background:#000';
-      img.alt = 'MJPEG camera stream';
-      playerDiv.appendChild(img);
-    }} else {{
-      // HLS or unknown — use <video> with HLS.js
-      const video = document.createElement('video');
-      video.controls = true; video.autoplay = true; video.muted = true;
-      video.style.cssText = 'width:100%;max-height:480px;background:#000';
-      if (Hls.isSupported()) {{
-        const hls = new Hls();
-        _activeHls = hls;
-        hls.loadSource(p.url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {{
-          video.play().catch(e => console.warn('Autoplay blocked:', e));
-        }});
-      }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-        // Safari native HLS
-        video.src = p.url;
-        video.addEventListener('loadedmetadata', () => {{
-          video.play().catch(e => console.warn('Autoplay blocked:', e));
-        }});
-      }}
-      playerDiv.appendChild(video);
+        const video = document.createElement('video');
+    video.controls = true; video.autoplay = true; video.muted = true;
+    video.style.cssText = 'width:100%;max-height:480px;background:#000';
+    if (Hls.isSupported()) {{
+      const hls = new Hls();
+      _activeHls = hls;
+      hls.loadSource(p.url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {{
+        video.play().catch(e => console.warn('Autoplay blocked:', e));
+      }});
+    }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+      video.src = p.url;
+      video.addEventListener('loadedmetadata', () => {{
+        video.play().catch(e => console.warn('Autoplay blocked:', e));
+      }});
     }}
+    playerDiv.appendChild(video);
   }} else {{
     playerDiv.innerHTML = '<p style="color:#888;padding:20px">No stream URL available.</p>';
   }}

@@ -18,7 +18,7 @@ All of the following agent functions are implemented as generated Python code:
 |-------|------------------------|
 | `DirectoryAgent` | `directory_crawler.py` — directory traversal, pagination, metadata extraction |
 | `SearchAgent` | `search_agent.py` — multi-language query generation and result parsing |
-| `ValidationAgent` | `validator.py` — HTTP validation, feed classification, legitimacy scoring |
+| `ValidationAgent` | `validator.py` — HTTP validation, HLS playlist classification, legitimacy scoring |
 | `CatalogAgent` | `catalog.py` — deduplication, geo-enrichment, JSON/Markdown export |
 | `MaintenanceAgent` | `maintenance.py` — scheduled status checks, status updates, and validation-review reporting |
 | `MapAgent` | `map.html` — self-contained Leaflet.js map; loads `camera.geojson` by default or any custom `.geojson` via in-map file picker |
@@ -45,7 +45,7 @@ pydantic          # Schema validation for camera records
 
 `MapAgent` always generates a single self-contained `map.html` file (Leaflet.js). No build step, no server, and no additional dependencies are required — open in any browser.
 
-The generated map supports loading geospatial camera data from a `.geojson` file in one of two ways:
+The generated map supports loading geospatial HLS camera data from a `.geojson` file in one of two ways:
 
 | Mode | Behaviour |
 |------|-----------|
@@ -100,7 +100,7 @@ See `MAPS.md` for full map specification and geojson file format requirements.
 "live webcam" [city] site:[known_directory]
 "public webcam" [city] -login -register -subscribe
 inurl:webcam OR inurl:livecam [city] filetype:html
-"mjpeg" OR "hls stream" [city] public
+"m3u8" OR "hls stream" [city] public
 [city] "traffic camera" live public feed
 [city] municipality OR "city council" webcam public
 [city] 観光 ライブカメラ (Japanese tourism live camera)
@@ -125,8 +125,8 @@ inurl:webcam OR inurl:livecam [city] filetype:html
 
 **Responsibilities:**
 - Perform HTTP HEAD (fallback: GET) on each candidate URL
-- **Verify that `stream_url` resolves to a live media stream, not an HTML page** — check `Content-Type` header: valid values are `image/jpeg`, `multipart/x-mixed-replace`, `application/vnd.apple.mpegurl`, `video/mp4`, or equivalent media types; a `text/html` response on a `stream_url` is a validation failure
-- Classify feed type: `MJPEG`, `HLS (.m3u8)`, `iframe embed`, `JS player`, `static image refresh`, `youtube_live`
+- **Verify that the candidate URL resolves to a live HLS playlist, not an HTML page** — the URL must be a direct `.m3u8` endpoint and return an HLS playlist payload (`#EXTM3U`) with an HLS content type or equivalent byte signature; a `text/html` response is a validation failure
+- Classify playlist type: `HLS_master` or `HLS_stream`
 - Apply the **Public Legitimacy Score** (see below)
 - Flag feeds that redirect to login pages, require cookies/JS, or return non-200 status
 - Check `robots.txt` of host domain — skip if webcam scraping is explicitly prohibited
@@ -143,7 +143,7 @@ inurl:webcam OR inurl:livecam [city] filetype:html
 **Generated Code:** `validator.py`
 - Uses `httpx` with configurable timeout and `asyncio.gather` for parallel HEAD/GET checks across all candidates
 - Implements `RobotsPolicySkill` via `urllib.robotparser` before any domain is fetched
-- Implements `FeedTypeClassificationSkill` by inspecting content-type headers and response body signatures
+- Implements `FeedTypeClassificationSkill` by inspecting HLS content-type headers and playlist body signatures
 - Assigns a `legitimacy_score` enum (`high` / `medium` / `low`) to each record using rule-based logic
 - Rejects records scoring `low`; flags `medium` records with a `requires_review` note
 - Emits validated `CameraRecord` Pydantic objects
@@ -192,13 +192,13 @@ inurl:webcam OR inurl:livecam [city] filetype:html
 - Apply marker clustering for dense city areas; auto-uncluster on zoom
 - Populate click popup with full camera schema fields
 - Wire the "Watch" button in each popup to open the camera's `url` in a new tab
-- Read `camera.geojson` produced by `CatalogAgent` — no conversion step required; the file is already in the correct GeoJSON format
+- Read `camera.geojson` produced by `CatalogAgent` — no conversion step required; every record represents a direct `.m3u8` stream
 
 **Map Behavior Requirements:**
 - Hover over marker → display full camera info card (all schema fields)
-- Click marker → open feed player modal; attempt `direct_stream_url` first, fall back to `url`
+- Click marker → open the HLS player modal using the record `url`
 - Cluster badge shows camera count; clicking cluster zooms to reveal individual markers
-- Map filter panel: filter by `feed_type`, `legitimacy_score`, `status`, `continent`
+- Map filter panel: filter by `feed_type`, `legitimacy_score`, `status`, `continent` (feed types will be HLS only)
 - Search bar: fly-to by city or camera label
 - Layer overlays: heatmap density; Tier 1 city circles (blue); Tier 2 city circles (amber); Tier 3 destination circles (green); Blocked sources markers (red ✕) — all independent toggles
 - Status color coding on markers: ✅ green = live, ⚠️ amber = unknown, ❌ red = dead
@@ -249,19 +249,14 @@ Each camera record must conform to the following structure:
   "continent": "North America",
   "latitude": 40.7580,
   "longitude": -73.9855,
-  "url": "https://example.com/embed/times-square",
-  "stream_url": "https://www.youtube-nocookie.com/embed/VIDEO_ID?autoplay=1&mute=1",
-  "direct_stream_url": "https://example.com/stream/ts-north.m3u8",
-  "video_id": "VIDEO_ID",
-  "feed_type": "HLS",
+  "url": "https://example.com/stream/ts-north.m3u8",
+  "feed_type": "HLS_stream",
   "source_directory": "earthcam.com",
   "source_refs": [
     "https://earthcam.com/usa/newyork/timessquare/",
     "https://webcamtaxi.com/en/usa/new-york/times-square.html"
   ],
   "legitimacy_score": "high",
-  "requires_js": false,
-  "geo_restricted": false,
   "last_verified": "2025-03-10",
   "status": "live",
   "notes": ""
@@ -308,6 +303,6 @@ Any publicly accessible feed found via search that passes validation, regardless
 - **Never** cap the number of cameras cataloged per city or location
 - **Always** record the source directory for every entry
 - **Always** prefer a direct stream URL over an embed page URL when both are available
-- **Always** verify that `stream_url` resolves to a live media stream (MJPEG, HLS, JPEG refresh, or active YouTube embed) — an HTML page URL is not a valid `stream_url`; `url` may point to a source page, but `stream_url` must point to the playable feed itself
+- **Always** verify that `url` resolves directly to a live HLS `.m3u8` playlist — HTML pages, embeds, JPEG refresh URLs, and any non-HLS protocol are invalid
 - **Always** include `latitude` and `longitude` on every record — run `GeoEnrichmentSkill` if missing; a record without coordinates cannot appear on the map
 - **Always** invoke `MapAgent` after any catalog update to regenerate `map.html`
