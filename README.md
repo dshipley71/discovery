@@ -40,7 +40,7 @@ See `docs/DIRECTORY_STRUCTURE.md` for the full layout and rationale.
 ## Validation and maintenance notes
 
 - HLS discovery targets the standard `.m3u8` playlist extension. Inputs or docs that mention `.h3u8` should be treated as a typo, not a supported stream type.
-- `ValidationAgent` uses HTTP probing plus `ffprobe`/`ffmpeg` frame analysis to classify streams as `live`, `unknown`, or `dead`.
-- `MaintenanceAgent` keeps repeatedly failing links in the catalog and writes them to a validation-review queue instead of auto-pruning them.
+- `ValidationAgent` uses HTTP probing plus `ffprobe`/`ffmpeg` frame analysis to classify streams as `live`, `unknown`, or `dead`, writes structured probe logs to `logs/validation_results.jsonl` and `logs/ffprobe_validation.jsonl`, and excludes confirmed-dead URLs from new catalog exports.
+- `MaintenanceAgent` keeps repeatedly failing links already present in the catalog and writes them to a validation-review queue instead of auto-pruning them automatically.
 
 - The pipeline is HLS-only: discovery, validation, maintenance, and map playback all require direct `.m3u8` URLs.

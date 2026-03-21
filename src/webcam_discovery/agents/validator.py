@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
@@ -65,6 +66,16 @@ def _domain_of(url: str) -> str:
 def _make_slug(city: str, label: str) -> str:
     """Generate a stable ID slug from city + label."""
     return slugify(f"{city} {label}", max_length=80, word_boundary=True, separator="-")
+
+
+def _append_jsonl(path: Path, rows: list[dict]) -> None:
+    """Append structured log rows to a JSONL file."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 # ── ValidationAgent ───────────────────────────────────────────────────────────
@@ -181,6 +192,20 @@ class ValidationAgent:
             [c.url for c in allowed], referers=referers
         )
         url_to_val = {r.url: r for r in validation_results}
+        validation_result_rows = [
+            {
+                "url": result.url,
+                "status": result.status,
+                "status_code": result.status_code,
+                "content_type": result.content_type,
+                "legitimacy_score": result.legitimacy_score,
+                "fail_reason": result.fail_reason,
+                "playlist_type": result.playlist_type,
+                "variant_streams": result.variant_streams,
+            }
+            for result in validation_results
+        ]
+        _append_jsonl(settings.log_dir / "validation_results.jsonl", validation_result_rows)
 
         n_live    = sum(1 for r in validation_results if r.status == "live")
         n_timeout = sum(1 for r in validation_results if r.fail_reason == "timeout")
@@ -195,7 +220,6 @@ class ValidationAgent:
         # Log fail_reason breakdown for dead + unknown results so operators can
         # distinguish token-expiry (http_403), offline (http_404), hotlink (http_403),
         # no-magic-bytes (no_m3u8_magic), and genuine timeouts.
-        from collections import Counter
         fail_reasons = Counter(
             r.fail_reason
             for r in validation_results
@@ -304,6 +328,21 @@ class ValidationAgent:
             )
             ffprobe_results = await ffprobe_skill.run(all_hls_urls)
             ffprobe_by_url = {r.url: r for r in ffprobe_results}
+            ffprobe_log_rows = [
+                {
+                    "url": fp.url,
+                    "stream_status": fp.stream_status,
+                    "camera_status": fp.camera_status,
+                    "frames_decoded": fp.frames_decoded,
+                    "mean_brightness": fp.mean_brightness,
+                    "entropy_avg": fp.entropy_avg,
+                    "interframe_diff_max": fp.interframe_diff_max,
+                    "detail": fp.detail,
+                    "ffprobe_available": fp.ffprobe_available,
+                }
+                for fp in ffprobe_results
+            ]
+            _append_jsonl(settings.log_dir / "ffprobe_validation.jsonl", ffprobe_log_rows)
 
             # Per-URL result log — visible in the terminal for every stream.
             for fp in ffprobe_results:
@@ -363,26 +402,28 @@ class ValidationAgent:
             )
 
         # ── Step 3: build record list ─────────────────────────────────────────
-        # "Do not remove any HLS streams, but flag as active, unknown, or dead."
-        #
-        # When ffprobe validation is active (default), ALL .m3u8 candidates are
-        # kept and geo-enriched regardless of their status.  Dead streams are
-        # preserved in the catalog so their health can be tracked over time
-        # and re-checked during maintenance runs.
-        #
-        # Without ffprobe (legacy mode), the traditional legitimacy gate is
-        # applied so that obviously bad HTTP results don't inflate the catalog.
+        # Dead streams should never enter the catalog. Unknown streams can still
+        # be retained for review, but confirmed-dead URLs (for example HTTP 404s
+        # or ffprobe-disabled streams) are filtered out here.
         to_enrich: list[tuple[CameraCandidate, object]] = []
+        dropped_dead = 0
 
         for candidate in allowed:
             v = url_to_val.get(candidate.url)
             if v is None:
                 continue
 
+            if v.status == "dead":
+                dropped_dead += 1
+                logger.info(
+                    "ValidationAgent: drop dead stream {} (fail_reason={})",
+                    candidate.url,
+                    v.fail_reason or "unknown",
+                )
+                continue
+
             if not settings.use_ffprobe_validation:
-                # Legacy path: drop dead and low-legitimacy results
-                if v.status == "dead":
-                    continue
+                # Legacy path: keep the legitimacy gate for non-dead results.
                 min_legit = settings.min_legitimacy
                 if v.status == "unknown" and min_legit != "low":
                     logger.debug(
@@ -404,8 +445,9 @@ class ValidationAgent:
         n_dead    = sum(1 for _, v in to_enrich if v.status == "dead")
         logger.info(
             "ValidationAgent: {} HLS streams to catalog — live={} unknown={} dead={} "
-            "(ffprobe_validation={})",
-            len(to_enrich), n_live, n_unknown, n_dead, settings.use_ffprobe_validation,
+            "dropped_dead={} (ffprobe_validation={})",
+            len(to_enrich), n_live, n_unknown, n_dead, dropped_dead,
+            settings.use_ffprobe_validation,
         )
 
         # ── Step 4: geo-enrich (batch async with cache warming) ───────────────
