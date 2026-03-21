@@ -111,14 +111,14 @@ class QueryGenerationSkill:
 
         # Core English queries
         queries.extend([
-            f"{city} live webcam public",
-            f"{city} traffic camera public feed",
-            f"{city} city webcam no login",
-            f"{city} tourism live camera",
-            f"{city} harbor port live cam",
-            f"{city} airport webcam live",
-            f"{city} transport authority live camera",
-            f"{city} open data webcam",
+            f"{city} live webcam m3u8",
+            f"{city} public hls stream webcam",
+            f"{city} traffic camera m3u8",
+            f"{city} tourism webcam m3u8",
+            f"{city} harbor live webcam m3u8",
+            f"{city} airport webcam hls",
+            f"{city} transport authority m3u8",
+            f"{city} open data webcam hls",
             f"site:windy.com/webcams {city}",
             f"site:webcamtaxi.com {city}",
             f"site:skylinewebcams.com {city}",

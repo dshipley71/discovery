@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maintenance.py — Liveness HEAD checks, status updates, and dead-link detection.
+maintenance.py — HLS liveness checks, status updates, and dead-link detection.
 Part of the Public Webcam Discovery System.
 
 Health-check strategy
@@ -15,14 +15,7 @@ HLS (.m3u8) streams
       does_not_exist   → CameraStatus "dead"    (DNS/404/connection failure)
 
     If the ffprobe binary is absent (graceful degradation) the check falls back
-    to an HTTP HEAD request with the same 200-206/redirect/auth status mapping
-    used for non-HLS URLs.
-
-Non-HLS URLs (should not appear when hls_only=True)
-    HTTP HEAD — 200-206 → live, 301/302 → unknown, 401/403 → dead, else → dead.
-
-YouTube live feeds
-    Verified via the oEmbed endpoint.
+    to an HTTP HEAD request for the same .m3u8 URL.
 """
 from __future__ import annotations
 
@@ -74,17 +67,15 @@ class HealthCheckSkill:
     Batch liveness check for existing catalog records.
 
     HLS (.m3u8) streams are checked via ffprobe for accurate frame-level status.
-    Non-HLS URLs fall back to HTTP HEAD.  Concurrency is bounded by a semaphore.
+    Concurrency is bounded by a semaphore.
     """
-
-    _YOUTUBE_OEMBED = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
 
     async def run(self, input: HealthCheckInput) -> HealthCheckSummary:
         """
         Perform batch health checks with controlled concurrency.
 
         HLS (.m3u8) records are verified with ffprobe (frame-level analysis).
-        Non-HLS records fall back to HTTP HEAD.  YouTube feeds use oEmbed.
+        The same URL falls back to HTTP HEAD only when ffprobe is unavailable.
 
         Status mapping:
           ffprobe active_streaming → "live"
@@ -159,23 +150,19 @@ class HealthCheckSkill:
         Dispatch to the appropriate check strategy for one record.
 
         HLS (.m3u8) → ffprobe frame analysis (with HTTP HEAD fallback)
-        YouTube live  → oEmbed endpoint verification
-        Other         → HTTP HEAD
+        Non-HLS URLs should never enter the catalog; if they do, mark them dead.
         """
-        # YouTube live: verify via oEmbed
-        if record.feed_type == "youtube_live":
-            return await self._check_youtube(client, record)
-
         check_url = record.url
 
-        # For HLS streams, use ffprobe for accurate frame-level status detection.
-        # An "active" stream is one where clicking the URL plays video immediately
-        # with no user interaction — confirmed by actual decoded frames.
         if ".m3u8" in check_url.lower():
             return await self._check_hls_ffprobe(record, check_url)
 
-        # Non-HLS: HTTP HEAD fallback
-        return await self._head_check(client, record, check_url)
+        return HealthCheckResult(
+            id=record.id,
+            url=check_url,
+            new_status="dead",
+            fail_reason="not_hls",
+        )
 
     async def _check_hls_ffprobe(
         self,
@@ -299,59 +286,6 @@ class HealthCheckSkill:
             return HealthCheckResult(
                 id=record.id,
                 url=check_url,
-                new_status="unknown",
-                fail_reason=str(exc)[:120],
-            )
-
-    async def _check_youtube(
-        self,
-        client: httpx.AsyncClient,
-        record: CameraRecord,
-    ) -> HealthCheckResult:
-        """Verify YouTube feed via oEmbed endpoint."""
-        import re
-
-        # Try to extract video_id from the record URL
-        video_id: Optional[str] = None
-        match = re.search(r"/embed/([A-Za-z0-9_-]+)", record.url)
-        if match:
-            video_id = match.group(1)
-
-        if not video_id:
-            # Fall back to HEAD check on the record URL
-            return await self._head_check(client, record, record.url)
-
-        oembed_url = self._YOUTUBE_OEMBED.format(video_id=video_id)
-        try:
-            response = await client.get(oembed_url)
-            if response.status_code == 200:
-                new_status: CameraStatus = "live"
-                fail_reason = None
-            elif response.status_code == 404:
-                new_status = "dead"
-                fail_reason = "youtube_removed"
-            else:
-                new_status = "unknown"
-                fail_reason = f"oembed_http_{response.status_code}"
-
-            return HealthCheckResult(
-                id=record.id,
-                url=oembed_url,
-                new_status=new_status,
-                status_code=response.status_code,
-                fail_reason=fail_reason,
-            )
-        except httpx.TimeoutException:
-            return HealthCheckResult(
-                id=record.id,
-                url=oembed_url,
-                new_status="unknown",
-                fail_reason="timeout",
-            )
-        except Exception as exc:
-            return HealthCheckResult(
-                id=record.id,
-                url=oembed_url,
                 new_status="unknown",
                 fail_reason=str(exc)[:120],
             )

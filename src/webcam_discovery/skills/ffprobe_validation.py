@@ -6,7 +6,7 @@ Part of the Public Webcam Discovery System.
 Why this exists
 ---------------
 HTTP-level probing (FeedValidationSkill) confirms a stream URL is reachable and
-returns valid HLS/MJPEG headers, but it cannot distinguish:
+returns a reachable HLS playlist, but it cannot distinguish:
 
   - A stream with active live video vs. a playlist serving stale/empty segments
   - A valid playlist with blank or frozen frames (camera covered/offline/dark)
@@ -121,7 +121,7 @@ class FfprobeValidationSkill:
     """
     Validate a list of live-stream URLs using ffprobe and frame analysis.
 
-    Only HLS (.m3u8) URLs are probed — MJPEG and HTML page URLs are skipped.
+    Only HLS (.m3u8) URLs are probed — HTML pages and every non-HLS URL are skipped.
     Concurrency is bounded by a semaphore to avoid overloading the host.
 
     Graceful degradation
@@ -186,7 +186,7 @@ class FfprobeValidationSkill:
 
     async def _probe_url(self, url: str, sem: asyncio.Semaphore) -> FfprobeResult:
         """Run ffprobe + frame sampling for one URL under the semaphore."""
-        # Only probe HLS streams — skip HTML pages and MJPEG
+        # Only probe HLS streams — skip HTML pages and every non-HLS URL
         u_lower = url.lower()
         if ".m3u8" not in u_lower:
             return FfprobeResult(url=url, detail="skipped_not_hls")

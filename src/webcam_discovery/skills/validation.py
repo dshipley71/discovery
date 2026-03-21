@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
 """
-validation.py — Stream validation (HLS + MJPEG) and robots.txt compliance.
+validation.py — HLS (.m3u8) validation and robots.txt compliance.
 Part of the Public Webcam Discovery System.
 
 Validation strategy
 -------------------
-Three URL types are probed for liveness:
+Only direct HLS (.m3u8) URLs are probed for liveness.
 
 HLS (.m3u8)
   1. GET the first 4 KB of the URL.
-  2. Verify #EXTM3U magic byte on line 1.
+  2. Verify #EXTM3U magic bytes near the start of the response.
   3. Classify playlist type:
      - Master playlist: #EXT-X-STREAM-INF → playlist_type='master', variant_streams extracted.
      - Media playlist:  #EXTINF / #EXT-X-TARGETDURATION → playlist_type='media'.
 
-MJPEG (.mjpg / .mjpeg)
-  Streaming GET — response headers only.  A 2xx with content-type containing
-  'multipart', 'video', 'mjpeg', or 'jpeg' → live.  Any other 2xx on a .mjpg
-  URL → optimistically live (medium legitimacy).
-
-HTML embed pages (all other URLs)
-  GET up to 32 KB.  Content-type checked first:
-  - multipart/x-mixed-replace or video/* → live MJPEG/video stream.
-  - text/html → scan body for embedded .m3u8 and .mjpeg URLs; probe each.
-  - Anything else → dead (non_stream_content).
-
-YouTube embeds, iframes with no extractable URL, and MP4-only pages are
-rejected (no_stream_found_in_html or non_stream_content).
+Any non-.m3u8 URL is rejected immediately with fail_reason='not_hls'.
 
 Concurrency: asyncio.Semaphore(settings.validation_concurrency) — default 50.
 Timeout:     connect=10 s, read=25 s.
@@ -98,7 +86,6 @@ _BROWSER_UA = (
 
 _HLS_MAGIC      = b"#EXTM3U"
 _HLS_URL_RE     = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
-_MJPEG_URL_RE   = re.compile(r"\.mjpe?g(\?|$)", re.IGNORECASE)
 _AUTH_URL_RE    = re.compile(
     r"/(login|signin|sign-in|auth|register|subscribe|account|member|join)",
     re.IGNORECASE,
@@ -107,8 +94,6 @@ _AUTH_URL_RE    = re.compile(
 # Broad catch-all patterns for scanning raw HTML bodies.
 # 1. Quoted string containing a stream URL (original)
 _BROAD_HLS_RE    = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
-_BROAD_MJPEG_RE  = re.compile(r"""['"]([^'"]{4,500}\.mjpe?g[^'"]{0,100})['"]""", re.IGNORECASE)
-_BROAD_DASH_RE   = re.compile(r"""['"]([^'"]{4,500}\.mpd[^'"]{0,100})['"]""",   re.IGNORECASE)
 # 2. JSON key-value pairs: "hlsUrl": "https://..." or 'streamUrl': '...'
 _JSON_HLS_RE     = re.compile(
     r'"(?:url|src|stream|hls|hlsUrl|hlsSrc|m3u8|streamUrl|videoUrl|liveUrl|'
@@ -138,12 +123,8 @@ _OFFLINE_MARKERS_RE = re.compile(
 
 # Content-type substrings that indicate a live stream is being served directly.
 _LIVE_CONTENT_TYPES = (
-    "multipart/x-mixed-replace",
-    "video/",
     "application/x-mpegurl",
     "application/vnd.apple.mpegurl",
-    "video/x-motion-jpeg",
-    "application/dash+xml",
 )
 
 
@@ -157,18 +138,11 @@ def _has_auth_path(url: str) -> bool:
 
 class FeedValidationSkill:
     """
-    Validate a list of .m3u8 URLs for liveness.
+    Validate a list of direct HLS (.m3u8) URLs for liveness.
 
-    When ``settings.hls_only=True`` (the default), only direct HLS (.m3u8)
-    stream URLs are accepted.  MJPEG streams, HTML embed pages, and all other
-    URL types are rejected immediately (status="dead", fail_reason="not_hls")
-    without making an HTTP request.  Direct .m3u8 URLs play automatically on
-    click with no user interaction required.
-
-    When ``hls_only=False``, the prober also handles MJPEG streams and HTML
-    embed pages that may contain embedded stream URLs.
-
-    Semaphore-limited concurrency avoids overwhelming servers.
+    Any non-.m3u8 URL is rejected immediately with status="dead" and
+    fail_reason="not_hls". Semaphore-limited concurrency avoids overwhelming
+    servers.
     """
 
     async def run(
@@ -237,44 +211,35 @@ class FeedValidationSkill:
         referer: Optional[str] = None,
     ) -> ValidationResult:
         """
-        Route each URL to the appropriate prober.
+        Route each URL to the HLS prober or reject it immediately.
 
-        When ``settings.hls_only=True`` (the default):
-          .m3u8  → _probe_hls    (HLS playlist validation)
-          other  → dead, fail_reason="not_hls"
-
-        When ``settings.hls_only=False``:
-          .m3u8  → _probe_hls    (HLS playlist validation)
-          .mjpg  → _probe_mjpeg  (MJPEG stream header check)
-          other  → _probe_generic (HTML embed page scan for embedded streams)
+        Only direct `.m3u8` URLs are valid inputs for this system.
         """
-        from webcam_discovery.config import settings
-
         # Reject URLs without a valid HTTP/HTTPS scheme — httpx raises a
-        # ValueError ("Request URL is missing an 'http://' or 'https://' protocol")
-        # for protocol-relative (//…) or bare paths, which would otherwise appear
-        # as cryptic failures in the fail_reason breakdown.
+        # ValueError for protocol-relative (//…) or bare paths, which would
+        # otherwise surface as cryptic exceptions.
         if not url.lower().startswith(("http://", "https://")):
             return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
+                url=url,
+                legitimacy_score="low",
+                status="dead",
                 fail_reason="missing_protocol",
             )
         if _has_auth_path(url):
             return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
+                url=url,
+                legitimacy_score="low",
+                status="dead",
                 fail_reason="auth_url_pattern",
             )
         if _HLS_URL_RE.search(url):
             return await self._probe_hls(client, url, referer=referer)
-        # Non-HLS URL: reject immediately (HLS-only is the system default)
-        if settings.hls_only:
-            return ValidationResult(
-                url=url, legitimacy_score="low", status="dead",
-                fail_reason="not_hls",
-            )
-        if _MJPEG_URL_RE.search(url):
-            return await self._probe_mjpeg(client, url)
-        return await self._probe_generic(client, url)
+        return ValidationResult(
+            url=url,
+            legitimacy_score="low",
+            status="dead",
+            fail_reason="not_hls",
+        )
 
     async def _probe_hls(
         self,
@@ -361,156 +326,6 @@ class FeedValidationSkill:
         except Exception as exc:
             return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
 
-    async def _probe_mjpeg(
-        self, client: httpx.AsyncClient, url: str
-    ) -> ValidationResult:
-        """
-        Verify a .mjpg/.mjpeg URL is a live MJPEG stream.
-
-        Opens a streaming GET and inspects response headers only (no body read)
-        to avoid downloading the infinite MJPEG byte stream.  A 2xx whose
-        content-type contains 'multipart', 'video', 'mjpeg', or 'jpeg' → live
-        (high legitimacy).  Any other 2xx on a .mjpg URL is optimistically live
-        (medium legitimacy) since many cameras omit the correct content-type.
-        """
-        try:
-            async with client.stream("GET", url) as resp:
-                ct = resp.headers.get("content-type", "").lower()
-                if resp.status_code not in range(200, 207):
-                    return ValidationResult(
-                        url=url, status_code=resp.status_code,
-                        legitimacy_score="low", status="dead",
-                        fail_reason=f"http_{resp.status_code}",
-                    )
-                # Check headers only — do NOT read the body
-            if any(k in ct for k in ("multipart", "video", "mjpeg", "jpeg", "mpegurl", "octet-stream")):
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct,
-                    legitimacy_score="high", status="live",
-                )
-            return ValidationResult(
-                url=url, status_code=200, content_type=ct or None,
-                legitimacy_score="medium", status="live",
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
-    async def _probe_generic(
-        self, client: httpx.AsyncClient, url: str
-    ) -> ValidationResult:
-        """
-        Probe an HTML embed page for embedded stream URLs.
-
-        Reads up to 64 KB of the response body (increased from 32 KB to
-        capture late-document JSON blobs and JavaScript variable assignments)
-        and applies multiple extraction patterns:
-
-        1. Returns live immediately if the content-type signals a direct stream
-           (multipart/x-mixed-replace, video/*, application/x-mpegurl, DASH …).
-        2. For text/html responses:
-           a. Detects offline-marker text and returns ``unknown`` with
-              ``fail_reason="offline_marker"`` without probing further.
-           b. Applies five URL-extraction patterns in priority order:
-              - JSON key-value pairs (``"hlsUrl":"…"`` etc.)
-              - data-* HTML attributes (``data-src``, ``data-stream`` etc.)
-              - Bare JavaScript variable assignments
-              - Standard quoted-string scan
-              - MJPEG / MPEG-DASH URLs (same multi-pattern approach)
-           c. Each candidate is probed; returns on the first live result.
-        3. Returns dead (no_stream_found_in_html) if nothing live is found.
-        """
-        try:
-            async with client.stream("GET", url) as resp:
-                ct = resp.headers.get("content-type", "").lower()
-                if resp.status_code not in range(200, 207):
-                    return ValidationResult(
-                        url=url, status_code=resp.status_code,
-                        legitimacy_score="low", status="dead",
-                        fail_reason=f"http_{resp.status_code}",
-                    )
-
-                # Direct live stream — no body needed
-                if any(k in ct for k in _LIVE_CONTENT_TYPES):
-                    return ValidationResult(
-                        url=url, status_code=200, content_type=ct,
-                        legitimacy_score="high", status="live",
-                    )
-
-                # Non-HTML, non-stream content
-                if ct and "text/html" not in ct:
-                    return ValidationResult(
-                        url=url, status_code=200, content_type=ct,
-                        legitimacy_score="low", status="dead",
-                        fail_reason="non_stream_content",
-                    )
-
-                # HTML — read up to 64 KB to scan for embedded stream URLs.
-                # 64 KB catches late-document JSON blobs and JS variable assignments
-                # that a 32 KB read would miss on larger pages.
-                buf = b""
-                async for chunk in resp.aiter_bytes():
-                    buf += chunk
-                    if len(buf) >= 65536:
-                        break
-
-            body = buf.decode("utf-8", errors="replace")
-
-            # Check for offline / unavailable markers before probing.
-            # Avoids wasting HTTP requests on cameras that are explicitly offline.
-            if _OFFLINE_MARKERS_RE.search(body):
-                return ValidationResult(
-                    url=url, status_code=200, content_type=ct or None,
-                    legitimacy_score="low", status="unknown",
-                    fail_reason="offline_marker",
-                )
-
-            # Collect HLS candidate URLs from all patterns (deduped, ordered by
-            # priority: JSON keys > data-* attrs > JS vars > quoted strings).
-            hls_seen: set[str] = set()
-
-            def _collect_hls(pattern: re.Pattern) -> list[str]:
-                result: list[str] = []
-                for m in pattern.finditer(body):
-                    raw = m.group(1)
-                    abs_url = raw if raw.startswith("http") else urljoin(url, raw)
-                    if abs_url not in hls_seen:
-                        hls_seen.add(abs_url)
-                        result.append(abs_url)
-                return result
-
-            for hls_url in (
-                _collect_hls(_JSON_HLS_RE)
-                + _collect_hls(_DATA_ATTR_HLS_RE)
-                + _collect_hls(_JS_VAR_HLS_RE)
-                + _collect_hls(_BROAD_HLS_RE)
-            ):
-                result = await self._probe_hls(client, hls_url, referer=url)
-                if result.status == "live":
-                    return result
-
-            # MJPEG candidates
-            mjpeg_seen: set[str] = set()
-            for m in _BROAD_MJPEG_RE.finditer(body):
-                raw = m.group(1)
-                abs_url = raw if raw.startswith("http") else urljoin(url, raw)
-                if abs_url not in mjpeg_seen:
-                    mjpeg_seen.add(abs_url)
-                    result = await self._probe_mjpeg(client, abs_url)
-                    if result.status == "live":
-                        return result
-
-            return ValidationResult(
-                url=url, status_code=200, content_type=ct or None,
-                legitimacy_score="low", status="dead",
-                fail_reason="no_stream_found_in_html",
-            )
-        except httpx.TimeoutException:
-            return ValidationResult(url=url, status="unknown", fail_reason="timeout")
-        except Exception as exc:
-            return ValidationResult(url=url, status="unknown", fail_reason=str(exc)[:100])
-
 
 # ── RobotsPolicySkill ──────────────────────────────────────────────────────────
 
@@ -580,11 +395,10 @@ class RobotsPolicySkill:
 # ── FeedTypeClassificationSkill ───────────────────────────────────────────────
 
 _HLS_EXT_RE  = re.compile(r"\.m3u8(\?|$)",  re.IGNORECASE)
-_MJPEG_EXT_RE = re.compile(r"\.mjpe?g(\?|$)", re.IGNORECASE)
 
 
 class FeedTypeClassificationSkill:
-    """Classify feed type (HLS master/stream or MJPEG) from playlist_type, URL, and content-type."""
+    """Classify feed type (HLS master/stream) from playlist_type, URL, and content-type."""
 
     def run(self, input: FeedTypeInput) -> FeedTypeResult:
         """
@@ -594,7 +408,7 @@ class FeedTypeClassificationSkill:
             input: FeedTypeInput with url, optional content_type, and playlist_type.
 
         Returns:
-            FeedTypeResult with feed_type: HLS_master, HLS_stream, MJPEG, or unknown.
+            FeedTypeResult with feed_type: HLS_master, HLS_stream, or unknown.
         """
         if input.playlist_type == "master":
             return FeedTypeResult(feed_type="HLS_master")
@@ -603,8 +417,6 @@ class FeedTypeClassificationSkill:
         ct = (input.content_type or "").lower()
         if _HLS_EXT_RE.search(input.url or "") or "mpegurl" in ct:
             return FeedTypeResult(feed_type="HLS_stream")
-        if _MJPEG_EXT_RE.search(input.url or "") or "multipart/x-mixed-replace" in ct or "mjpeg" in ct:
-            return FeedTypeResult(feed_type="MJPEG")
         return FeedTypeResult(feed_type="unknown")
 
 

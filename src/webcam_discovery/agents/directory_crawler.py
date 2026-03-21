@@ -284,7 +284,7 @@ class DirectoryAgent:
             tier:     Maximum tier to crawl (1 = Tier 1 only, 5 = all tiers 1–5).
             hls_only: When True, skip source sites whose SOURCES.md feed-types column
                       does not include "HLS", and drop any candidate whose URL does not
-                      end with ``.m3u8`` (removes MJPEG and HTML-page candidates).
+                      end with ``.m3u8`` (removes HTML-page and non-HLS candidates).
 
         Returns:
             Deduplicated list of CameraCandidate objects with resolved feed URLs.

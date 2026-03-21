@@ -206,23 +206,16 @@ class ValidationAgent:
             logger.info("ValidationAgent: failure reasons — {}", breakdown)
 
         # ── Step 2b: browser second-pass (optional) ───────────────────────────
-        # Many webcam sites load stream URLs via JavaScript fetch/XHR after the
-        # page renders — they are never in the static HTML so _probe_generic
-        # classifies them as "dead" (no_stream_found_in_html).  This pass opens
-        # those pages in headless Chromium, intercepts network responses, clicks
-        # play buttons, and retrieves the actual .m3u8 URL.
-        #
-        # _browser_stream_map: page_url → direct stream_url discovered by browser
+        # In the HLS-only pipeline this path is effectively dormant because only
+        # direct .m3u8 candidates survive into validation. It remains available
+        # for future HTML-to-HLS extraction experiments.
         _browser_stream_map: dict[str, str] = {}
 
         if settings.use_browser_validation:
-            # Target HTML-page URLs that the static prober could not confirm live.
             browser_targets = [
                 c.url for c in allowed
                 if not c.url.lower().endswith(".m3u8")
                 and ".m3u8" not in c.url.lower()
-                and ".mjpeg" not in c.url.lower()
-                and ".mjpg" not in c.url.lower()
                 and url_to_val.get(c.url) is not None
                 and url_to_val[c.url].status != "live"
             ]
@@ -346,7 +339,7 @@ class ValidationAgent:
                     continue
 
                 if fp.stream_status is None:
-                    # ffprobe unavailable or non-HLS — preserve HTTP probe status
+                    # ffprobe unavailable — preserve HTTP probe status
                     n_skipped += 1
                     continue
 
