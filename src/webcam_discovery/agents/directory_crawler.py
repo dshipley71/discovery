@@ -231,6 +231,48 @@ _LISTING_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SHALLOW_NON_CAMERA_TOKENS = frozenset({
+    "about",
+    "advertise",
+    "advertising",
+    "brand",
+    "brands",
+    "contact",
+    "docs",
+    "faq",
+    "help",
+    "leaflets",
+    "partner",
+    "partners",
+    "pricing",
+    "privacy",
+    "resource",
+    "resources",
+    "support",
+    "terms",
+})
+_COLLECTION_PATH_SEGMENTS = frozenset({
+    "cameras",
+    "collections",
+    "galleries",
+    "livecams",
+    "streams",
+    "webcams",
+})
+_DETAIL_PATH_SEGMENTS = frozenset({
+    "cam",
+    "camera",
+    "livecam",
+    "player",
+    "stream",
+    "view",
+    "webcam",
+})
+
+# Prevent extraction from overloading any single host when a traversal yields a
+# large burst of same-domain candidates.
+PER_HOST_EXTRACT_CONCURRENCY = 3
+
 # Language prefixes that some directories prepend to every page
 # (e.g. /en/camera/x/, /ru/camera/x/, /zh-CN/camera/x/).
 # Used to collapse language duplicates of the same camera page.
@@ -254,6 +296,39 @@ def _canonical_path(url: str) -> str:
     parsed = urlparse(url)
     path = _LANG_PREFIX_RE.sub("/", parsed.path, count=1)
     return parsed.netloc + path + ("?" + parsed.query if parsed.query else "")
+
+
+def _should_skip_feed_extraction(url: str) -> bool:
+    """
+    Return True when *url* is known to be a non-camera page.
+
+    Generic listing/tag/search pages are skipped for every source. Shallow
+    marketing/support pages and obvious collection routes are also skipped so
+    feed extraction does not waste requests on URLs that are unlikely to be
+    individual camera pages.
+    """
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    path_parts = [part.lower() for part in path.strip("/").split("/") if part]
+    path_tokens = {
+        token
+        for part in path_parts
+        for token in re.split(r"[-_]+", part)
+        if token
+    }
+
+    if _LISTING_PATH_RE.search(path):
+        return True
+
+    if 0 < len(path_parts) <= 2 and path_tokens & _SHALLOW_NON_CAMERA_TOKENS:
+        return True
+
+    collection_segments = set(path_parts[:-1]) & _COLLECTION_PATH_SEGMENTS
+    detail_segments = set(path_parts) & _DETAIL_PATH_SEGMENTS
+    if collection_segments and not detail_segments:
+        return True
+
+    return False
 
 
 # ── DirectoryAgent ────────────────────────────────────────────────────────────
@@ -501,6 +576,9 @@ class DirectoryAgent:
 
         sem = asyncio.Semaphore(self.EXTRACT_CONCURRENCY)
         streams_by_domain: defaultdict[str, int] = defaultdict(int)
+        domain_limits: defaultdict[str, asyncio.Semaphore] = defaultdict(
+            lambda: asyncio.Semaphore(PER_HOST_EXTRACT_CONCURRENCY)
+        )
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=3.0, read=8.0, write=5.0, pool=3.0),
@@ -514,17 +592,19 @@ class DirectoryAgent:
                 page_url = candidate.url
 
                 # Skip category/tag/listing pages without an HTTP request.
-                if _LISTING_PATH_RE.search(urlparse(page_url).path):
+                if _should_skip_feed_extraction(page_url):
                     return []
 
+                domain_sem = domain_limits[_domain_of(page_url)]
                 async with sem:
-                    try:
-                        feed = await skill.run(FeedExtractionInput(page_url=page_url))
-                    except Exception as exc:
-                        logger.warning(
-                            "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
-                        )
-                        return [candidate]
+                    async with domain_sem:
+                        try:
+                            feed = await skill.run(FeedExtractionInput(page_url=page_url))
+                        except Exception as exc:
+                            logger.warning(
+                                "DirectoryAgent: feed extraction error for {}: {}", page_url, exc
+                            )
+                            return [candidate]
 
                 results: list[CameraCandidate] = []
                 already_seen: set[str] = {page_url}
