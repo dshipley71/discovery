@@ -5,8 +5,10 @@ import pytest
 from webcam_discovery.agents.directory_crawler import (
     DirectoryAgent,
     PER_HOST_EXTRACT_CONCURRENCY,
+    SourcesRegistry,
     _should_skip_feed_extraction,
 )
+from webcam_discovery.agents.search_agent import _is_blocked
 from webcam_discovery.schemas import CameraCandidate
 from webcam_discovery.skills.traversal import FeedExtractionOutput
 
@@ -87,3 +89,37 @@ def test_resolve_feed_urls_caps_per_host_concurrency(
     assert len(resolved) == 6
     assert all(candidate.url.endswith(".m3u8") for candidate in resolved)
     assert all("/live/streams/" not in ref for c in resolved for ref in c.source_refs)
+
+
+def test_sources_registry_parses_blocked_domains_from_urls(tmp_path) -> None:
+    sources_path = tmp_path / "SOURCES.md"
+    sources_path.write_text(
+        """# SOURCES
+
+## Section 2 — Blocked Sources
+
+| Source | URL | Reason |
+|--------|-----|--------|
+| **Insecam** | https://www.insecam.org | Surveillance-oriented |
+| **Shodan** | https://www.shodan.io | Device search engine |
+| **example.net** | https://example.net/login | Auth gated |
+""",
+        encoding="utf-8",
+    )
+
+    registry = SourcesRegistry(sources_path=sources_path)
+
+    assert registry.blocked_domains == frozenset({"insecam.org", "shodan.io", "example.net"})
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.insecam.org/en/", True),
+        ("https://search.censys.io/hosts", True),
+        ("https://subdomain.zoomeye.org/path", True),
+        ("https://worldcams.tv/city", False),
+    ],
+)
+def test_search_agent_uses_sources_registry_blocklist(url: str, expected: bool) -> None:
+    assert _is_blocked(url) is expected

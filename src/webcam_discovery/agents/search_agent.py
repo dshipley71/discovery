@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from webcam_discovery.config import settings
+from webcam_discovery.agents.directory_crawler import SourcesRegistry
 from webcam_discovery.schemas import CameraCandidate
 from webcam_discovery.skills.search import QueryGenerationSkill, QueryGenerationInput
 
@@ -47,14 +48,7 @@ TIER2_CITIES: list[str] = [
     "Accra", "Dakar", "Addis Ababa", "Dar es Salaam", "Kampala",
 ]
 
-BLOCKED_DOMAINS: set[str] = {
-    "shodan.io",
-    "insecam.org",
-    "www.insecam.org",
-    "censys.io",
-    "zoomeye.org",
-    "fofa.info",
-}
+BLOCKED_DOMAINS: frozenset[str] = SourcesRegistry().blocked_domains
 
 _CITY_TIERS: dict[int, list[str]] = {
     1: TIER1_CITIES,
@@ -70,7 +64,7 @@ def _domain_of(url: str) -> str:
 def _is_blocked(url: str) -> bool:
     """Check if URL belongs to a blocked domain."""
     domain = _domain_of(url)
-    return domain in BLOCKED_DOMAINS or any(b in domain for b in BLOCKED_DOMAINS)
+    return any(domain == blocked or domain.endswith("." + blocked) for blocked in BLOCKED_DOMAINS)
 
 
 async def _duckduckgo_search(

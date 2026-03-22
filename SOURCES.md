@@ -58,6 +58,8 @@ by `SourceDiscoverySkill`, it must be added here by a human operator before agen
 
 Never crawl or catalog these sources. They are blocked because they are private, surveillance-oriented,
 auth-gated, or incompatible with the project's public-only and HLS-only policy.
+Code repositories or tools that advertise indiscriminate webcam scraping (for example, "scrape any country's
+web cameras") are also out of scope and must not be treated as discovery sources.
 
 | Source | URL | Reason |
 |--------|-----|--------|

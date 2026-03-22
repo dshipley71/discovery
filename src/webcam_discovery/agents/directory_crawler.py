@@ -211,13 +211,34 @@ class SourcesRegistry:
         return result
 
     def _parse_blocked_domains(self, content: str) -> set[str]:
-        """Extract domain-like strings from bold source names in Section 2."""
+        """
+        Extract blocked domains from Section 2 table rows.
+
+        The canonical data lives in the URL column, but we also accept
+        domain-like source names for defensive parsing of future edits.
+        """
         blocked: set[str] = set()
-        for match in self._BOLD_CELL_RE.finditer(content):
-            name = match.group(1).strip().lower()
-            first_word = name.split()[0].rstrip(".,;")
-            if self._DOMAIN_RE.match(first_word):
-                blocked.add(first_word)
+        for line in content.splitlines():
+            if "|" not in line or line.lstrip().startswith("|-"):
+                continue
+
+            cells = [cell.strip() for cell in line.split("|")[1:-1]]
+            if len(cells) < 2:
+                continue
+
+            _, source_url = cells[0], cells[1]
+
+            name_match = self._BOLD_CELL_RE.match(line)
+            if name_match:
+                name = name_match.group(1).strip().lower()
+                first_word = name.split()[0].rstrip(".,;")
+                if self._DOMAIN_RE.match(first_word):
+                    blocked.add(first_word)
+
+            if source_url.startswith("http://") or source_url.startswith("https://"):
+                domain = urlparse(source_url).netloc.lower().removeprefix("www.")
+                if domain:
+                    blocked.add(domain)
         return blocked
 
 
