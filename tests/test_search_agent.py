@@ -1,4 +1,8 @@
 import asyncio
+import types
+import warnings
+
+import webcam_discovery.agents.search_agent as search_agent_module
 
 from webcam_discovery.agents.map_agent import MapAgent
 from webcam_discovery.agents.search_agent import (
@@ -19,9 +23,66 @@ def test_query_generation_includes_known_source_domains() -> None:
         )
     )
 
-    assert 'site:worldcams.tv "Tokyo" webcam' in result.queries
-    assert 'site:earthcam.com "Tokyo" webcam' in result.queries
+    assert 'site:worldcams.tv "Tokyo"' in result.queries
+    assert 'site:earthcam.com "Tokyo"' in result.queries
     assert any("ライブカメラ" in query for query in result.queries)
+
+
+def test_load_ddgs_class_prefers_renamed_package(monkeypatch) -> None:
+    renamed_module = types.SimpleNamespace(DDGS=object())
+    legacy_module = types.SimpleNamespace(DDGS=object())
+
+    monkeypatch.setattr(
+        search_agent_module,
+        "import_module",
+        lambda name: renamed_module if name == "ddgs" else legacy_module,
+    )
+
+    ddgs_class, using_legacy_package = search_agent_module._load_ddgs_class()
+
+    assert ddgs_class is renamed_module.DDGS
+    assert using_legacy_package is False
+
+
+def test_load_ddgs_class_falls_back_to_legacy_package(monkeypatch) -> None:
+    legacy_module = types.SimpleNamespace(DDGS=object())
+
+    def fake_import_module(name: str):
+        if name == "ddgs":
+            raise ImportError(name)
+        if name == "duckduckgo_search":
+            return legacy_module
+        raise AssertionError(f"Unexpected module {name}")
+
+    monkeypatch.setattr(search_agent_module, "import_module", fake_import_module)
+
+    ddgs_class, using_legacy_package = search_agent_module._load_ddgs_class()
+
+    assert ddgs_class is legacy_module.DDGS
+    assert using_legacy_package is True
+
+
+def test_duckduckgo_search_suppresses_legacy_rename_warning(monkeypatch) -> None:
+    class FakeDDGS:
+        def text(self, query: str, max_results: int):
+            warnings.warn(
+                "This package (`duckduckgo_search`) has been renamed to `ddgs`! Use `pip install ddgs` instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return [{"href": "https://allowed.example/live/master.m3u8"}]
+
+    monkeypatch.setattr(
+        search_agent_module,
+        "_load_ddgs_class",
+        lambda: (FakeDDGS, True),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        urls = asyncio.run(search_agent_module._duckduckgo_search("Tokyo webcam"))
+
+    assert urls == ["https://allowed.example/live/master.m3u8"]
 
 
 def test_search_agent_extracts_direct_hls_candidates(
