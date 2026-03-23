@@ -20,6 +20,25 @@ Coordinates     — GeoEnrichmentSkill tries four strategies: city+country,
                   Cameras that survive all fallbacks with no coordinates are
                   included with latitude=None/longitude=None and
                   notes="location_unknown" for manual review.
+
+Fixes applied (2026-03-23)
+--------------------------
+unwrap_player_url() is now called on every candidate URL immediately after
+candidates are loaded, before robots.txt checking, the hls_only filter, or
+any HTTP probing.
+
+Some webcam directories (worldcams.tv, etc.) embed the real .m3u8 URL inside
+a player-wrapper URL, e.g.:
+
+    https://worldcams.tv/player?url=https://cdn.example.com/stream.m3u8
+
+These wrapper URLs pass the hls_only filter because ".m3u8" appears in the
+string, but FeedValidationSkill probes the wrapper page, receives HTML (not
+an HLS playlist), finds no #EXTM3U magic, and drops the stream as dead —
+discarding a potentially live feed.
+
+Unwrapping at ingestion resolves this for all entry paths: direct runs,
+queue-based streaming, and maintenance re-checks.
 """
 from __future__ import annotations
 
@@ -47,6 +66,7 @@ from webcam_discovery.skills.validation import (
     ValidationResult,
 )
 from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput, _normalize_place_name
+from webcam_discovery.skills.traversal import unwrap_player_url   # ← FIX: import unwrapper
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -94,6 +114,45 @@ def _append_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _unwrap_candidates(candidates: list[CameraCandidate]) -> list[CameraCandidate]:
+    """
+    Unwrap any player-wrapper URLs in the candidate list.
+
+    For each candidate whose URL is a player wrapper (e.g.
+    ``https://worldcams.tv/player?url=https://cdn.example.com/stream.m3u8``),
+    the inner .m3u8 URL is extracted and stored as the candidate URL.  The
+    original wrapper URL is preserved in source_refs so the source page remains
+    traceable.
+
+    Candidates whose URL is already a clean .m3u8 are returned unchanged.
+    """
+    unwrapped: list[CameraCandidate] = []
+    n_unwrapped = 0
+
+    for c in candidates:
+        clean_url = unwrap_player_url(c.url)
+        if clean_url != c.url:
+            n_unwrapped += 1
+            logger.debug(
+                "ValidationAgent: unwrapped player URL '{}' → '{}'",
+                c.url, clean_url,
+            )
+            # Preserve the original wrapper URL as a source reference
+            existing_refs = list(c.source_refs) if c.source_refs else []
+            if c.url not in existing_refs:
+                existing_refs.insert(0, c.url)
+            c = c.model_copy(update={"url": clean_url, "source_refs": existing_refs})
+        unwrapped.append(c)
+
+    if n_unwrapped:
+        logger.info(
+            "ValidationAgent: unwrapped {} player-wrapper URL(s) → direct .m3u8 stream(s)",
+            n_unwrapped,
+        )
+
+    return unwrapped
+
+
 # ── ValidationAgent ───────────────────────────────────────────────────────────
 
 class ValidationAgent:
@@ -103,6 +162,7 @@ class ValidationAgent:
 
     Processing steps
     ----------------
+    0. Unwrap player-wrapper URLs (FIX 2026-03-23).
     1. Group by domain; check robots.txt concurrently (one task per domain).
     2. Probe all allowed URLs via FeedValidationSkill (semaphore-limited async).
     3. Filter by settings.min_legitimacy.
@@ -139,6 +199,12 @@ class ValidationAgent:
 
         logger.info("ValidationAgent: {} candidates received", len(candidates))
 
+        # ── Step 0: unwrap player-wrapper URLs (FIX) ──────────────────────────
+        # Must run before robots.txt, hls_only filter, and HTTP probing so that
+        # wrapper URLs like https://worldcams.tv/player?url=https://.../stream.m3u8
+        # are resolved to their inner .m3u8 before any validation takes place.
+        candidates = _unwrap_candidates(candidates)
+
         # ── Step 1: robots.txt (per-domain, cached, concurrent) ───────────────
         robots_skill = RobotsPolicySkill()
         domain_map: dict[str, list[CameraCandidate]] = {}
@@ -165,6 +231,8 @@ class ValidationAgent:
         # not a direct .m3u8 stream.  Such URLs require user interaction (e.g.
         # clicking a play button on a web page) and are not automatically playable.
         # This runs before the HTTP probe to avoid wasting requests.
+        # NOTE: after _unwrap_candidates() above, wrapper URLs are already
+        # resolved — the .m3u8 check here applies to the clean inner URL.
         if settings.hls_only:
             hls_allowed = [
                 c for c in allowed
@@ -196,9 +264,6 @@ class ValidationAgent:
             settings.validation_timeout_connect,
             settings.validation_timeout_read,
         )
-        # Build Referer map: url → source_directory so _probe_hls can send the
-        # originating webcam site's URL as the Referer header.  Many CDNs gate
-        # .m3u8 delivery to requests that look like they come from the source site.
         referers = {
             c.url: referer
             for c in allowed
@@ -233,9 +298,6 @@ class ValidationAgent:
             len(allowed) - n_live - n_dead - n_unknown - n_timeout,
         )
 
-        # Log fail_reason breakdown for dead + unknown results so operators can
-        # distinguish token-expiry (http_403), offline (http_404), hotlink (http_403),
-        # no-magic-bytes (no_m3u8_magic), and genuine timeouts.
         fail_reasons = Counter(
             r.fail_reason
             for r in validation_results
@@ -246,9 +308,6 @@ class ValidationAgent:
             logger.info("ValidationAgent: failure reasons — {}", breakdown)
 
         # ── Step 2b: browser second-pass (optional) ───────────────────────────
-        # In the HLS-only pipeline this path is effectively dormant because only
-        # direct .m3u8 candidates survive into validation. It remains available
-        # for future HTML-to-HLS extraction experiments.
         _browser_stream_map: dict[str, str] = {}
 
         if settings.use_browser_validation:
@@ -266,8 +325,6 @@ class ValidationAgent:
                 browser_output = await BrowserValidationSkill().run(browser_targets)
 
                 if browser_output.stream_map:
-                    # Re-probe each discovered stream URL with the standard prober
-                    # so we get proper HLS magic / content-type validation.
                     new_stream_urls = list(browser_output.stream_map.values())
                     new_referers = {
                         stream_url: page_url
@@ -280,14 +337,10 @@ class ValidationAgent:
                     for page_url, stream_url in browser_output.stream_map.items():
                         stream_result = new_url_to_val.get(stream_url)
                         if stream_result and stream_result.status == "live":
-                            # Replace the failed page-probe result with the live
-                            # stream-probe result, keyed by the original page URL.
                             url_to_val[page_url] = stream_result
                             _browser_stream_map[page_url] = stream_url
                             upgraded += 1
 
-                    # Mark pages where the browser detected offline/unavailable
-                    # markers as definitively dead so they are excluded from records.
                     for page_url in browser_output.offline_pages:
                         existing = url_to_val.get(page_url)
                         if existing is not None:
@@ -304,33 +357,18 @@ class ValidationAgent:
                     )
 
         # ── Step 2c: ffprobe frame-level verification (primary status) ──────────
-        # ffprobe is the authoritative stream-status check.  It runs on EVERY
-        # .m3u8 candidate — not just the ones the HTTP probe confirmed as live.
-        # A CDN that returns HTTP 404 for a playlist GET may still serve valid
-        # segments to ffprobe (CDN quirks, IP restrictions, header differences).
-        # ffprobe result overwrites the HTTP probe status unconditionally.
-        #
-        # Status mapping (FfprobeResult.stream_status → CameraRecord.status):
-        #   active_streaming → "live"    (frames decoded, real content + motion)
-        #   active_blank     → "unknown" (frames decoded, blank/frozen content)
-        #   disabled         → "dead"    (playlist reachable, no decodable segments)
-        #   does_not_exist   → "dead"    (DNS/404/connection failure at segment level)
-        #   None (unavailable) → keep HTTP probe status (ffprobe not installed)
         if settings.use_ffprobe_validation:
             from webcam_discovery.skills.ffprobe_validation import FfprobeValidationSkill
 
-            # All candidates here are already .m3u8 (enforced by hls_only filter).
-            # Run ffprobe on every URL — HTTP status is irrelevant at this stage.
             all_hls_urls = [
                 c.url for c in allowed
                 if url_to_val.get(c.url) is not None
             ]
-            # Also check stream URLs discovered by the browser second-pass
             all_hls_urls += [
                 stream_url for stream_url in _browser_stream_map.values()
                 if ".m3u8" in stream_url.lower()
             ]
-            all_hls_urls = list(dict.fromkeys(all_hls_urls))  # dedupe, preserve order
+            all_hls_urls = list(dict.fromkeys(all_hls_urls))
 
             logger.info(
                 "ValidationAgent: running ffprobe on {} HLS URLs "
@@ -360,7 +398,6 @@ class ValidationAgent:
             ]
             _append_jsonl(settings.log_dir / "ffprobe_validation.jsonl", ffprobe_log_rows)
 
-            # Per-URL result log — visible in the terminal for every stream.
             for fp in ffprobe_results:
                 if not fp.ffprobe_available:
                     logger.warning(
@@ -380,7 +417,6 @@ class ValidationAgent:
                     fp.detail,
                 )
 
-            # Apply ffprobe status to url_to_val — this overrides the HTTP status.
             n_live = n_unknown = n_dead = n_skipped = 0
             for page_url, stream_url in list(_browser_stream_map.items()) + [
                 (u, u) for u in all_hls_urls if u not in _browser_stream_map.values()
@@ -394,11 +430,9 @@ class ValidationAgent:
                     continue
 
                 if fp.stream_status is None:
-                    # ffprobe unavailable — preserve HTTP probe status
                     n_skipped += 1
                     continue
 
-                # ffprobe result is authoritative: set the definitive status.
                 camera_status = fp.camera_status or "unknown"
                 fail_reason   = fp.detail if camera_status != "live" else None
                 url_to_val[val_key] = existing.model_copy(
@@ -418,9 +452,6 @@ class ValidationAgent:
             )
 
         # ── Step 3: build record list ─────────────────────────────────────────
-        # Dead streams should never enter the catalog. Unknown streams can still
-        # be retained for review, but confirmed-dead URLs (for example HTTP 404s
-        # or ffprobe-disabled streams) are filtered out here.
         to_enrich: list[tuple[CameraCandidate, object]] = []
         dropped_dead = 0
 
@@ -439,7 +470,6 @@ class ValidationAgent:
                 continue
 
             if not settings.use_ffprobe_validation:
-                # Legacy path: keep the legitimacy gate for non-dead results.
                 min_legit = settings.min_legitimacy
                 if v.status == "unknown" and min_legit != "low":
                     logger.debug(
@@ -475,11 +505,7 @@ class ValidationAgent:
 
         # ── Step 5: build CameraRecord objects ────────────────────────────────
         for (candidate, v), geo in zip(to_enrich, geo_results):
-            # If the browser second-pass discovered a direct stream URL for this
-            # page, store that as the record URL and preserve the original page
-            # URL in source_refs so it remains traceable.
             effective_url = _browser_stream_map.get(candidate.url, candidate.url)
-            # Use effective_url (stream URL) for feed-type classification
             feed_type_result = type_skill.run(FeedTypeInput(
                 url=effective_url,
                 content_type=v.content_type,
@@ -512,8 +538,6 @@ class ValidationAgent:
                 notes = f"{notes} location_unknown".strip()
 
             source_refs = list(candidate.source_refs) if candidate.source_refs else []
-            # If the browser found a stream URL, preserve the original page URL
-            # as the first source reference so operators can trace the source.
             if effective_url != candidate.url and candidate.url not in source_refs:
                 source_refs.insert(0, candidate.url)
 
@@ -571,10 +595,6 @@ class ValidationAgent:
         Validate candidates delivered via an ``asyncio.Queue``, processing them
         in batches as they arrive.
 
-        Used by the streaming pipeline so that validation overlaps with discovery:
-        candidates produced by DirectoryAgent / SearchAgent are validated
-        immediately rather than waiting for all discovery to finish.
-
         The queue must be closed by the producer(s) sending a single ``None``
         sentinel value after all items have been put.
 
@@ -582,16 +602,14 @@ class ValidationAgent:
             queue:      Shared ``asyncio.Queue[CameraCandidate | None]``.
                         ``None`` is the end-of-stream sentinel.
             batch_size: Number of candidates to accumulate before triggering a
-                        validation pass.  Smaller values reduce latency at the
-                        cost of more per-batch overhead (extra robots/HTTP round-
-                        trips).  Default: 100.
+                        validation pass.  Default: 100.
 
         Returns:
             list[CameraRecord] — combined results from all batches.
         """
         pending: list[CameraCandidate] = []
         all_records: list[CameraRecord] = []
-        seen_urls: set[str] = set()  # cross-agent deduplication
+        seen_urls: set[str] = set()
 
         async def flush() -> None:
             if not pending:
@@ -606,12 +624,18 @@ class ValidationAgent:
         while True:
             item: CameraCandidate | None = await queue.get()
             if item is None:
-                # End-of-stream sentinel — flush whatever remains and stop.
                 await flush()
                 break
 
-            if item.url not in seen_urls:
-                seen_urls.add(item.url)
+            # Unwrap before deduplication so wrapper and inner URLs don't both enter
+            clean_url = unwrap_player_url(item.url)
+            if clean_url not in seen_urls:
+                seen_urls.add(clean_url)
+                if clean_url != item.url:
+                    existing_refs = list(item.source_refs) if item.source_refs else []
+                    if item.url not in existing_refs:
+                        existing_refs.insert(0, item.url)
+                    item = item.model_copy(update={"url": clean_url, "source_refs": existing_refs})
                 pending.append(item)
 
             if len(pending) >= batch_size:
@@ -638,16 +662,12 @@ class ValidationAgent:
         Skips Nominatim pre-warm phases entirely.  Calls skill.run() for every
         candidate concurrently via asyncio.gather; GeoEnrichmentSkill._llm_lock
         serialises the underlying Ollama requests at 1 req/s to avoid 429s.
-        Progress is shown as each LLM call completes.
 
         Nominatim mode (use_llm_geodecode=False)
         ----------------------------------------
-        Phase 1 — Pre-warm cache for unique city+country pairs (sequential,
-                  1 req/s Nominatim policy).
-        Phase 2 — Pre-warm cache for unique country names (country-center
-                  fallback).
-        Phase 3 — Concurrent per-candidate resolution; nearly all calls are
-                  instant cache hits.  ip-api.com fallbacks run in parallel.
+        Phase 1 — Pre-warm cache for unique city+country pairs.
+        Phase 2 — Pre-warm cache for unique country names.
+        Phase 3 — Concurrent per-candidate resolution.
 
         Returns results in the same order as `candidates`.
         """
@@ -698,10 +718,7 @@ class ValidationAgent:
             ):
                 await skill._geocode_nominatim(country, cache_key=f"country:{country}")
 
-        # ── Phase 3 (both modes): per-candidate resolution ─────────────────────
-        # LLM mode: calls are serialised inside _geocode_with_llm via _llm_lock
-        #           (1 req/s); tqdm shows each call completing in sequence.
-        # Nominatim mode: nearly all calls are instant cache hits from Phase 1/2.
+        # ── Phase 3: per-candidate resolution ─────────────────────────────────
         geo_desc = (
             f"LLM geocoding ({skill._LLM_INTERVAL:.1f}s/req)"
             if skill._use_llm
