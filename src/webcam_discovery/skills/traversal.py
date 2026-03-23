@@ -3,6 +3,29 @@
 traversal.py — Directory traversal and .m3u8 feed URL extraction from webcam listing pages.
 Part of the Public Webcam Discovery System.
 
+Fixes applied (2026-03-23)
+--------------------------
+FIX: Player-wrapper URL unwrapping added to _normalize_stream_url().
+
+     Some webcam directories (worldcams.tv, etc.) embed the real .m3u8 URL
+     inside a player wrapper URL, e.g.:
+
+       https://worldcams.tv/player?url=https://cdn.example.com/stream.m3u8
+
+     _BROAD_HLS_RE matches the entire wrapper string because it ends in .m3u8,
+     so the wrapper URL was passed to the validator unchanged.  The validator
+     probed the player page (HTML), got no HLS content-type, and dropped the
+     stream as dead — discarding a potentially live feed.
+
+     unwrap_player_url() is now called early in _normalize_stream_url():
+     - Inspects all query-string parameters for values that are themselves
+       valid http(s) URLs containing .m3u8.
+     - Returns the inner .m3u8 URL if found; otherwise returns the input
+       unchanged so normal processing continues.
+     - Handles URL-encoded inner URLs (urllib.parse.unquote).
+     - Exported at module level so ValidationAgent can call it as a
+       pre-processing step on every candidate URL it receives.
+
 Traversal strategy
 ------------------
 DirectoryTraversalSkill fetches a webcam directory's root page and recursively
@@ -24,7 +47,7 @@ import asyncio
 import json
 import re
 from typing import Optional
-from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
+from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse, unquote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -45,6 +68,7 @@ def _make_soup(content: str) -> BeautifulSoup:
         except Exception:
             pass  # lxml not installed or parse error — fall through
     return BeautifulSoup(content, "html.parser")
+
 from loguru import logger
 from pydantic import BaseModel
 
@@ -131,12 +155,73 @@ _STREAM_EXTENSIONS = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next|p=\d+)[^'"]*)['"]""", re.IGNORECASE)
 
 # Broad catch-all: any quoted stream URL regardless of variable name or context.
-_BROAD_HLS_RE   = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
+_BROAD_HLS_RE = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""", re.IGNORECASE)
 
 # Per-source traversal limits — prevent runaway crawls on large directories.
 MAX_PAGES_PER_SOURCE   = 100   # total HTTP GETs per source URL
 MAX_SUB_LINKS_PER_PAGE = 10    # sub-category links to recursively follow per page
 
+# Regex to detect an .m3u8 URL embedded in a query-string parameter value.
+# Matches the inner URL whether it is raw or URL-encoded (%3A%2F%2F).
+_EMBEDDED_HLS_RE = re.compile(
+    r"https?(?:://|%3A%2F%2F).+?\.m3u8",
+    re.IGNORECASE,
+)
+
+
+# ── Player-wrapper URL unwrapping ─────────────────────────────────────────────
+
+def unwrap_player_url(url: str) -> str:
+    """
+    Extract an embedded .m3u8 stream URL from a player-wrapper URL if present.
+
+    Some directories pass the real stream URL as a query-string parameter, e.g.:
+
+        https://worldcams.tv/player?url=https://cdn.example.com/stream.m3u8
+        https://example.com/embed?src=https%3A%2F%2Fcdn.example.com%2Fstream.m3u8
+        https://example.com/play?stream=https://cdn.example.com/live/index.m3u8&autoplay=1
+
+    This function inspects every query-string parameter value for an embedded
+    http(s) URL that contains .m3u8.  If found, that inner URL is returned.
+    If no embedded stream URL is detected the original URL is returned unchanged.
+
+    This is exported at module level so ValidationAgent can call it as a
+    pre-processing step on every candidate URL it receives.
+    """
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+
+    params = parse_qs(parsed.query, keep_blank_values=False)
+    for values in params.values():
+        for value in values:
+            # Decode URL-encoded inner URLs first
+            decoded = unquote(value)
+            if _STREAM_EXTENSIONS.search(decoded) and decoded.startswith("http"):
+                logger.debug(
+                    "unwrap_player_url: extracted inner stream '{}' from '{}'",
+                    decoded, url,
+                )
+                return decoded
+
+    # No embedded stream found — check for URL-encoded form in the raw query
+    # string (handles double-encoded values not caught by parse_qs).
+    m = _EMBEDDED_HLS_RE.search(unquote(url))
+    if m:
+        candidate = m.group(0)
+        # Fix any residual %XX encoding on the inner URL
+        candidate = unquote(candidate)
+        if candidate != url:
+            logger.debug(
+                "unwrap_player_url: regex-extracted inner stream '{}' from '{}'",
+                candidate, url,
+            )
+            return candidate
+
+    return url
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_domain(url: str) -> str:
     """Return the netloc of a URL as a simple string."""
@@ -153,6 +238,9 @@ def _normalize_stream_url(raw: str, base_url: str) -> Optional[str]:
     """
     Normalise extracted stream URLs before validation.
 
+    Step 0 (FIX): Unwrap player-wrapper URLs so the inner .m3u8 URL is
+    extracted before any other normalisation takes place.
+
     Handles common malformed patterns seen in scraped player HTML:
     - JSON-escaped URLs such as ``https:\\/\\/cdn.example/live.m3u8``
     - protocol-relative URLs such as ``//cdn.example/live.m3u8``
@@ -165,17 +253,25 @@ def _normalize_stream_url(raw: str, base_url: str) -> Optional[str]:
     if not candidate:
         return None
 
+    # ── Step 0: unwrap player-wrapper URLs ────────────────────────────────────
+    # Must run before JSON-unescape so that URL-encoded inner URLs are
+    # decoded correctly by unwrap_player_url().
+    candidate = unwrap_player_url(candidate)
+
+    # ── Step 1: JSON-escaped backslashes ──────────────────────────────────────
     if "\\/" in candidate:
         try:
             candidate = json.loads(f'"{candidate}"')
         except Exception:
             candidate = candidate.replace("\\/", "/")
 
+    # ── Step 2: protocol-relative URLs ────────────────────────────────────────
     if candidate.startswith("//"):
         parsed_base = urlparse(base_url)
         scheme = parsed_base.scheme or "https"
         candidate = f"{scheme}:{candidate}"
 
+    # ── Step 3: relative URLs ─────────────────────────────────────────────────
     if not candidate.startswith(("http://", "https://")):
         candidate = _absolute(candidate, base_url)
 
@@ -432,17 +528,29 @@ class FeedExtractionSkill:
         """
         Fetch a page and extract .m3u8 stream URLs.
 
+        The input page_url is unwrapped via unwrap_player_url() before fetching
+        so that player-wrapper URLs (e.g. /player?url=https://.../stream.m3u8)
+        resolve to the inner stream directly.
+
         Args:
             input: FeedExtractionInput with page_url.
 
         Returns:
             FeedExtractionOutput with direct_stream_url and embedded_links (.m3u8 only).
         """
+        # FIX: unwrap player-wrapper URLs before fetching
+        page_url = unwrap_player_url(input.page_url)
+        if page_url != input.page_url:
+            logger.debug(
+                "FeedExtractionSkill: unwrapped '{}' → '{}'",
+                input.page_url, page_url,
+            )
+
         if self._shared_client is not None:
-            return await self._fetch_and_extract(self._shared_client, input.page_url)
+            return await self._fetch_and_extract(self._shared_client, page_url)
 
         async with httpx.AsyncClient(**self._CLIENT_DEFAULTS) as client:
-            return await self._fetch_and_extract(client, input.page_url)
+            return await self._fetch_and_extract(client, page_url)
 
     async def _fetch_and_extract(
         self, client: httpx.AsyncClient, url: str
@@ -458,6 +566,14 @@ class FeedExtractionSkill:
         """
         html = await self._get_html(client, url)
         if html is None:
+            # If the URL itself is a direct .m3u8 (content-type was mpegurl),
+            # return it as the stream directly.
+            if _STREAM_EXTENSIONS.search(url):
+                return FeedExtractionOutput(
+                    direct_stream_url=url,
+                    feed_type_hint="HLS",
+                    embedded_links=[url],
+                )
             return FeedExtractionOutput()
 
         result = self._extract_from_html(html, url)
@@ -523,6 +639,8 @@ class FeedExtractionSkill:
             if not src or src.startswith("javascript"):
                 continue
             abs_src = _absolute(src, base_url) if not src.startswith("http") else src
+            # FIX: also unwrap player-wrapper iframe src URLs
+            abs_src = unwrap_player_url(abs_src)
             parsed = urlparse(abs_src)
             if parsed.scheme not in ("http", "https"):
                 continue
@@ -563,25 +681,23 @@ class FeedExtractionSkill:
             if _STREAM_EXTENSIONS.search(normalized) and normalized not in direct_streams:
                 direct_streams.append(normalized)
 
-        # 1. <source src> and <video src> — covers both nested <source> and
-        #    top-level <video src="..."> which many players use directly.
+        # 1. <source src> and <video src>
         for tag in soup.find_all(["source", "video"]):
             _add_direct(tag.get("src", ""))
 
-        # 2. JS player patterns — collect ALL matches via finditer
+        # 2. JS player patterns
         scripts = " ".join(tag.get_text() for tag in soup.find_all("script"))
         for pattern in (_JW_PLAYER_RE, _HLS_LOAD_RE, _STREAM_VAR_RE):
             for m in pattern.finditer(scripts):
                 _add_direct(m.group(1))
 
-        # 3. data-* attributes — collect ALL matches via finditer
+        # 3. data-* attributes
         for pattern in (_DATA_CAM_RE, _DATA_STREAM_RE, _DATA_SRC_RE):
             for m in pattern.finditer(html):
                 _add_direct(m.group(1))
 
         # 4. Broad catch-all: any quoted .m3u8 URL anywhere in HTML.
-        #    Runs over the full raw HTML so it catches stream URLs in JSON blobs,
-        #    window.__data__ assignments, and any non-standard variable names.
+        #    _normalize_stream_url() will unwrap any player-wrapper URLs found here.
         for m in _BROAD_HLS_RE.finditer(html):
             _add_direct(m.group(1))
 
@@ -590,9 +706,7 @@ class FeedExtractionSkill:
             _add_direct(str(link["href"]))
 
         best_direct = direct_streams[0] if direct_streams else None
-        feed_hint = None
-        if best_direct:
-            feed_hint = "HLS"
+        feed_hint = "HLS" if best_direct else None
 
         if best_direct:
             return FeedExtractionOutput(
