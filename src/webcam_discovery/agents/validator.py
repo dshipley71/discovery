@@ -63,6 +63,22 @@ def _domain_of(url: str) -> str:
     return urlparse(url).netloc.removeprefix("www.")
 
 
+def _candidate_referer(candidate: CameraCandidate) -> Optional[str]:
+    """
+    Return the best available HTTP(S) referer URL for *candidate*.
+
+    ``source_directory`` is sometimes a bare domain and sometimes a full page URL.
+    Prefer a real URL from source_refs when available, otherwise fall back to
+    source_directory only when it already looks like HTTP(S).
+    """
+    for ref in candidate.source_refs:
+        if ref.startswith(("http://", "https://")):
+            return ref
+    if candidate.source_directory and candidate.source_directory.startswith(("http://", "https://")):
+        return candidate.source_directory
+    return None
+
+
 def _make_slug(city: str, label: str) -> str:
     """Generate a stable ID slug from city + label."""
     return slugify(f"{city} {label}", max_length=80, word_boundary=True, separator="-")
@@ -184,9 +200,9 @@ class ValidationAgent:
         # originating webcam site's URL as the Referer header.  Many CDNs gate
         # .m3u8 delivery to requests that look like they come from the source site.
         referers = {
-            c.url: c.source_directory
+            c.url: referer
             for c in allowed
-            if c.source_directory
+            if (referer := _candidate_referer(c)) is not None
         }
         validation_results = await feed_skill.run(
             [c.url for c in allowed], referers=referers

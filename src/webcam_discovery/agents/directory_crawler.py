@@ -149,6 +149,23 @@ class SourcesRegistry:
         """Return {tier: source_count} for diagnostics."""
         return {t: len(v) for t, v in sorted(self._tier_sources.items())}
 
+    def source_domains_for_tier(self, max_tier: int, hls_only: bool = False) -> list[str]:
+        """
+        Return ordered, deduplicated source domains for tiers 1..max_tier.
+
+        This is primarily used by SearchAgent to build site-targeted queries
+        from the canonical SOURCES.md registry instead of hardcoding directory
+        hostnames in multiple places.
+        """
+        seen: set[str] = set()
+        domains: list[str] = []
+        for url in self.sources_for_tier(max_tier=max_tier, hls_only=hls_only):
+            domain = _domain_of(url)
+            if domain and domain not in seen:
+                seen.add(domain)
+                domains.append(domain)
+        return domains
+
     # ── Parsing helpers ───────────────────────────────────────────────────────
 
     def _parse(self) -> None:

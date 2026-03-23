@@ -23,6 +23,7 @@ class QueryGenerationInput(BaseModel):
 
     city: str
     language_codes: list[str] = ["en"]
+    known_domains: list[str] = []
 
 
 class QueryGenerationOutput(BaseModel):
@@ -109,20 +110,25 @@ class QueryGenerationSkill:
         city = input.city
         queries: list[str] = []
 
-        # Core English queries
+        # Core English queries aligned with SOURCES.md patterns.
         queries.extend([
-            f"{city} live webcam m3u8",
-            f"{city} public hls stream webcam",
-            f"{city} traffic camera m3u8",
-            f"{city} tourism webcam m3u8",
-            f"{city} harbor live webcam m3u8",
-            f"{city} airport webcam hls",
-            f"{city} transport authority m3u8",
-            f"{city} open data webcam hls",
-            f"site:windy.com/webcams {city}",
-            f"site:webcamtaxi.com {city}",
-            f"site:skylinewebcams.com {city}",
-            f"site:earthcam.com {city}",
+            f'"live webcam" "{city}" ".m3u8"',
+            f'"public webcam" "{city}" "hls" -login -register -subscribe',
+            f'inurl:webcam OR inurl:livecam "{city}" ".m3u8"',
+            f'"{city}" "traffic camera" ".m3u8"',
+            f'"{city}" municipality webcam hls',
+        ])
+
+        # Known-source site queries from SOURCES.md.
+        for domain in input.known_domains:
+            queries.append(f'site:{domain} "{city}" webcam')
+
+        queries.extend([
+            f'"{city}" tourism webcam ".m3u8"',
+            f'"{city}" harbor webcam ".m3u8"',
+            f'"{city}" airport webcam hls',
+            f'"{city}" transport authority ".m3u8"',
+            f'"{city}" open data webcam hls',
         ])
 
         # Locale-specific queries
@@ -131,18 +137,25 @@ class QueryGenerationSkill:
                 continue
             terms = _LOCALE_TERMS.get(lang, [])
             for term in terms:
-                queries.append(f"{city} {term}")
+                queries.append(f'"{city}" {term} m3u8')
 
         # Government and infrastructure queries
         queries.extend([
-            f"{city} DOT traffic camera",
-            f"{city} municipality live camera",
-            f"{city} 511 traffic feed",
-            f"{city} national weather service camera",
+            f'"{city}" DOT traffic camera ".m3u8"',
+            f'"{city}" 511 traffic feed ".m3u8"',
+            f'"{city}" national weather service camera ".m3u8"',
         ])
 
-        logger.debug("QueryGenerationSkill: {} queries for '{}'", len(queries), city)
-        return QueryGenerationOutput(queries=queries)
+        deduped_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for query in queries:
+            normalized = " ".join(query.split())
+            if normalized not in seen_queries:
+                seen_queries.add(normalized)
+                deduped_queries.append(normalized)
+
+        logger.debug("QueryGenerationSkill: {} queries for '{}'", len(deduped_queries), city)
+        return QueryGenerationOutput(queries=deduped_queries)
 
 
 # ── LocaleNavigationSkill ──────────────────────────────────────────────────────
