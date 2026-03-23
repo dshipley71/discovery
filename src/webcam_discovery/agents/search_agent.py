@@ -24,7 +24,9 @@ import asyncio
 import argparse
 import random
 import re
+import warnings
 from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import AsyncGenerator, Callable, Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
@@ -268,29 +270,50 @@ def _language_codes_for_city(city: str) -> list[str]:
 
 # ── FIX 1 — DDG search via library, not HTML scraping ────────────────────────
 
+_DDG_RENAME_WARNING = (
+    r"This package \(`duckduckgo_search`\) has been renamed to `ddgs`!.*"
+)
+
+
+def _load_ddgs_class() -> tuple[type, bool]:
+    """Return the available DDGS client class and whether it came from the legacy package."""
+    try:
+        return import_module("ddgs").DDGS, False
+    except ImportError:
+        try:
+            return import_module("duckduckgo_search").DDGS, True
+        except ImportError as exc:
+            raise RuntimeError(
+                "Neither ddgs nor duckduckgo-search is installed.  "
+                "Add it to pyproject.toml: ddgs>=9.0"
+            ) from exc
+
+
 async def _duckduckgo_search(query: str) -> list[str]:
     """
     Execute a DuckDuckGo search and return result URLs.
 
-    Uses the duckduckgo-search PyPI package (DDGS) which handles DDG's
-    anti-bot measures internally.  Falls back gracefully on any error.
-
-    NOTE: DDGS.text() is synchronous; run in an executor to avoid blocking
-    the event loop.
+    Prefers the renamed `ddgs` PyPI package and falls back to the legacy
+    `duckduckgo-search` package when needed.  NOTE: DDGS.text() is
+    synchronous; run it in an executor to avoid blocking the event loop.
     """
-    try:
-        from duckduckgo_search import DDGS  # type: ignore[import]
-    except ImportError:
-        raise RuntimeError(
-            "duckduckgo-search is not installed.  "
-            "Add it to pyproject.toml: duckduckgo-search>=6.0"
-        )
+    DDGS, using_legacy_package = _load_ddgs_class()
 
     loop = asyncio.get_event_loop()
     try:
+        def _run_search() -> list[dict]:
+            with warnings.catch_warnings():
+                if using_legacy_package:
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=_DDG_RENAME_WARNING,
+                        category=RuntimeWarning,
+                    )
+                return list(DDGS().text(query, max_results=10))
+
         results: list[dict] = await loop.run_in_executor(
             None,
-            lambda: list(DDGS().text(query, max_results=10)),
+            _run_search,
         )
         urls: list[str] = []
         for r in results:
@@ -508,7 +531,7 @@ class SearchAgent:
         for query in queries:
             async with search_semaphore:
                 try:
-                    urls = await _duckduckgo_search(client, query)
+                    urls = await _duckduckgo_search(query)
                 except DuckDuckGoSearchBlocked as exc:
                     self._duckduckgo_available = False
                     logger.warning("SearchAgent: {}", exc)
