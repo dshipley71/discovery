@@ -10,7 +10,7 @@ import argparse
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncGenerator, Iterable
+from typing import AsyncGenerator, Callable, Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
@@ -311,6 +311,7 @@ class SearchAgent:
         *,
         blocked_locations: Iterable[str] | None = None,
         blocked_locations_file: Path | None = None,
+        stream_reporter: Callable[[str], None] | None = None,
         show_progress: bool = True,
     ) -> None:
         self._duckduckgo_available = True
@@ -318,15 +319,56 @@ class SearchAgent:
         if blocked_locations_file is not None:
             entries.extend(blocked_locations_file.read_text(encoding="utf-8").splitlines())
         self._blocked_locations = BlockedLocationRules.from_entries(entries)
+        self._stream_reporter = stream_reporter
         self._show_progress = show_progress
 
     @staticmethod
-    def _progress_message(progress: tqdm, city: str, hls_count: int) -> str:
+    def _progress_message(
+        progress: tqdm,
+        city: str,
+        hls_count: int,
+        city_index: int,
+        city_total: int,
+    ) -> str:
         """Build a short tqdm postfix string with city, HLS count, and ETA."""
         remaining = progress.total - progress.n if progress.total is not None else 0
         rate = progress.format_dict.get("rate") or 0
         eta_seconds = int(remaining / rate) if rate else 0
-        return f"city={city[:20]} hls={hls_count} eta={eta_seconds}s"
+        return (
+            f"city={city[:18]} city={city_index}/{city_total} "
+            f"hls={hls_count} eta={eta_seconds}s"
+        )
+
+    def _build_city_plan(
+        self,
+        tier: int,
+        query_skill: QueryGenerationSkill,
+        *,
+        log_skips: bool = False,
+    ) -> list[tuple[str, list[str]]]:
+        """Precompute the city/query plan so progress totals have a stable denominator."""
+        planned: list[tuple[str, list[str]]] = []
+        for city in _CITY_TIERS.get(tier, TIER1_CITIES):
+            if self._blocked_locations.should_block(city=city):
+                if log_skips:
+                    logger.info("SearchAgent: skipping blocked city '{}'", city)
+                continue
+            output = query_skill.run(
+                QueryGenerationInput(
+                    city=city,
+                    language_codes=_language_codes_for_city(city),
+                    known_domains=list(KNOWN_SOURCE_DOMAINS),
+                )
+            )
+            planned.append((city, output.queries[: self.MAX_QUERIES_PER_CITY]))
+        return planned
+
+    def _report_hls_stream(self, stream_url: str) -> None:
+        """Report a discovered HLS stream without introducing warning noise."""
+        if self._stream_reporter is not None:
+            self._stream_reporter(stream_url)
+            return
+        logger.info("SearchAgent: HLS stream {}", stream_url)
 
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
         """Collect the streaming search results into a list."""
@@ -340,8 +382,13 @@ class SearchAgent:
                 seen_urls.add(c.url)
                 unique_candidates.append(c)
 
-        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
-        logger.info("SearchAgent: tier={} → {} unique candidates from {} cities", tier, len(unique_candidates), len(cities))
+        planned_cities = len(self._build_city_plan(tier, QueryGenerationSkill()))
+        logger.info(
+            "SearchAgent: tier={} → {} unique candidates from {} planned cities",
+            tier,
+            len(unique_candidates),
+            planned_cities,
+        )
         return unique_candidates
 
     async def stream(self, tier: int = 1) -> AsyncGenerator[CameraCandidate, None]:
@@ -358,15 +405,16 @@ class SearchAgent:
         Yields:
             CameraCandidate objects, deduplicated by URL across all emitted cities.
         """
-        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
         query_skill = QueryGenerationSkill()
+        city_plan = self._build_city_plan(tier, query_skill, log_skips=True)
         search_semaphore = asyncio.Semaphore(self.CONCURRENCY)
         page_semaphore = asyncio.Semaphore(self.RESULT_PAGE_CONCURRENCY)
         seen_urls: set[str] = set()
+        total_queries = sum(len(queries) for _, queries in city_plan)
         progress = tqdm(
-            total=len(cities),
-            desc="SearchAgent cities",
-            unit="city",
+            total=total_queries,
+            desc="SearchAgent queries",
+            unit="query",
             dynamic_ncols=True,
             disable=not self._show_progress,
         )
@@ -377,12 +425,16 @@ class SearchAgent:
                 follow_redirects=True,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
             ) as client:
-                for city in cities:
-                    progress.set_postfix_str(self._progress_message(progress, city, len(seen_urls)))
-                    if self._blocked_locations.should_block(city=city):
-                        logger.info("SearchAgent: skipping blocked city '{}'", city)
-                        progress.update(1)
-                        continue
+                for city_index, (city, queries) in enumerate(city_plan, start=1):
+                    progress.set_postfix_str(
+                        self._progress_message(
+                            progress,
+                            city,
+                            len(seen_urls),
+                            city_index,
+                            len(city_plan),
+                        )
+                    )
                     if not self._duckduckgo_available:
                         logger.warning(
                             "SearchAgent.stream: stopping early because DuckDuckGo is unavailable"
@@ -390,11 +442,15 @@ class SearchAgent:
                         break
                     try:
                         city_candidates = await self._search_city(
-                            client, city, query_skill, search_semaphore, page_semaphore
+                            client=client,
+                            city=city,
+                            queries=queries,
+                            search_semaphore=search_semaphore,
+                            page_semaphore=page_semaphore,
+                            on_query_complete=lambda: progress.update(1),
                         )
                     except Exception as exc:
                         logger.warning("SearchAgent.stream: error for city '{}': {}", city, exc)
-                        progress.update(1)
                         continue
 
                     emitted_for_city = 0
@@ -402,11 +458,17 @@ class SearchAgent:
                         if c.url not in seen_urls:
                             seen_urls.add(c.url)
                             emitted_for_city += 1
+                            self._report_hls_stream(c.url)
                             progress.set_postfix_str(
-                                self._progress_message(progress, city, len(seen_urls))
+                                self._progress_message(
+                                    progress,
+                                    city,
+                                    len(seen_urls),
+                                    city_index,
+                                    len(city_plan),
+                                )
                             )
                             yield c
-                    progress.update(1)
                     logger.info(
                         "SearchAgent: city '{}' complete — {} new HLS stream(s), {} total",
                         city,
@@ -418,27 +480,19 @@ class SearchAgent:
 
         logger.info(
             "SearchAgent.stream: finished — {} unique HLS candidates emitted from {} cities",
-            len(seen_urls), len(cities),
+            len(seen_urls), len(city_plan),
         )
 
     async def _search_city(
         self,
         client: httpx.AsyncClient,
         city: str,
-        query_skill: QueryGenerationSkill,
+        queries: list[str],
         search_semaphore: asyncio.Semaphore,
         page_semaphore: asyncio.Semaphore,
+        on_query_complete: Callable[[], None] | None = None,
     ) -> list[CameraCandidate]:
         """Generate queries for one city, search DuckDuckGo, and extract direct HLS URLs."""
-        output = query_skill.run(
-            QueryGenerationInput(
-                city=city,
-                language_codes=_language_codes_for_city(city),
-                known_domains=list(KNOWN_SOURCE_DOMAINS),
-            )
-        )
-        queries = output.queries[: self.MAX_QUERIES_PER_CITY]
-
         extraction_skill = FeedExtractionSkill(client=client)
         page_candidates: list[CameraCandidate] = []
         direct_candidates: list[CameraCandidate] = []
@@ -454,6 +508,9 @@ class SearchAgent:
                     self._duckduckgo_available = False
                     logger.warning("SearchAgent: {}", exc)
                     break
+                finally:
+                    if on_query_complete is not None:
+                        on_query_complete()
                 await asyncio.sleep(0.5)  # polite delay between requests
 
             for url in urls[: self.MAX_RESULTS_PER_QUERY]:
@@ -551,7 +608,6 @@ class SearchAgent:
                     }
                 )
             )
-            logger.info("SearchAgent: HLS stream {}", stream_url)
 
         return results
 
@@ -573,7 +629,6 @@ class SearchAgent:
         ):
             logger.info("SearchAgent: blocked HLS stream {}", url)
             return None
-        logger.info("SearchAgent: HLS stream {}", url)
         return candidate
 
 
@@ -615,6 +670,7 @@ def main() -> None:
         SearchAgent(
             blocked_locations=args.blocked_location,
             blocked_locations_file=args.blocked_locations_file,
+            stream_reporter=tqdm.write,
             show_progress=not args.no_progress,
         ).run(tier=args.tier)
     )

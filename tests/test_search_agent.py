@@ -157,6 +157,39 @@ def test_search_agent_filters_blocked_locations_from_cli_and_file(
     assert urls == ["https://allowed.example/live/master.m3u8"]
 
 
+def test_search_agent_reports_successful_hls_streams(
+    monkeypatch,
+) -> None:
+    reported: list[str] = []
+
+    async def exercise() -> list[str]:
+        agent = SearchAgent(
+            stream_reporter=reported.append,
+            show_progress=False,
+        )
+
+        async def fake_search(client, query):  # noqa: ANN001
+            if "Tokyo" not in query:
+                return []
+            return ["https://allowed.example/live/master.m3u8"]
+
+        monkeypatch.setattr(
+            "webcam_discovery.agents.search_agent._CITY_TIERS",
+            {1: ["Tokyo"]},
+        )
+        monkeypatch.setattr(
+            "webcam_discovery.agents.search_agent._duckduckgo_search",
+            fake_search,
+        )
+
+        return [candidate.url for candidate in await agent.run(tier=1)]
+
+    urls = asyncio.run(exercise())
+
+    assert urls == ["https://allowed.example/live/master.m3u8"]
+    assert reported == ["https://allowed.example/live/master.m3u8"]
+
+
 def test_map_agent_copies_template_to_output(tmp_path) -> None:
     output_dir = tmp_path / "out"
     map_path = MapAgent(output_dir=output_dir).run()
