@@ -1,7 +1,10 @@
 import asyncio
 
 from webcam_discovery.agents.map_agent import MapAgent
-from webcam_discovery.agents.search_agent import SearchAgent
+from webcam_discovery.agents.search_agent import (
+    DuckDuckGoSearchBlocked,
+    SearchAgent,
+)
 from webcam_discovery.skills.search import QueryGenerationInput, QueryGenerationSkill
 from webcam_discovery.skills.traversal import FeedExtractionOutput
 
@@ -68,6 +71,35 @@ def test_search_agent_extracts_direct_hls_candidates(
         "https://streams.example/direct/live.m3u8",
         "https://cdn.example/tokyo-harbor/master.m3u8",
     }
+
+
+def test_search_agent_stops_after_duckduckgo_block(
+    monkeypatch,
+) -> None:
+    async def exercise() -> tuple[list[str], bool]:
+        agent = SearchAgent()
+        seen_queries: list[str] = []
+
+        async def fake_search(client, query):  # noqa: ANN001
+            seen_queries.append(query)
+            raise DuckDuckGoSearchBlocked("anti-bot page")
+
+        monkeypatch.setattr(
+            "webcam_discovery.agents.search_agent._CITY_TIERS",
+            {1: ["Tokyo", "Paris"]},
+        )
+        monkeypatch.setattr(
+            "webcam_discovery.agents.search_agent._duckduckgo_search",
+            fake_search,
+        )
+
+        results = await agent.run(tier=1)
+        return seen_queries, results == []
+
+    seen_queries, empty_results = asyncio.run(exercise())
+
+    assert empty_results is True
+    assert len(seen_queries) == 1
 
 
 def test_map_agent_copies_template_to_output(tmp_path) -> None:

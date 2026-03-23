@@ -91,6 +91,10 @@ _CITY_TIERS: dict[int, list[str]] = {
 }
 
 
+class DuckDuckGoSearchBlocked(RuntimeError):
+    """Raised when DuckDuckGo is unavailable due to anti-bot or upstream blocking."""
+
+
 def _domain_of(url: str) -> str:
     """Extract domain from URL, stripping a 'www.' prefix if present."""
     return urlparse(url).netloc.removeprefix("www.")
@@ -143,6 +147,10 @@ async def _duckduckgo_search(
                 "Referer": "https://duckduckgo.com/",
             },
         )
+        if resp.status_code in {401, 403, 429}:
+            raise DuckDuckGoSearchBlocked(
+                f"DuckDuckGo returned HTTP {resp.status_code} for query {query!r}"
+            )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         urls: list[str] = []
@@ -154,13 +162,17 @@ async def _duckduckgo_search(
                     seen.add(href)
                     urls.append(href)
         if not urls and ("anomaly" in resp.text.lower() or "captcha" in resp.text.lower()):
-            logger.warning("DuckDuckGo returned an anti-bot page for query '{}'", query)
+            raise DuckDuckGoSearchBlocked(
+                f"DuckDuckGo returned an anti-bot page for query {query!r}"
+            )
         return urls
+    except DuckDuckGoSearchBlocked:
+        raise
     except httpx.HTTPError as exc:
-        logger.warning("DuckDuckGo search failed for '{}': {}", query, exc)
+        logger.warning("DuckDuckGo search failed for '{}': {}", query, repr(exc))
         return []
     except Exception as exc:
-        logger.warning("DuckDuckGo parse error for '{}': {}", query, exc)
+        logger.warning("DuckDuckGo parse error for '{}': {}", query, repr(exc))
         return []
 
 
@@ -175,39 +187,12 @@ class SearchAgent:
     MAX_RESULTS_PER_QUERY = 8
     RESULT_PAGE_CONCURRENCY = 10
 
+    def __init__(self) -> None:
+        self._duckduckgo_available = True
+
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
-        """
-        Generate and execute search queries for each Tier-N city.
-
-        Args:
-            tier: City tier to search (1 = Tier 1 cities only).
-
-        Returns:
-            list[CameraCandidate] — camera candidates from search results.
-        """
-        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
-        query_skill = QueryGenerationSkill()
-        candidates: list[CameraCandidate] = []
-
-        search_semaphore = asyncio.Semaphore(self.CONCURRENCY)
-        page_semaphore = asyncio.Semaphore(self.RESULT_PAGE_CONCURRENCY)
-
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
-        ) as client:
-            tasks = [
-                self._search_city(client, city, query_skill, search_semaphore, page_semaphore)
-                for city in cities
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for city, result in zip(cities, results):
-            if isinstance(result, Exception):
-                logger.warning("SearchAgent: error for city '{}': {}", city, result)
-            else:
-                candidates.extend(result)
+        """Collect the streaming search results into a list."""
+        candidates = [candidate async for candidate in self.stream(tier=tier)]
 
         # Deduplicate by URL
         seen_urls: set[str] = set()
@@ -217,10 +202,8 @@ class SearchAgent:
                 seen_urls.add(c.url)
                 unique_candidates.append(c)
 
-        logger.info(
-            "SearchAgent: tier={} → {} unique candidates from {} cities",
-            tier, len(unique_candidates), len(cities),
-        )
+        cities = _CITY_TIERS.get(tier, TIER1_CITIES)
+        logger.info("SearchAgent: tier={} → {} unique candidates from {} cities", tier, len(unique_candidates), len(cities))
         return unique_candidates
 
     async def stream(self, tier: int = 1) -> AsyncGenerator[CameraCandidate, None]:
@@ -249,6 +232,11 @@ class SearchAgent:
             headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
         ) as client:
             for city in cities:
+                if not self._duckduckgo_available:
+                    logger.warning(
+                        "SearchAgent.stream: stopping early because DuckDuckGo is unavailable"
+                    )
+                    break
                 try:
                     city_candidates = await self._search_city(
                         client, city, query_skill, search_semaphore, page_semaphore
@@ -291,8 +279,15 @@ class SearchAgent:
         seen_pages: set[str] = set()
 
         for query in queries:
+            if not self._duckduckgo_available:
+                break
             async with search_semaphore:
-                urls = await _duckduckgo_search(client, query)
+                try:
+                    urls = await _duckduckgo_search(client, query)
+                except DuckDuckGoSearchBlocked as exc:
+                    self._duckduckgo_available = False
+                    logger.warning("SearchAgent: {}", exc)
+                    break
                 await asyncio.sleep(0.5)  # polite delay between requests
 
             for url in urls[: self.MAX_RESULTS_PER_QUERY]:
