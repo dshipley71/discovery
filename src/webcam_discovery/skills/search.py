@@ -2,6 +2,17 @@
 """
 search.py — Search query generation, locale-aware URL traversal, and new source discovery.
 Part of the Public Webcam Discovery System.
+
+Fixes applied (2026-03-23)
+--------------------------
+FIX 2: Removed ".m3u8" from all query strings.
+        Search engines index page text, not JS source — .m3u8 never appears
+        in page titles or body copy.  Queries now target watch pages; stream
+        URL extraction is delegated entirely to FeedExtractionSkill.
+
+FIX 4: Locale-specific queries now appear BEFORE site: queries so they are
+        never truncated by SearchAgent.MAX_QUERIES_PER_CITY=12.
+        Previously locale queries were appended last and always cut off.
 """
 from __future__ import annotations
 
@@ -59,6 +70,8 @@ class SourceDiscoveryOutput(BaseModel):
 
 
 # ── Language-specific search terms ────────────────────────────────────────────
+# FIX 2: All terms are natural-language page-discovery phrases.
+# ".m3u8" and "hls" tokens removed — they never appear in indexed page text.
 
 _LOCALE_TERMS: dict[str, list[str]] = {
     "ja": ["ライブカメラ 公開", "観光 ライブカメラ", "国道 カメラ", "リアルタイム カメラ"],
@@ -99,53 +112,64 @@ class QueryGenerationSkill:
 
     def run(self, input: QueryGenerationInput) -> QueryGenerationOutput:
         """
-        Generate English, locale-specific, and government/infrastructure queries.
+        Generate queries in priority order:
+          1. Core English watch-page queries  (always included)
+          2. Locale-specific queries          (FIX 4: before site: so never truncated)
+          3. Government / infrastructure      (FIX 4: before site:)
+          4. Known-source site: queries       (JS-gated domains already excluded
+                                              by caller passing SEARCH_SAFE_DOMAINS)
+          5. Supplemental English             (lower priority, may be truncated)
 
-        Args:
-            input: QueryGenerationInput with city and language_codes.
-
-        Returns:
-            QueryGenerationOutput with queries list.
+        FIX 2: No query contains ".m3u8" or "hls" — those tokens do not appear
+        in indexed page text and produce zero results.  Stream URL extraction is
+        handled entirely by FeedExtractionSkill after the watch page is fetched.
         """
         city = input.city
         queries: list[str] = []
 
-        # Core English queries aligned with SOURCES.md patterns.
+        # ── 1. Core English queries ───────────────────────────────────────────
+        # Target watch/listing pages — NOT stream files.
         queries.extend([
-            f'"live webcam" "{city}" ".m3u8"',
-            f'"public webcam" "{city}" "hls" -login -register -subscribe',
-            f'inurl:webcam OR inurl:livecam "{city}" ".m3u8"',
-            f'"{city}" "traffic camera" ".m3u8"',
-            f'"{city}" municipality webcam hls',
+            f'"{city}" live webcam public',
+            f'"{city}" webcam live stream outdoor',
+            f'inurl:webcam "{city}" live',
+            f'inurl:livecam "{city}"',
+            f'"{city}" traffic camera live public',
+            f'"{city}" municipality webcam public',
         ])
 
-        # Known-source site queries from SOURCES.md.
-        for domain in input.known_domains:
-            queries.append(f'site:{domain} "{city}" webcam')
-
-        queries.extend([
-            f'"{city}" tourism webcam ".m3u8"',
-            f'"{city}" harbor webcam ".m3u8"',
-            f'"{city}" airport webcam hls',
-            f'"{city}" transport authority ".m3u8"',
-            f'"{city}" open data webcam hls',
-        ])
-
-        # Locale-specific queries
+        # ── 2. Locale-specific queries (FIX 4: run BEFORE site: queries) ─────
         for lang in input.language_codes:
             if lang == "en":
                 continue
             terms = _LOCALE_TERMS.get(lang, [])
-            for term in terms:
-                queries.append(f'"{city}" {term} m3u8')
+            # Take up to 2 terms per language to stay within MAX_QUERIES_PER_CITY
+            for term in terms[:2]:
+                queries.append(f'"{city}" {term}')
 
-        # Government and infrastructure queries
+        # ── 3. Government / infrastructure (FIX 4: run BEFORE site: queries) ─
         queries.extend([
-            f'"{city}" DOT traffic camera ".m3u8"',
-            f'"{city}" 511 traffic feed ".m3u8"',
-            f'"{city}" national weather service camera ".m3u8"',
+            f'"{city}" DOT traffic camera live',
+            f'"{city}" 511 traffic feed live',
+            f'"{city}" national weather service camera',
         ])
 
+        # ── 4. Known-source site: queries ─────────────────────────────────────
+        # Caller (SearchAgent) passes SEARCH_SAFE_DOMAINS — JS-gated sources
+        # (EarthCam, SkylineWebcams, etc.) are already excluded (FIX 3).
+        for domain in input.known_domains:
+            queries.append(f'site:{domain} "{city}"')
+
+        # ── 5. Supplemental English (lower priority) ──────────────────────────
+        queries.extend([
+            f'"{city}" tourism webcam live',
+            f'"{city}" harbor port webcam live',
+            f'"{city}" airport webcam live',
+            f'"{city}" transport authority camera live',
+            f'"{city}" open data camera feed',
+        ])
+
+        # Deduplicate while preserving order
         deduped_queries: list[str] = []
         seen_queries: set[str] = set()
         for query in queries:
@@ -154,7 +178,10 @@ class QueryGenerationSkill:
                 seen_queries.add(normalized)
                 deduped_queries.append(normalized)
 
-        logger.debug("QueryGenerationSkill: {} queries for '{}'", len(deduped_queries), city)
+        logger.debug(
+            "QueryGenerationSkill: {} queries for '{}' (langs={})",
+            len(deduped_queries), city, input.language_codes,
+        )
         return QueryGenerationOutput(queries=deduped_queries)
 
 
@@ -182,7 +209,13 @@ class LocaleNavigationSkill:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(10.0),
                 follow_redirects=True,
-                headers={"User-Agent": "WebcamDiscoveryBot/1.0"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                },
             ) as client:
                 resp = await client.get(input.source_url)
                 if resp.status_code != 200:
@@ -198,7 +231,6 @@ class LocaleNavigationSkill:
                     if link_domain != base_domain:
                         continue
 
-                    # Check if the link text or URL path contains navigation terms
                     combined = (text + " " + href).lower()
                     if any(term.lower() in combined for term in nav_terms):
                         camera_links.append(abs_href)
@@ -241,7 +273,6 @@ class SourceDiscoverySkill:
             except Exception:
                 continue
 
-        # Only flag domains appearing multiple times as potential cam directories
         candidate_sources: list[dict] = []
         for domain, count in domain_counts.items():
             if count >= 2:
@@ -267,5 +298,5 @@ if __name__ == "__main__":
     city = sys.argv[1] if len(sys.argv) > 1 else "Tokyo"
     skill = QueryGenerationSkill()
     result = skill.run(QueryGenerationInput(city=city, language_codes=["en", "ja"]))
-    for q in result.queries:
-        logger.info("  {}", q)
+    for i, q in enumerate(result.queries, 1):
+        logger.info("  {:2d}. {}", i, q)
