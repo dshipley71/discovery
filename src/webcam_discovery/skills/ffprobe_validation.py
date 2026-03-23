@@ -51,6 +51,7 @@ from typing import Literal, Optional
 
 from loguru import logger
 from pydantic import BaseModel
+from tqdm import tqdm
 
 
 # ── Types ─────────────────────────────────────────────────────────────────────
@@ -140,7 +141,13 @@ class FfprobeValidationSkill:
         """
         self._concurrency = concurrency
 
-    async def run(self, urls: list[str]) -> list[FfprobeResult]:
+    async def run(
+        self,
+        urls: list[str],
+        *,
+        show_progress: bool = True,
+        progress_desc: str = "ffprobe",
+    ) -> list[FfprobeResult]:
         """
         Probe each URL with ffprobe and return one FfprobeResult per input URL.
 
@@ -166,8 +173,27 @@ class FfprobeValidationSkill:
             ]
 
         sem = asyncio.Semaphore(self._concurrency)
-        tasks = [self._probe_url(url, sem) for url in urls]
-        return list(await asyncio.gather(*tasks))
+        results: list[Optional[FfprobeResult]] = [None] * len(urls)
+        tasks = [
+            asyncio.create_task(self._probe_index(idx, url, sem))
+            for idx, url in enumerate(urls)
+        ]
+
+        iterator = asyncio.as_completed(tasks)
+        if show_progress and tasks:
+            iterator = tqdm(
+                iterator,
+                total=len(tasks),
+                desc=progress_desc,
+                unit="url",
+                dynamic_ncols=True,
+            )
+
+        for completed in iterator:
+            idx, result = await completed
+            results[idx] = result
+
+        return [result for result in results if result is not None]
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -183,6 +209,15 @@ class FfprobeValidationSkill:
             return proc.returncode == 0
         except FileNotFoundError:
             return False
+
+    async def _probe_index(
+        self,
+        idx: int,
+        url: str,
+        sem: asyncio.Semaphore,
+    ) -> tuple[int, FfprobeResult]:
+        """Return the original URL index alongside its ffprobe result."""
+        return idx, await self._probe_url(url, sem)
 
     async def _probe_url(self, url: str, sem: asyncio.Semaphore) -> FfprobeResult:
         """Run ffprobe + frame sampling for one URL under the semaphore."""
