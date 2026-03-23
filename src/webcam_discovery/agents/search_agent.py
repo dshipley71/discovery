@@ -508,7 +508,7 @@ class SearchAgent:
         for query in queries:
             async with search_semaphore:
                 try:
-                    urls = await _duckduckgo_search(client, query)
+                    urls = await _duckduckgo_search(query)
                 except DuckDuckGoSearchBlocked as exc:
                     self._duckduckgo_available = False
                     logger.warning("SearchAgent: {}", exc)
