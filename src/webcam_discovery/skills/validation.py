@@ -20,6 +20,16 @@ Concurrency: asyncio.Semaphore(settings.validation_concurrency) — default 50.
 Timeout:     connect=10 s, read=25 s.
 Retry:       1 automatic retry (2 s back-off) on timeout.
 User-Agent:  Browser-like string to avoid bot-blocking.
+
+Fixes applied (2026-03-23)
+--------------------------
+unwrap_player_url() is called at the top of _dispatch() as a final safety net.
+
+The primary unwrap happens in ValidationAgent._unwrap_candidates() before any
+candidates reach this skill.  This second unwrap in _dispatch() covers edge
+cases where wrapper URLs enter FeedValidationSkill directly — for example,
+from MaintenanceAgent re-checking catalog entries stored before the fix was
+applied, or from any future caller that bypasses ValidationAgent.
 """
 from __future__ import annotations
 
@@ -35,6 +45,7 @@ from pydantic import BaseModel
 from tqdm.asyncio import tqdm_asyncio
 
 from webcam_discovery.schemas import CameraStatus, FeedType, LegitimacyScore
+from webcam_discovery.skills.traversal import unwrap_player_url   # ← FIX: import unwrapper
 
 
 # ── I/O Models ────────────────────────────────────────────────────────────────
@@ -91,28 +102,21 @@ _AUTH_URL_RE    = re.compile(
     re.IGNORECASE,
 )
 
-# Broad catch-all patterns for scanning raw HTML bodies.
-# 1. Quoted string containing a stream URL (original)
 _BROAD_HLS_RE    = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""",  re.IGNORECASE)
-# 2. JSON key-value pairs: "hlsUrl": "https://..." or 'streamUrl': '...'
 _JSON_HLS_RE     = re.compile(
     r'"(?:url|src|stream|hls|hlsUrl|hlsSrc|m3u8|streamUrl|videoUrl|liveUrl|'
     r'feedUrl|playbackUrl|mediaUrl|contentUrl|manifestUrl)"\s*:\s*"([^"]{4,500}\.m3u8[^"]{0,100})"',
     re.IGNORECASE,
 )
-# 3. data-* HTML attribute values
 _DATA_ATTR_HLS_RE = re.compile(
     r'data-(?:src|stream|url|hls|m3u8|video|live|feed|manifest)\s*=\s*["\']([^"\']{4,500}\.m3u8[^"\']{0,100})["\']',
     re.IGNORECASE,
 )
-# 4. Bare JS variable assignments: var hlsUrl = "https://..."
 _JS_VAR_HLS_RE   = re.compile(
     r'(?:var|let|const)\s+\w*(?:hls|stream|url|src|m3u8|video|live|feed)\w*\s*=\s*["\']([^"\']{4,500}\.m3u8[^"\']{0,100})["\']',
     re.IGNORECASE,
 )
 
-# Text markers that indicate a camera is currently offline / unavailable.
-# Detect these to avoid wasting time probing dead cameras and to give a clearer fail_reason.
 _OFFLINE_MARKERS_RE = re.compile(
     r'\b(?:camera\s+(?:is\s+)?(?:offline|unavailable|disabled|not\s+available)|'
     r'stream\s+(?:is\s+)?(?:offline|unavailable)|'
@@ -121,7 +125,6 @@ _OFFLINE_MARKERS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Content-type substrings that indicate a live stream is being served directly.
 _LIVE_CONTENT_TYPES = (
     "application/x-mpegurl",
     "application/vnd.apple.mpegurl",
@@ -155,10 +158,7 @@ class FeedValidationSkill:
 
         Args:
             urls:     Candidate URLs to validate.
-            referers: Optional mapping of url → Referer header value.  When
-                      provided, the Referer is sent with HLS requests so that
-                      CDN hotlink-protection rules (which gate .m3u8 delivery
-                      to the originating webcam site) pass correctly.
+            referers: Optional mapping of url → Referer header value.
 
         Returns:
             list[ValidationResult] in the same order as urls.
@@ -213,11 +213,22 @@ class FeedValidationSkill:
         """
         Route each URL to the HLS prober or reject it immediately.
 
+        FIX: unwrap_player_url() is called first so that any player-wrapper
+        URL that reaches this method directly (bypassing ValidationAgent's
+        pre-processing pass) is resolved to its inner .m3u8 before probing.
+
         Only direct `.m3u8` URLs are valid inputs for this system.
         """
-        # Reject URLs without a valid HTTP/HTTPS scheme — httpx raises a
-        # ValueError for protocol-relative (//…) or bare paths, which would
-        # otherwise surface as cryptic exceptions.
+        # ── FIX: unwrap player-wrapper URLs before any other check ────────────
+        clean_url = unwrap_player_url(url)
+        if clean_url != url:
+            logger.debug(
+                "FeedValidationSkill._dispatch: unwrapped '{}' → '{}'",
+                url, clean_url,
+            )
+            url = clean_url
+
+        # Reject URLs without a valid HTTP/HTTPS scheme.
         if not url.lower().startswith(("http://", "https://")):
             return ValidationResult(
                 url=url,
@@ -252,11 +263,6 @@ class FeedValidationSkill:
 
         Master playlist (#EXT-X-STREAM-INF) → playlist_type='master', variant_streams extracted.
         Media playlist  (#EXTINF / #EXT-X-TARGETDURATION) → playlist_type='media'.
-
-        Args:
-            referer: If provided, sent as the HTTP ``Referer`` header so that
-                     CDN hotlink-protection rules (which restrict .m3u8 delivery
-                     to requests originating from the source webcam site) pass.
         """
         extra_headers = {"Referer": referer} if referer else {}
         try:
@@ -289,7 +295,6 @@ class FeedValidationSkill:
 
             content = buf.decode("utf-8", errors="replace")
 
-            # Classify playlist type
             is_master = "#EXT-X-STREAM-INF" in content
             is_media  = "#EXTINF" in content or "#EXT-X-TARGETDURATION" in content
 
@@ -313,7 +318,6 @@ class FeedValidationSkill:
                                 break
             elif is_media:
                 playlist_type = "media"
-
 
             return ValidationResult(
                 url=url, status_code=200, content_type=ct or None,
