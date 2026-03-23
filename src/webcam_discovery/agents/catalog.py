@@ -23,7 +23,7 @@ from webcam_discovery.skills.catalog import (
     GeoJSONExportSkill,
     GeoJSONExportInput,
 )
-from webcam_discovery.skills.map_rendering import MapRenderingSkill, MapRenderingInput
+from webcam_discovery.agents.map_agent import MapAgent
 
 
 class CatalogAgent:
@@ -122,13 +122,12 @@ class CatalogAgent:
                 logger.info("CatalogAgent: snapshot written to '{}'", snapshot_path)
 
         # Step 5: Regenerate map.html
-        map_path = output_dir / "map.html"
-        map_skill = MapRenderingSkill()
-        map_result = map_skill.run(MapRenderingInput(
-            geojson_path=geojson_path,
-            output_path=map_path,
-        ))
-        logger.info("CatalogAgent: map.html written to '{}' ({} cameras)", map_result.path, map_result.camera_count)
+        map_path = MapAgent(output_dir=output_dir).run()
+        logger.info(
+            "CatalogAgent: map.html written to '{}' ({} cameras)",
+            map_path,
+            export_result.exported,
+        )
 
     def _write_markdown(self, records: list[CameraRecord], path: Path) -> None:
         """Write cameras.md grouped by continent → country → city."""

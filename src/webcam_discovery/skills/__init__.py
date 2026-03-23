@@ -52,12 +52,6 @@ from webcam_discovery.skills.maintenance import (
     HealthCheckSummary,
 )
 
-from webcam_discovery.skills.map_rendering import (
-    MapRenderingSkill,
-    MapRenderingInput,
-    MapRenderingOutput,
-)
-
 from webcam_discovery.skills.browser_validation import (
     BrowserValidationSkill,
     BrowserValidationInput,
@@ -112,10 +106,6 @@ __all__ = [
     "HealthCheckInput",
     "HealthCheckResult",
     "HealthCheckSummary",
-    # map_rendering
-    "MapRenderingSkill",
-    "MapRenderingInput",
-    "MapRenderingOutput",
     # browser_validation
     "BrowserValidationSkill",
     "BrowserValidationInput",

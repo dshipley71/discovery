@@ -30,7 +30,6 @@ Output
 
 from __future__ import annotations
 
-import logging
 import shutil
 from pathlib import Path
 
@@ -40,7 +39,7 @@ from loguru import logger
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEMPLATE_REL = Path(__file__).parent / "templates" / "map_template.html"
+_TEMPLATE_REL = Path(__file__).resolve().parents[1] / "templates" / "map_template.html"
 """Path to the bundled Leaflet map template, relative to this module."""
 
 _OUTPUT_FILENAME = "map.html"
@@ -152,7 +151,7 @@ class MapAgent:
 def main() -> None:
     """CLI convenience wrapper: ``python -m webcam_discovery.agents.map_agent``."""
     import argparse
-
+    import logging
     parser = argparse.ArgumentParser(
         description="Generate map.html from the canonical Leaflet template."
     )
