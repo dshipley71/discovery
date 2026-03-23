@@ -8,13 +8,15 @@ from __future__ import annotations
 import asyncio
 import argparse
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
+from tqdm.auto import tqdm
 
 from webcam_discovery.config import settings
 from webcam_discovery.agents.directory_crawler import SourcesRegistry
@@ -90,9 +92,126 @@ _CITY_TIERS: dict[int, list[str]] = {
     2: TIER1_CITIES + TIER2_CITIES,
 }
 
+_FIELD_ALIASES: dict[str, str] = {
+    "city": "city",
+    "country": "country",
+    "region": "region",
+    "label": "label",
+    "url": "url",
+    "source": "source_directory",
+    "source_directory": "source_directory",
+    "source_ref": "source_refs",
+    "source_refs": "source_refs",
+    "notes": "notes",
+}
+
 
 class DuckDuckGoSearchBlocked(RuntimeError):
     """Raised when DuckDuckGo is unavailable due to anti-bot or upstream blocking."""
+
+
+def _normalize_location_text(value: str) -> str:
+    """Normalize text for case-insensitive blocked-location matching."""
+    collapsed = re.sub(r"[\W_]+", " ", value.casefold())
+    return " ".join(collapsed.split())
+
+
+@dataclass(slots=True)
+class BlockedLocationRules:
+    """Field-aware blocked location matcher for SearchAgent filtering."""
+
+    global_terms: set[str] = field(default_factory=set)
+    field_terms: dict[str, set[str]] = field(default_factory=dict)
+
+    @classmethod
+    def from_entries(cls, entries: Iterable[str]) -> "BlockedLocationRules":
+        rules = cls()
+        for raw_entry in entries:
+            entry = raw_entry.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            key, value = cls._parse_entry(entry)
+            normalized = _normalize_location_text(value)
+            if not normalized:
+                continue
+            if key is None:
+                rules.global_terms.add(normalized)
+            else:
+                rules.field_terms.setdefault(key, set()).add(normalized)
+        return rules
+
+    @staticmethod
+    def _parse_entry(entry: str) -> tuple[str | None, str]:
+        prefix, sep, remainder = entry.partition(":")
+        if not sep:
+            return None, entry
+        field_name = _FIELD_ALIASES.get(prefix.strip().casefold())
+        if field_name is None:
+            return None, entry
+        return field_name, remainder.strip()
+
+    @property
+    def enabled(self) -> bool:
+        """Return True when at least one blocked term is configured."""
+        return bool(self.global_terms or self.field_terms)
+
+    @property
+    def count(self) -> int:
+        """Return the total number of configured blocked terms."""
+        return len(self.global_terms) + sum(len(values) for values in self.field_terms.values())
+
+    def should_block(
+        self,
+        *,
+        city: str | None = None,
+        region: str | None = None,
+        country: str | None = None,
+        label: str | None = None,
+        url: str | None = None,
+        source_directory: str | None = None,
+        source_refs: Iterable[str] | None = None,
+        notes: str | None = None,
+    ) -> bool:
+        """Return True when any blocked term matches the supplied metadata."""
+        if not self.enabled:
+            return False
+
+        metadata: dict[str, list[str]] = {
+            "city": [city or ""],
+            "region": [region or ""],
+            "country": [country or ""],
+            "label": [label or ""],
+            "url": [url or ""],
+            "source_directory": [source_directory or ""],
+            "source_refs": list(source_refs or []),
+            "notes": [notes or ""],
+        }
+
+        normalized_metadata = {
+            field_name: [
+                normalized
+                for value in values
+                if (normalized := _normalize_location_text(value))
+            ]
+            for field_name, values in metadata.items()
+        }
+
+        haystacks = [
+            normalized
+            for values in normalized_metadata.values()
+            for normalized in values
+        ]
+
+        for term in self.global_terms:
+            if any(term in haystack for haystack in haystacks):
+                return True
+
+        for field_name, terms in self.field_terms.items():
+            values = normalized_metadata.get(field_name, [])
+            if any(term in value for term in terms for value in values):
+                return True
+
+        return False
 
 
 def _domain_of(url: str) -> str:
@@ -187,8 +306,27 @@ class SearchAgent:
     MAX_RESULTS_PER_QUERY = 8
     RESULT_PAGE_CONCURRENCY = 10
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        blocked_locations: Iterable[str] | None = None,
+        blocked_locations_file: Path | None = None,
+        show_progress: bool = True,
+    ) -> None:
         self._duckduckgo_available = True
+        entries = list(blocked_locations or [])
+        if blocked_locations_file is not None:
+            entries.extend(blocked_locations_file.read_text(encoding="utf-8").splitlines())
+        self._blocked_locations = BlockedLocationRules.from_entries(entries)
+        self._show_progress = show_progress
+
+    @staticmethod
+    def _progress_message(progress: tqdm, city: str, hls_count: int) -> str:
+        """Build a short tqdm postfix string with city, HLS count, and ETA."""
+        remaining = progress.total - progress.n if progress.total is not None else 0
+        rate = progress.format_dict.get("rate") or 0
+        eta_seconds = int(remaining / rate) if rate else 0
+        return f"city={city[:20]} hls={hls_count} eta={eta_seconds}s"
 
     async def run(self, tier: int = 1) -> list[CameraCandidate]:
         """Collect the streaming search results into a list."""
@@ -225,33 +363,61 @@ class SearchAgent:
         search_semaphore = asyncio.Semaphore(self.CONCURRENCY)
         page_semaphore = asyncio.Semaphore(self.RESULT_PAGE_CONCURRENCY)
         seen_urls: set[str] = set()
+        progress = tqdm(
+            total=len(cities),
+            desc="SearchAgent cities",
+            unit="city",
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
-        ) as client:
-            for city in cities:
-                if not self._duckduckgo_available:
-                    logger.warning(
-                        "SearchAgent.stream: stopping early because DuckDuckGo is unavailable"
-                    )
-                    break
-                try:
-                    city_candidates = await self._search_city(
-                        client, city, query_skill, search_semaphore, page_semaphore
-                    )
-                except Exception as exc:
-                    logger.warning("SearchAgent.stream: error for city '{}': {}", city, exc)
-                    continue
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0),
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
+            ) as client:
+                for city in cities:
+                    progress.set_postfix_str(self._progress_message(progress, city, len(seen_urls)))
+                    if self._blocked_locations.should_block(city=city):
+                        logger.info("SearchAgent: skipping blocked city '{}'", city)
+                        progress.update(1)
+                        continue
+                    if not self._duckduckgo_available:
+                        logger.warning(
+                            "SearchAgent.stream: stopping early because DuckDuckGo is unavailable"
+                        )
+                        break
+                    try:
+                        city_candidates = await self._search_city(
+                            client, city, query_skill, search_semaphore, page_semaphore
+                        )
+                    except Exception as exc:
+                        logger.warning("SearchAgent.stream: error for city '{}': {}", city, exc)
+                        progress.update(1)
+                        continue
 
-                for c in city_candidates:
-                    if c.url not in seen_urls:
-                        seen_urls.add(c.url)
-                        yield c
+                    emitted_for_city = 0
+                    for c in city_candidates:
+                        if c.url not in seen_urls:
+                            seen_urls.add(c.url)
+                            emitted_for_city += 1
+                            progress.set_postfix_str(
+                                self._progress_message(progress, city, len(seen_urls))
+                            )
+                            yield c
+                    progress.update(1)
+                    logger.info(
+                        "SearchAgent: city '{}' complete — {} new HLS stream(s), {} total",
+                        city,
+                        emitted_for_city,
+                        len(seen_urls),
+                    )
+        finally:
+            progress.close()
 
         logger.info(
-            "SearchAgent.stream: finished — {} unique candidates emitted from {} cities",
+            "SearchAgent.stream: finished — {} unique HLS candidates emitted from {} cities",
             len(seen_urls), len(cities),
         )
 
@@ -294,15 +460,12 @@ class SearchAgent:
                 if _is_blocked(url):
                     continue
                 if _HLS_RE.search(url):
-                    direct_candidates.append(
-                        CameraCandidate(
-                            url=url,
-                            city=city,
-                            source_directory=_domain_of(url),
-                            source_refs=[f"query:{query}"],
-                            notes=f"search_query:{query[:80]}",
-                        )
-                    )
+                    if direct_candidate := self._direct_hls_candidate(
+                        url=url,
+                        city=city,
+                        query=query,
+                    ):
+                        direct_candidates.append(direct_candidate)
                     continue
                 if url not in seen_pages:
                     seen_pages.add(url)
@@ -331,7 +494,7 @@ class SearchAgent:
         city_candidates = list(direct_candidates)
         for result, candidate in zip(extracted, page_candidates):
             if isinstance(result, Exception):
-                logger.warning(
+                logger.debug(
                     "SearchAgent: failed to extract streams from {}: {}",
                     candidate.url,
                     result,
@@ -362,6 +525,20 @@ class SearchAgent:
                 continue
             if not _HLS_RE.search(stream_url):
                 continue
+            if self._blocked_locations.should_block(
+                city=candidate.city,
+                label=candidate.label,
+                url=stream_url,
+                source_directory=candidate.source_directory,
+                source_refs=[page_url, *candidate.source_refs],
+                notes=candidate.notes,
+            ):
+                logger.info(
+                    "SearchAgent: blocked HLS stream {} from page {}",
+                    stream_url,
+                    page_url,
+                )
+                continue
             seen_urls.add(stream_url)
             refs = [page_url, *candidate.source_refs]
             results.append(
@@ -374,8 +551,30 @@ class SearchAgent:
                     }
                 )
             )
+            logger.info("SearchAgent: HLS stream {}", stream_url)
 
         return results
+
+    def _direct_hls_candidate(self, *, url: str, city: str, query: str) -> CameraCandidate | None:
+        """Build a direct HLS candidate, unless blocked by location rules."""
+        candidate = CameraCandidate(
+            url=url,
+            city=city,
+            source_directory=_domain_of(url),
+            source_refs=[f"query:{query}"],
+            notes=f"search_query:{query[:80]}",
+        )
+        if self._blocked_locations.should_block(
+            city=city,
+            url=url,
+            source_directory=candidate.source_directory,
+            source_refs=candidate.source_refs,
+            notes=candidate.notes,
+        ):
+            logger.info("SearchAgent: blocked HLS stream {}", url)
+            return None
+        logger.info("SearchAgent: HLS stream {}", url)
+        return candidate
 
 
 def main() -> None:
@@ -391,9 +590,34 @@ def main() -> None:
         default=settings.candidates_dir / "search_candidates.jsonl",
         help="Output path for search_candidates.jsonl",
     )
+    parser.add_argument(
+        "--blocked-location",
+        action="append",
+        default=[],
+        help=(
+            "Blocked location term. Repeat as needed. Supports raw terms "
+            "or field-aware entries like city:Paris, country:France, source:example.com."
+        ),
+    )
+    parser.add_argument(
+        "--blocked-locations-file",
+        type=Path,
+        help="Optional file with one blocked location rule per line.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the SearchAgent progress bar.",
+    )
     args = parser.parse_args()
 
-    candidates = asyncio.run(SearchAgent().run(tier=args.tier))
+    candidates = asyncio.run(
+        SearchAgent(
+            blocked_locations=args.blocked_location,
+            blocked_locations_file=args.blocked_locations_file,
+            show_progress=not args.no_progress,
+        ).run(tier=args.tier)
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(c.model_dump_json() for c in candidates))
     logger.info("SearchAgent: {} candidates → {}", len(candidates), args.output)
