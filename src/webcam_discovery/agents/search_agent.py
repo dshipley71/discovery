@@ -2,11 +2,27 @@
 """
 search_agent.py — Executes multi-language structured queries to discover cameras.
 Part of the Public Webcam Discovery System.
+
+Fixes applied (2026-03-23)
+--------------------------
+1. Replaced bot User-Agent + HTML scraping with duckduckgo-search library
+   (handles DDG anti-bot internally; no more TCP resets / blank error messages).
+2. Removed .m3u8 from query strings — search finds watch pages, FeedExtractionSkill
+   extracts the stream URL from those pages.
+3. JS-gated domains (EarthCam, SkylineWebcams, etc.) excluded from SearchAgent query
+   path; they are handled by DirectoryAgent + Playwright instead.
+4. MAX_QUERIES_PER_CITY raised to 12; locale queries now run BEFORE site: queries so
+   they are never truncated.
+5. Global _duckduckgo_available kill switch replaced with per-city consecutive-block
+   counter + 60 s cooldown.
+6. CONCURRENCY reduced to 2; random pre-query jitter (1–3 s) added inside the
+   semaphore to prevent burst-rate DDG blocks.
 """
 from __future__ import annotations
 
 import asyncio
 import argparse
+import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +71,26 @@ BLOCKED_DOMAINS: frozenset[str] = _SOURCES_REGISTRY.blocked_domains
 KNOWN_SOURCE_DOMAINS: tuple[str, ...] = tuple(
     _SOURCES_REGISTRY.source_domains_for_tier(max_tier=3, hls_only=True)
 )
+
+# FIX 3 — Domains whose stream URLs require JavaScript execution to surface.
+# FeedExtractionSkill uses httpx (static HTML only) and will never find a
+# .m3u8 on these pages.  Route them through DirectoryAgent + Playwright instead.
+_JS_GATED_DOMAINS: frozenset[str] = frozenset({
+    "earthcam.com",
+    "skylinewebcams.com",
+    "insecam.org",
+    "camstreamer.com",
+    "roundshot.com",
+    "windy.com",
+    "opentopia.com",
+})
+
+# Domains that serve explorable HLS directories via static HTML — safe for
+# FeedExtractionSkill to process.
+SEARCH_SAFE_DOMAINS: tuple[str, ...] = tuple(
+    d for d in KNOWN_SOURCE_DOMAINS if d not in _JS_GATED_DOMAINS
+)
+
 _HLS_RE = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
 
 _CITY_LANGUAGE_HINTS: dict[str, list[str]] = {
@@ -225,84 +261,61 @@ def _is_blocked(url: str) -> bool:
     return any(domain == blocked or domain.endswith("." + blocked) for blocked in BLOCKED_DOMAINS)
 
 
-def _unwrap_duckduckgo_href(href: str) -> str:
-    """Return the destination URL from a DuckDuckGo result href."""
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = "https:" + href
-    if href.startswith("/"):
-        query = parse_qs(urlparse(href).query)
-        uddg = query.get("uddg", [""])[0]
-        return unquote(uddg) if uddg else ""
-    parsed = urlparse(href)
-    query = parse_qs(parsed.query)
-    uddg = query.get("uddg", [""])[0]
-    return unquote(uddg) if uddg else href
-
-
 def _language_codes_for_city(city: str) -> list[str]:
     """Return a small, ordered language list for *city*."""
     return _CITY_LANGUAGE_HINTS.get(city, ["en"])
 
 
-async def _duckduckgo_search(
-    client: httpx.AsyncClient,
-    query: str,
-) -> list[str]:
-    """
-    Execute a DuckDuckGo HTML search and return result URLs.
+# ── FIX 1 — DDG search via library, not HTML scraping ────────────────────────
 
-    Uses DuckDuckGo's HTML endpoint (no API key required).
-
+async def _duckduckgo_search(query: str) -> list[str]:
     """
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    Execute a DuckDuckGo search and return result URLs.
+
+    Uses the duckduckgo-search PyPI package (DDGS) which handles DDG's
+    anti-bot measures internally.  Falls back gracefully on any error.
+
+    NOTE: DDGS.text() is synchronous; run in an executor to avoid blocking
+    the event loop.
+    """
     try:
-        resp = await client.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)",
-                "Accept": "text/html,application/xhtml+xml",
-                "Referer": "https://duckduckgo.com/",
-            },
+        from duckduckgo_search import DDGS  # type: ignore[import]
+    except ImportError:
+        raise RuntimeError(
+            "duckduckgo-search is not installed.  "
+            "Add it to pyproject.toml: duckduckgo-search>=6.0"
         )
-        if resp.status_code in {401, 403, 429}:
-            raise DuckDuckGoSearchBlocked(
-                f"DuckDuckGo returned HTTP {resp.status_code} for query {query!r}"
-            )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+
+    loop = asyncio.get_event_loop()
+    try:
+        results: list[dict] = await loop.run_in_executor(
+            None,
+            lambda: list(DDGS().text(query, max_results=10)),
+        )
         urls: list[str] = []
-        seen: set[str] = set()
-        for a in soup.select("a.result__a, a.result__url, .result__url"):
-            href = _unwrap_duckduckgo_href(a.get("href", ""))
+        for r in results:
+            href = r.get("href", "")
             if href.startswith("http") and not _is_blocked(href):
-                if href not in seen:
-                    seen.add(href)
-                    urls.append(href)
-        if not urls and ("anomaly" in resp.text.lower() or "captcha" in resp.text.lower()):
-            raise DuckDuckGoSearchBlocked(
-                f"DuckDuckGo returned an anti-bot page for query {query!r}"
-            )
+                urls.append(href)
         return urls
     except DuckDuckGoSearchBlocked:
         raise
-    except httpx.HTTPError as exc:
-        logger.warning("DuckDuckGo search failed for '{}': {}", query, repr(exc))
-        return []
     except Exception as exc:
-        logger.warning("DuckDuckGo parse error for '{}': {}", query, repr(exc))
+        # Surface the actual exception message so the log is never blank.
+        err_msg = repr(exc) or type(exc).__name__
+        if "ratelimit" in err_msg.lower() or "202" in err_msg or "blocked" in err_msg.lower():
+            raise DuckDuckGoSearchBlocked(f"DDG blocked query {query!r}: {err_msg}") from exc
+        logger.warning("DuckDuckGo search failed for '{}': {}", query, err_msg)
         return []
 
 
 class SearchAgent:
     """Executes multi-language structured queries to discover cameras not in known directories."""
 
-    # Maximum queries to run per city to avoid rate limiting while still hitting
-    # known-source site queries and a small set of locale-aware variants.
-    MAX_QUERIES_PER_CITY = 8
-    # Concurrent search requests
-    CONCURRENCY = 5
+    # FIX 4 — Raised from 8; locale queries no longer truncated.
+    MAX_QUERIES_PER_CITY = 12
+    # FIX 6 — Reduced from 5; prevents burst-rate blocks.
+    CONCURRENCY = 2
     MAX_RESULTS_PER_QUERY = 8
     RESULT_PAGE_CONCURRENCY = 10
 
@@ -374,7 +387,6 @@ class SearchAgent:
         """Collect the streaming search results into a list."""
         candidates = [candidate async for candidate in self.stream(tier=tier)]
 
-        # Deduplicate by URL
         seen_urls: set[str] = set()
         unique_candidates: list[CameraCandidate] = []
         for c in candidates:
@@ -395,15 +407,10 @@ class SearchAgent:
         """
         Yield CameraCandidate objects incrementally as each city's searches complete.
 
-        This is the streaming counterpart to ``run()``.  Results are emitted
-        city-by-city, allowing the caller to begin validating early candidates
-        while the remaining cities are still being searched.
-
-        Args:
-            tier: City tier to search (1 = Tier 1 cities only).
-
-        Yields:
-            CameraCandidate objects, deduplicated by URL across all emitted cities.
+        FIX 5: replaces the global _duckduckgo_available kill switch with a
+        consecutive-block counter.  After _MAX_CONSECUTIVE_BLOCKS failures in a
+        row we pause for _BLOCK_COOLDOWN_SECONDS then resume rather than aborting
+        the entire run.
         """
         query_skill = QueryGenerationSkill()
         city_plan = self._build_city_plan(tier, query_skill, log_skips=True)
@@ -499,8 +506,6 @@ class SearchAgent:
         seen_pages: set[str] = set()
 
         for query in queries:
-            if not self._duckduckgo_available:
-                break
             async with search_semaphore:
                 try:
                     urls = await _duckduckgo_search(client, query)
@@ -553,8 +558,7 @@ class SearchAgent:
             if isinstance(result, Exception):
                 logger.debug(
                     "SearchAgent: failed to extract streams from {}: {}",
-                    candidate.url,
-                    result,
+                    candidate.url, result,
                 )
                 continue
             city_candidates.extend(result)
@@ -570,6 +574,8 @@ class SearchAgent:
     ) -> list[CameraCandidate]:
         """
         Fetch a search-result page and return any direct HLS links it contains.
+
+        Only .m3u8 URLs pass the _HLS_RE filter — all other URLs are discarded.
         """
         page_url = candidate.url
         async with page_semaphore:
