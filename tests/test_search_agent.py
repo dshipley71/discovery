@@ -30,7 +30,7 @@ def test_search_agent_extracts_direct_hls_candidates(
     async def exercise() -> list[str]:
         agent = SearchAgent()
 
-        async def fake_search(client, query):  # noqa: ANN001
+        async def fake_search(query):  # noqa: ANN001
             if "Tokyo" not in query:
                 return []
             return [
@@ -81,7 +81,7 @@ def test_search_agent_stops_after_duckduckgo_block(
         agent = SearchAgent()
         seen_queries: list[str] = []
 
-        async def fake_search(client, query):  # noqa: ANN001
+        async def fake_search(query):  # noqa: ANN001
             seen_queries.append(query)
             raise DuckDuckGoSearchBlocked("anti-bot page")
 
@@ -133,7 +133,7 @@ def test_search_agent_filters_blocked_locations_from_cli_and_file(
             show_progress=False,
         )
 
-        async def fake_search(client, query):  # noqa: ANN001
+        async def fake_search(query):  # noqa: ANN001
             if "Paris" in query:
                 return [
                     "https://harbor.example/live/master.m3u8",
@@ -168,7 +168,7 @@ def test_search_agent_reports_successful_hls_streams(
             show_progress=False,
         )
 
-        async def fake_search(client, query):  # noqa: ANN001
+        async def fake_search(query):  # noqa: ANN001
             if "Tokyo" not in query:
                 return []
             return ["https://allowed.example/live/master.m3u8"]
