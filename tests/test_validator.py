@@ -4,7 +4,7 @@ import json
 from webcam_discovery.agents.validator import ValidationAgent
 from webcam_discovery.config import settings
 from webcam_discovery.schemas import CameraCandidate
-from webcam_discovery.skills.ffprobe_validation import FfprobeResult
+from webcam_discovery.skills.ffprobe_validation import FfprobeResult, FfprobeValidationSkill
 from webcam_discovery.skills.validation import ValidationResult
 
 
@@ -132,3 +132,51 @@ def test_validation_agent_drops_dead_streams_and_logs_results(
         "does_not_exist",
     ]
     assert ffprobe_rows[1]["camera_status"] == "dead"
+
+
+def test_ffprobe_validation_skill_shows_progress_and_preserves_input_order(
+    monkeypatch,
+) -> None:
+    skill = FfprobeValidationSkill(concurrency=2)
+    urls = [
+        "https://example.com/slow.m3u8",
+        "https://example.com/fast.m3u8",
+    ]
+    progress_calls: list[dict] = []
+
+    async def fake_ffprobe_available(self):  # noqa: ANN001
+        return True
+
+    async def fake_probe_url(self, url, sem):  # noqa: ANN001
+        async with sem:
+            if "slow" in url:
+                await asyncio.sleep(0.02)
+            else:
+                await asyncio.sleep(0.0)
+            return FfprobeResult(url=url, stream_status="active_streaming", detail="frames_ok")
+
+    def fake_tqdm(iterable, **kwargs):  # noqa: ANN001
+        progress_calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(
+        "webcam_discovery.skills.ffprobe_validation.FfprobeValidationSkill._ffprobe_available",
+        fake_ffprobe_available,
+    )
+    monkeypatch.setattr(
+        "webcam_discovery.skills.ffprobe_validation.FfprobeValidationSkill._probe_url",
+        fake_probe_url,
+    )
+    monkeypatch.setattr("webcam_discovery.skills.ffprobe_validation.tqdm", fake_tqdm)
+
+    results = asyncio.run(skill.run(urls))
+
+    assert [result.url for result in results] == urls
+    assert progress_calls == [
+        {
+            "total": 2,
+            "desc": "ffprobe",
+            "unit": "url",
+            "dynamic_ncols": True,
+        }
+    ]
