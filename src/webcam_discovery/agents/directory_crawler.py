@@ -21,8 +21,9 @@ import asyncio
 import argparse
 import re
 from collections import defaultdict
+from html import escape
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -310,6 +311,16 @@ _DETAIL_PATH_SEGMENTS = frozenset({
 # Prevent extraction from overloading any single host when a traversal yields a
 # large burst of same-domain candidates.
 PER_HOST_EXTRACT_CONCURRENCY = 3
+FORMAT_BUCKETS: tuple[str, ...] = (
+    ".m3u8",
+    "RTSP",
+    "MJPEG",
+    "MP4-only",
+    "JPEG-refresh",
+    "DASH",
+    "YouTube-only source",
+    "Other/HTML/unknown",
+)
 
 # Language prefixes that some directories prepend to every page
 # (e.g. /en/camera/x/, /ru/camera/x/, /zh-CN/camera/x/).
@@ -367,6 +378,171 @@ def _should_skip_feed_extraction(url: str) -> bool:
         return True
 
     return False
+
+
+def _classify_camera_format(url: str) -> str:
+    """
+    Classify candidate URL into the requested transport/media buckets.
+
+    This is URL-pattern based because DirectoryAgent candidates are pre-validation
+    hints; they may still be embed pages when no direct stream URL is discoverable.
+    """
+    lowered = url.lower()
+    parsed = urlparse(lowered)
+
+    if parsed.scheme in {"rtsp", "rtsps"}:
+        return "RTSP"
+    if lowered.endswith(".m3u8") or ".m3u8?" in lowered:
+        return ".m3u8"
+    if lowered.endswith(".mpd") or ".mpd?" in lowered or "/dash/" in lowered:
+        return "DASH"
+    if "youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc:
+        return "YouTube-only source"
+    if any(token in lowered for token in ("mjpeg", ".mjpg", ".mjpeg", "multipart/x-mixed-replace")):
+        return "MJPEG"
+    if lowered.endswith(".mp4") or ".mp4?" in lowered:
+        return "MP4-only"
+    if any(
+        lowered.endswith(ext) or f"{ext}?" in lowered
+        for ext in (".jpg", ".jpeg")
+    ) or "snapshot" in lowered or "refresh" in lowered:
+        return "JPEG-refresh"
+    return "Other/HTML/unknown"
+
+
+async def _classify_camera_format_with_probe(
+    client: httpx.AsyncClient, candidate: CameraCandidate
+) -> str:
+    """
+    Determine format with a lightweight network probe for non-obvious URLs.
+
+    Strategy:
+    1) URL-pattern fast path.
+    2) HEAD request content-type.
+    3) GET range bytes sniff for HLS/DASH signatures.
+    """
+    initial = _classify_camera_format(candidate.url)
+    if initial != "Other/HTML/unknown":
+        return initial
+
+    try:
+        head = await client.head(candidate.url)
+        content_type = (head.headers.get("content-type") or "").lower()
+        if "application/vnd.apple.mpegurl" in content_type or "application/x-mpegurl" in content_type:
+            return ".m3u8"
+        if "application/dash+xml" in content_type:
+            return "DASH"
+        if "multipart/x-mixed-replace" in content_type or "mjpeg" in content_type:
+            return "MJPEG"
+        if content_type.startswith("video/mp4"):
+            return "MP4-only"
+        if content_type.startswith("image/jpeg"):
+            return "JPEG-refresh"
+    except Exception:
+        pass
+
+    try:
+        get_resp = await client.get(candidate.url, headers={"Range": "bytes=0-8191"})
+        body_text = get_resp.text[:8192].upper()
+        if "#EXTM3U" in body_text:
+            return ".m3u8"
+        if "<MPD" in body_text:
+            return "DASH"
+    except Exception:
+        pass
+
+    return initial
+
+
+async def _resolve_report_formats(candidates: list[CameraCandidate]) -> list[str]:
+    """Return one format bucket per candidate using URL + HTTP probe classification."""
+    sem = asyncio.Semaphore(20)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=3.0, read=6.0, write=4.0, pool=3.0),
+        follow_redirects=True,
+        headers={"User-Agent": _BROWSER_UA},
+    ) as client:
+        async def _classify(candidate: CameraCandidate) -> str:
+            async with sem:
+                return await _classify_camera_format_with_probe(client, candidate)
+        return await asyncio.gather(*[_classify(c) for c in candidates])
+
+
+def _render_format_breakdown_html(
+    candidates: list[CameraCandidate], formats: Sequence[str]
+) -> str:
+    """Render per-city/country format counts as a single HTML table."""
+    counts: dict[tuple[str, str], defaultdict[str, int]] = {}
+    totals_by_bucket: defaultdict[str, int] = defaultdict(int)
+    for candidate, format_bucket in zip(candidates, formats):
+        city = candidate.city or "Unknown"
+        country = candidate.country or "Unknown"
+        key = (city, country)
+        if key not in counts:
+            counts[key] = defaultdict(int)
+        counts[key][format_bucket] += 1
+        totals_by_bucket[format_bucket] += 1
+
+    headers = ["City", "Country", *FORMAT_BUCKETS, "Total"]
+    lines = [
+        "<!doctype html>",
+        "<html lang=\"en\">",
+        "<head>",
+        "  <meta charset=\"utf-8\" />",
+        "  <title>DirectoryAgent format breakdown</title>",
+        "  <style>",
+        "    body { font-family: Arial, sans-serif; margin: 16px; }",
+        "    table { border-collapse: collapse; width: 100%; font-size: 14px; }",
+        "    th, td { border: 1px solid #ddd; padding: 6px 8px; }",
+        "    th { background: #f3f4f6; position: sticky; top: 0; }",
+        "    td.num { text-align: right; font-variant-numeric: tabular-nums; }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        "  <h1>DirectoryAgent format breakdown</h1>",
+        f"  <p>Total candidate URLs: {len(candidates)}</p>",
+        "  <table>",
+        "    <thead>",
+        "      <tr>",
+    ]
+    lines.extend([f"        <th>{escape(header)}</th>" for header in headers])
+    lines.extend(
+        [
+            "      </tr>",
+            "    </thead>",
+            "    <tbody>",
+        ]
+    )
+
+    for city, country in sorted(counts.keys(), key=lambda row: (row[1], row[0])):
+        row_counts = counts[(city, country)]
+        total = sum(row_counts.values())
+        lines.append("      <tr>")
+        lines.append(f"        <td>{escape(city)}</td>")
+        lines.append(f"        <td>{escape(country)}</td>")
+        for bucket in FORMAT_BUCKETS:
+            lines.append(f"        <td class=\"num\">{row_counts.get(bucket, 0)}</td>")
+        lines.append(f"        <td class=\"num\">{total}</td>")
+        lines.append("      </tr>")
+
+    grand_total = sum(totals_by_bucket.values())
+    lines.append("      <tr>")
+    lines.append("        <td><strong>Total</strong></td>")
+    lines.append("        <td></td>")
+    for bucket in FORMAT_BUCKETS:
+        lines.append(f"        <td class=\"num\"><strong>{totals_by_bucket.get(bucket, 0)}</strong></td>")
+    lines.append(f"        <td class=\"num\"><strong>{grand_total}</strong></td>")
+    lines.append("      </tr>")
+
+    lines.extend(
+        [
+            "    </tbody>",
+            "  </table>",
+            "</body>",
+            "</html>",
+        ]
+    )
+    return "\n".join(lines)
 
 
 # ── DirectoryAgent ────────────────────────────────────────────────────────────
@@ -724,6 +900,15 @@ def main() -> None:
         "--hls-only", action="store_true", default=False,
         help="Skip non-HLS source sites and drop all non-.m3u8 candidate URLs from output.",
     )
+    parser.add_argument(
+        "--format-report-html",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output path for an HTML table with per-city/country "
+            "counts by URL format bucket."
+        ),
+    )
     args = parser.parse_args()
 
     candidates = asyncio.run(DirectoryAgent().run(tier=args.tier, hls_only=args.hls_only))
@@ -737,6 +922,17 @@ def main() -> None:
         "DirectoryAgent: wrote {} candidates → {}",
         len(candidates), args.output,
     )
+    if args.format_report_html is not None:
+        args.format_report_html.parent.mkdir(parents=True, exist_ok=True)
+        formats = asyncio.run(_resolve_report_formats(candidates))
+        args.format_report_html.write_text(
+            _render_format_breakdown_html(candidates, formats),
+            encoding="utf-8",
+        )
+        logger.info(
+            "DirectoryAgent: wrote format breakdown HTML → {}",
+            args.format_report_html,
+        )
 
 
 if __name__ == "__main__":
