@@ -158,7 +158,7 @@ _NEXT_PAGE_RE = re.compile(r"""(?:href|src)\s*=\s*['"]([^'"]*(?:page[=/]\d+|next
 _BROAD_HLS_RE = re.compile(r"""['"]([^'"]{4,500}\.m3u8[^'"]{0,100})['"]""", re.IGNORECASE)
 
 # Per-source traversal limits — prevent runaway crawls on large directories.
-MAX_PAGES_PER_SOURCE   = 100   # total HTTP GETs per source URL
+MAX_PAGES_PER_SOURCE   = 250   # total HTTP GETs per source URL
 MAX_SUB_LINKS_PER_PAGE = 10    # sub-category links to recursively follow per page
 
 # Regex to detect an .m3u8 URL embedded in a query-string parameter value.
