@@ -91,6 +91,93 @@ _SKIP_IFRAME_DOMAINS: frozenset[str] = frozenset({
     "maps.google.com", "openstreetmap.org", "disqus.com",
 })
 
+# ── Geographic hierarchy extraction ───────────────────────────────────────────
+
+# ISO-639-1 language codes and common locale tags used as path prefixes by
+# webcam directory sites (e.g. /en/, /it/, /zh-cn/).
+_LANG_PATH_SEGMENTS: frozenset[str] = frozenset({
+    "en", "it", "fr", "de", "es", "pt", "ru", "zh", "ja", "ko", "nl", "pl",
+    "sv", "tr", "ar", "cs", "da", "fi", "hu", "nb", "ro", "sk", "uk", "el",
+    "zh-cn", "zh-tw", "pt-br", "en-us", "en-gb", "en-au",
+})
+
+# Structural path tokens used by webcam directories that carry no geographic
+# meaning and must be stripped before interpreting the path hierarchy.
+_NON_GEO_PATH_SEGMENTS: frozenset[str] = frozenset({
+    "webcam", "webcams", "cam", "cams", "camera", "cameras",
+    "live", "stream", "streaming", "video", "watch", "view", "views", "feed",
+    "world", "global",
+})
+
+# Regex: a path segment that looks like a camera-page leaf rather than a place
+# (contains a file extension, or duplicates the preceding segment, etc.).
+_HAS_EXTENSION_RE = re.compile(r"\.[a-zA-Z0-9]{2,5}$")
+
+
+def _part_to_place(part: str) -> str:
+    """Strip file extension and normalise a URL path segment to a place name."""
+    part = re.sub(r"\.[^./]+$", "", part)          # remove extension (.html, .php …)
+    return part.replace("-", " ").replace("_", " ").title()
+
+
+def _extract_geo_hierarchy(
+    path_parts: list[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Return ``(country, state_region, city)`` extracted from URL path parts.
+
+    Strategy
+    --------
+    1. Strip a leading language/locale segment (e.g. ``en``, ``it``, ``zh-cn``).
+    2. Drop non-geographic structural tokens (``webcam``, ``stream``, etc.).
+    3. Strip the trailing camera-page leaf when the remaining depth is ≥ 4
+       (the leaf is a specific camera page, not a place) or when it carries a
+       file extension.
+    4. Interpret the remaining 1–3 segments as the geographic hierarchy from
+       general → specific:
+         - 3+ segments: country / state-region / city
+         - 2 segments:  country / city  (no state known)
+         - 1 segment:   city only
+
+    This correctly handles the following real-world URL patterns:
+    - ``/en/usa/alaska/sitka/sitka-webcam.html``      → USA / Alaska / Sitka
+    - ``/en/canada/british-columbia/port-alberni/``   → Canada / British Columbia / Port Alberni
+    - ``/it/webcam/italia/sicilia/catania/``           → Italia / Sicilia / Catania
+    - ``/usa/california/santa-monica``                 → USA / California / Santa Monica
+    - ``/en/webcam/brazil/rio-de-janeiro/balneario/`` → Brazil / Rio De Janeiro / Balneario
+    """
+    # 1. Strip leading language segment
+    geo: list[str] = []
+    for i, part in enumerate(path_parts):
+        low = part.lower()
+        if i == 0 and low in _LANG_PATH_SEGMENTS:
+            continue
+        if low in _NON_GEO_PATH_SEGMENTS:
+            continue
+        geo.append(part)
+
+    if not geo:
+        return None, None, None
+
+    # 2. Strip camera-leaf: the last segment is a leaf when it carries a file
+    #    extension OR when we already have ≥ 4 geographic segments (country +
+    #    region + city + camera-page).
+    if _HAS_EXTENSION_RE.search(geo[-1]):
+        geo = geo[:-1]
+    elif len(geo) >= 4:
+        geo = geo[:-1]   # drop camera-name segment; geography is the first 3
+
+    if not geo:
+        return None, None, None
+
+    # 3. Assign hierarchy
+    if len(geo) >= 3:
+        return _part_to_place(geo[0]), _part_to_place(geo[1]), _part_to_place(geo[-1])
+    elif len(geo) == 2:
+        return _part_to_place(geo[0]), None, _part_to_place(geo[1])
+    else:
+        return None, None, _part_to_place(geo[0])
+
 
 # ── I/O Models ────────────────────────────────────────────────────────────────
 
@@ -404,27 +491,18 @@ class DirectoryTraversalSkill:
 
             path_parts = [p for p in parsed.path.strip("/").split("/") if p]
             path_depth = len(path_parts)
-            city    = None
-            country = None
-            label   = text or None
+            label      = text or None
 
-            def _part_to_place(part: str) -> str:
-                """Strip file extension and normalise a URL path segment to a place name."""
-                part = re.sub(r"\.[^./]+$", "", part)  # remove extension (e.g. .html, .php)
-                return part.replace("-", " ").replace("_", " ").title()
-
-            if path_depth >= 3:
-                country = _part_to_place(path_parts[-2])
-                city    = _part_to_place(path_parts[-1])
-            elif path_depth == 2:
-                city = _part_to_place(path_parts[-1])
-            elif path_depth == 1:
-                city = _part_to_place(path_parts[0])
+            # Use the geo-hierarchy extractor which strips language prefixes,
+            # non-geographic structural tokens (e.g. "webcam"), and camera-leaf
+            # segments before assigning country / state_region / city.
+            country, state_region, city = _extract_geo_hierarchy(path_parts)
 
             candidates.append(CameraCandidate(
                 url=abs_href,
                 label=label,
                 city=city,
+                state_region=state_region,
                 country=country,
                 source_directory=source_directory,
                 source_refs=[url],

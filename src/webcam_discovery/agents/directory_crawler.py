@@ -419,7 +419,8 @@ async def _classify_camera_format_with_probe(
     Strategy:
     1) URL-pattern fast path.
     2) HEAD request content-type.
-    3) GET range bytes sniff for HLS/DASH signatures.
+    3) GET range bytes sniff for raw HLS/DASH signatures.
+    4) Full HTML scan for embedded .m3u8 URL patterns (catches JS player pages).
     """
     initial = _classify_camera_format(candidate.url)
     if initial != "Other/HTML/unknown":
@@ -443,11 +444,46 @@ async def _classify_camera_format_with_probe(
 
     try:
         get_resp = await client.get(candidate.url, headers={"Range": "bytes=0-8191"})
-        body_text = get_resp.text[:8192].upper()
-        if "#EXTM3U" in body_text:
+        body_bytes = get_resp.text[:8192]
+        body_upper = body_bytes.upper()
+
+        # Raw manifest / container markers
+        if "#EXTM3U" in body_upper:
             return ".m3u8"
-        if "<MPD" in body_text:
+        if "<MPD" in body_upper:
             return "DASH"
+
+        # Probe for a quoted .m3u8 URL embedded in HTML/JS — this is the
+        # dominant pattern for webcam directory player pages where the stream
+        # URL is set via a JS player initialisation call.
+        # We read a larger chunk (64 KB) for this step since JS is often at
+        # the bottom of the page.
+        try:
+            full_resp = await client.get(candidate.url)
+            html_body = full_resp.text[:65536]
+        except Exception:
+            html_body = body_bytes
+
+        # Quoted .m3u8 URL anywhere in the page source
+        if re.search(r"""['"][^'"]{4,500}\.m3u8[^'"]{0,100}['"]""", html_body, re.IGNORECASE):
+            return ".m3u8"
+        # RTSP URL in page source
+        if re.search(r"""['"]rtsp[s]?://[^'"]{4,400}['"]""", html_body, re.IGNORECASE):
+            return "RTSP"
+        # MJPEG signature in page
+        if re.search(r"""multipart/x-mixed-replace|\.mjpg['"?]|\.mjpeg['"?]""", html_body, re.IGNORECASE):
+            return "MJPEG"
+        # DASH manifest URL in page
+        if re.search(r"""['"][^'"]{4,500}\.mpd[^'"]{0,100}['"]""", html_body, re.IGNORECASE):
+            return "DASH"
+        # MP4 stream URL in page
+        if re.search(r"""['"][^'"]{4,500}\.mp4[^'"]{0,100}['"]""", html_body, re.IGNORECASE):
+            return "MP4-only"
+        # JPEG snapshot/refresh pattern
+        if re.search(r"""['"][^'"]{4,500}\.jpe?g[^'"]{0,100}['"]|snapshot|getimage""",
+                     html_body, re.IGNORECASE):
+            if "snapshot" in html_body.lower() or "getimage" in html_body.lower():
+                return "JPEG-refresh"
     except Exception:
         pass
 
@@ -471,19 +507,112 @@ async def _resolve_report_formats(candidates: list[CameraCandidate]) -> list[str
 def _render_format_breakdown_html(
     candidates: list[CameraCandidate], formats: Sequence[str]
 ) -> str:
-    """Render per-city/country format counts as a single HTML table."""
-    counts: dict[tuple[str, str], defaultdict[str, int]] = {}
+    """Render per-city/state/country format counts as a single HTML table.
+
+    Columns: City | State/Region | Country | <format buckets> | Total
+
+    Geographic data is drawn from the ``city``, ``state_region``, and
+    ``country`` fields on each CameraCandidate.  When ``state_region`` is
+    absent but ``country`` looks like a sub-national region (e.g. a US state
+    or Canadian province), it is promoted to ``state_region`` and ``country``
+    is left blank so the report renders correctly without needing a full
+    geo-enrichment pass.
+    """
+    # Known sub-national regions that should never appear in the Country column.
+    # These are produced when older candidates were crawled before the traversal
+    # fix and the country slot holds a state/province instead of a sovereign nation.
+    _US_STATES: frozenset[str] = frozenset({
+        "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+        "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+        "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+        "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+        "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+        "New Hampshire", "New Jersey", "New Mexico", "New York",
+        "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+        "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+        "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+        "West Virginia", "Wisconsin", "Wyoming", "District Of Columbia", "Dc",
+    })
+    _CA_PROVINCES: frozenset[str] = frozenset({
+        "Alberta", "British Columbia", "Manitoba", "New Brunswick",
+        "Newfoundland And Labrador", "Northwest Territories", "Nova Scotia",
+        "Nunavut", "Ontario", "Prince Edward Island", "Quebec", "Saskatchewan",
+        "Yukon",
+    })
+    _IT_REGIONS: frozenset[str] = frozenset({
+        "Abruzzo", "Basilicata", "Calabria", "Campania", "Emilia Romagna",
+        "Friuli Venezia Giulia", "Lazio", "Liguria", "Lombardia", "Lombardy",
+        "Marche", "Molise", "Piemonte", "Puglia", "Sardegna", "Sardinia",
+        "Sicilia", "Sicily", "Toscana", "Tuscany", "Trentino Alto Adige",
+        "Umbria", "Valle D Aosta", "Veneto",
+        # Italian province capitals that appear as "country" in pre-fix candidates
+        "Agrigento", "Bari", "Belluno", "Bologna", "Bolzano", "Caltanissetta",
+        "Campobasso", "Catania", "Catanzaro", "Cosenza", "Crotone", "Firenze",
+        "Foggia", "Genova", "Messina", "Milano", "Napoli", "Roma", "Salerno",
+        "Trento", "Venezia", "Verona",
+    })
+    _ES_REGIONS: frozenset[str] = frozenset({
+        "Alicante", "Almeria", "Murcia", "Cataluna", "Catalonia", "Catalunya",
+        "Andalucia", "Galicia", "Aragon", "Castilla", "Valencia",
+        "Islas Baleares", "Canarias", "Extremadura", "La Rioja", "Navarra",
+        "Pais Vasco", "Cantabria", "Asturias",
+        # Province name appearing as country in pre-fix data
+        "Santa Cruz De Tenerife",
+    })
+    # Build a reverse map: sub-national region → sovereign country
+    _REGION_TO_COUNTRY: dict[str, str] = {}
+    for _r in _US_STATES:    _REGION_TO_COUNTRY[_r] = "United States"
+    for _r in _CA_PROVINCES: _REGION_TO_COUNTRY[_r] = "Canada"
+    for _r in _IT_REGIONS:   _REGION_TO_COUNTRY[_r] = "Italy"
+    for _r in _ES_REGIONS:   _REGION_TO_COUNTRY[_r] = "Spain"
+    _SUB_NATIONAL: frozenset[str] = (
+        _US_STATES | _CA_PROVINCES | _IT_REGIONS | _ES_REGIONS
+    )
+    # Normalize known alt-spellings to canonical country names
+    _COUNTRY_NORMALIZE: dict[str, str] = {
+        "Brasil": "Brazil", "Usa": "United States",
+        "Uk": "United Kingdom", "Italia": "Italy",
+    }
+
+    # Known noise values that are never valid geographic data
+    _GEO_NOISE: frozenset[str] = frozenset({
+        "Webcam", "Webcams", "Camera", "Cameras", "Live", "Stream",
+        "Live Cams Category", "Help", "Unknown", "",
+    })
+
+    # Accumulate counts per (city, state_region, country) tuple
+    counts: dict[tuple[str, str, str], defaultdict[str, int]] = {}
     totals_by_bucket: defaultdict[str, int] = defaultdict(int)
+
     for candidate, format_bucket in zip(candidates, formats):
-        city = candidate.city or "Unknown"
-        country = candidate.country or "Unknown"
-        key = (city, country)
+        city         = (candidate.city or "Unknown").strip()
+        state_region = (candidate.state_region or "").strip()
+        country      = (candidate.country or "Unknown").strip()
+
+        # Normalize alt-spellings first
+        country = _COUNTRY_NORMALIZE.get(country, country)
+
+        # Promote mis-filed sub-national values from country → state_region
+        # and resolve the correct sovereign country via the reverse map.
+        if country in _SUB_NATIONAL and not state_region:
+            state_region = country
+            country = _REGION_TO_COUNTRY.get(country, "Unknown")
+
+        # Suppress noise tokens so they don't pollute the table
+        if city in _GEO_NOISE:
+            city = "Unknown"
+        if country in _GEO_NOISE:
+            country = "Unknown"
+        if state_region in _GEO_NOISE:
+            state_region = ""
+
+        key = (city, state_region, country)
         if key not in counts:
             counts[key] = defaultdict(int)
         counts[key][format_bucket] += 1
         totals_by_bucket[format_bucket] += 1
 
-    headers = ["City", "Country", *FORMAT_BUCKETS, "Total"]
+    headers = ["City", "State / Region", "Country", *FORMAT_BUCKETS, "Total"]
     lines = [
         "<!doctype html>",
         "<html lang=\"en\">",
@@ -496,6 +625,8 @@ def _render_format_breakdown_html(
         "    th, td { border: 1px solid #ddd; padding: 6px 8px; }",
         "    th { background: #f3f4f6; position: sticky; top: 0; }",
         "    td.num { text-align: right; font-variant-numeric: tabular-nums; }",
+        "    td.geo-sub { color: #555; font-style: italic; }",
+        "    tr:hover td { background: #fafafa; }",
         "  </style>",
         "</head>",
         "<body>",
@@ -514,11 +645,15 @@ def _render_format_breakdown_html(
         ]
     )
 
-    for city, country in sorted(counts.keys(), key=lambda row: (row[1], row[0])):
-        row_counts = counts[(city, country)]
+    # Sort: Country → State/Region → City
+    for city, state_region, country in sorted(
+        counts.keys(), key=lambda row: (row[2], row[1], row[0])
+    ):
+        row_counts = counts[(city, state_region, country)]
         total = sum(row_counts.values())
         lines.append("      <tr>")
         lines.append(f"        <td>{escape(city)}</td>")
+        lines.append(f"        <td class=\"geo-sub\">{escape(state_region)}</td>")
         lines.append(f"        <td>{escape(country)}</td>")
         for bucket in FORMAT_BUCKETS:
             lines.append(f"        <td class=\"num\">{row_counts.get(bucket, 0)}</td>")
@@ -528,6 +663,7 @@ def _render_format_breakdown_html(
     grand_total = sum(totals_by_bucket.values())
     lines.append("      <tr>")
     lines.append("        <td><strong>Total</strong></td>")
+    lines.append("        <td></td>")
     lines.append("        <td></td>")
     for bucket in FORMAT_BUCKETS:
         lines.append(f"        <td class=\"num\"><strong>{totals_by_bucket.get(bucket, 0)}</strong></td>")

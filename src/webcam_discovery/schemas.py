@@ -32,6 +32,7 @@ class CameraCandidate(BaseModel):
     url:              str
     label:            Optional[str]  = None
     city:             Optional[str]  = None
+    state_region:     Optional[str]  = None   # state / province / region extracted from URL path
     country:          Optional[str]  = None
     source_directory: Optional[str]  = None
     source_refs:      list[str]      = []
