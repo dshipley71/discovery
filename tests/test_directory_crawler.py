@@ -3,9 +3,12 @@ import asyncio
 import pytest
 
 from webcam_discovery.agents.directory_crawler import (
+    FORMAT_BUCKETS,
     DirectoryAgent,
     PER_HOST_EXTRACT_CONCURRENCY,
     SourcesRegistry,
+    _classify_camera_format,
+    _render_format_breakdown_html,
     _should_skip_feed_extraction,
 )
 from webcam_discovery.agents.search_agent import _is_blocked
@@ -123,3 +126,38 @@ def test_sources_registry_parses_blocked_domains_from_urls(tmp_path) -> None:
 )
 def test_search_agent_uses_sources_registry_blocklist(url: str, expected: bool) -> None:
     assert _is_blocked(url) is expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://cams.example/live/main.m3u8", ".m3u8"),
+        ("rtsp://cams.example/live", "RTSP"),
+        ("https://cams.example/channel/stream.mpd", "DASH"),
+        ("https://youtube.com/watch?v=abc", "YouTube-only source"),
+        ("https://cams.example/mjpeg", "MJPEG"),
+        ("https://cams.example/archive.mp4", "MP4-only"),
+        ("https://cams.example/snapshot.jpg?refresh=1", "JPEG-refresh"),
+        ("https://cams.example/camera/times-square", "Other/HTML/unknown"),
+    ],
+)
+def test_classify_camera_format(url: str, expected: str) -> None:
+    assert _classify_camera_format(url) == expected
+
+
+def test_render_format_breakdown_html_counts_formats() -> None:
+    candidates = [
+        CameraCandidate(url="https://x.example/a.m3u8", city="Paris", country="France"),
+        CameraCandidate(url="https://x.example/b.m3u8", city="Paris", country="France"),
+        CameraCandidate(url="rtsp://x.example/cam", city="Paris", country="France"),
+    ]
+
+    html = _render_format_breakdown_html(candidates)
+
+    assert "<table>" in html
+    assert "Paris" in html
+    assert "France" in html
+    assert "Region" not in html
+    assert all(bucket in html for bucket in FORMAT_BUCKETS)
+    assert "<td class=\"num\">2</td>" in html
+    assert "<td class=\"num\">1</td>" in html
