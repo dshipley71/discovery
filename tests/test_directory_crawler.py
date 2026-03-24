@@ -150,9 +150,11 @@ def test_render_format_breakdown_html_counts_formats() -> None:
         CameraCandidate(url="https://x.example/a.m3u8", city="Paris", country="France"),
         CameraCandidate(url="https://x.example/b.m3u8", city="Paris", country="France"),
         CameraCandidate(url="rtsp://x.example/cam", city="Paris", country="France"),
+        CameraCandidate(url="https://x.example/rome", city="Rome", country="Italy"),
     ]
+    formats = [".m3u8", ".m3u8", "RTSP", "MJPEG"]
 
-    html = _render_format_breakdown_html(candidates)
+    html = _render_format_breakdown_html(candidates, formats)
 
     assert "<table>" in html
     assert "Paris" in html
@@ -161,3 +163,5 @@ def test_render_format_breakdown_html_counts_formats() -> None:
     assert all(bucket in html for bucket in FORMAT_BUCKETS)
     assert "<td class=\"num\">2</td>" in html
     assert "<td class=\"num\">1</td>" in html
+    assert "<strong>Total</strong>" in html
+    assert html.index("France") < html.index("Italy")

@@ -23,7 +23,7 @@ import re
 from collections import defaultdict
 from html import escape
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -410,16 +410,78 @@ def _classify_camera_format(url: str) -> str:
     return "Other/HTML/unknown"
 
 
-def _render_format_breakdown_html(candidates: list[CameraCandidate]) -> str:
+async def _classify_camera_format_with_probe(
+    client: httpx.AsyncClient, candidate: CameraCandidate
+) -> str:
+    """
+    Determine format with a lightweight network probe for non-obvious URLs.
+
+    Strategy:
+    1) URL-pattern fast path.
+    2) HEAD request content-type.
+    3) GET range bytes sniff for HLS/DASH signatures.
+    """
+    initial = _classify_camera_format(candidate.url)
+    if initial != "Other/HTML/unknown":
+        return initial
+
+    try:
+        head = await client.head(candidate.url)
+        content_type = (head.headers.get("content-type") or "").lower()
+        if "application/vnd.apple.mpegurl" in content_type or "application/x-mpegurl" in content_type:
+            return ".m3u8"
+        if "application/dash+xml" in content_type:
+            return "DASH"
+        if "multipart/x-mixed-replace" in content_type or "mjpeg" in content_type:
+            return "MJPEG"
+        if content_type.startswith("video/mp4"):
+            return "MP4-only"
+        if content_type.startswith("image/jpeg"):
+            return "JPEG-refresh"
+    except Exception:
+        pass
+
+    try:
+        get_resp = await client.get(candidate.url, headers={"Range": "bytes=0-8191"})
+        body_text = get_resp.text[:8192].upper()
+        if "#EXTM3U" in body_text:
+            return ".m3u8"
+        if "<MPD" in body_text:
+            return "DASH"
+    except Exception:
+        pass
+
+    return initial
+
+
+async def _resolve_report_formats(candidates: list[CameraCandidate]) -> list[str]:
+    """Return one format bucket per candidate using URL + HTTP probe classification."""
+    sem = asyncio.Semaphore(20)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=3.0, read=6.0, write=4.0, pool=3.0),
+        follow_redirects=True,
+        headers={"User-Agent": _BROWSER_UA},
+    ) as client:
+        async def _classify(candidate: CameraCandidate) -> str:
+            async with sem:
+                return await _classify_camera_format_with_probe(client, candidate)
+        return await asyncio.gather(*[_classify(c) for c in candidates])
+
+
+def _render_format_breakdown_html(
+    candidates: list[CameraCandidate], formats: Sequence[str]
+) -> str:
     """Render per-city/country format counts as a single HTML table."""
     counts: dict[tuple[str, str], defaultdict[str, int]] = {}
-    for candidate in candidates:
+    totals_by_bucket: defaultdict[str, int] = defaultdict(int)
+    for candidate, format_bucket in zip(candidates, formats):
         city = candidate.city or "Unknown"
         country = candidate.country or "Unknown"
         key = (city, country)
         if key not in counts:
             counts[key] = defaultdict(int)
-        counts[key][_classify_camera_format(candidate.url)] += 1
+        counts[key][format_bucket] += 1
+        totals_by_bucket[format_bucket] += 1
 
     headers = ["City", "Country", *FORMAT_BUCKETS, "Total"]
     lines = [
@@ -452,7 +514,7 @@ def _render_format_breakdown_html(candidates: list[CameraCandidate]) -> str:
         ]
     )
 
-    for city, country in sorted(counts.keys()):
+    for city, country in sorted(counts.keys(), key=lambda row: (row[1], row[0])):
         row_counts = counts[(city, country)]
         total = sum(row_counts.values())
         lines.append("      <tr>")
@@ -462,6 +524,15 @@ def _render_format_breakdown_html(candidates: list[CameraCandidate]) -> str:
             lines.append(f"        <td class=\"num\">{row_counts.get(bucket, 0)}</td>")
         lines.append(f"        <td class=\"num\">{total}</td>")
         lines.append("      </tr>")
+
+    grand_total = sum(totals_by_bucket.values())
+    lines.append("      <tr>")
+    lines.append("        <td><strong>Total</strong></td>")
+    lines.append("        <td></td>")
+    for bucket in FORMAT_BUCKETS:
+        lines.append(f"        <td class=\"num\"><strong>{totals_by_bucket.get(bucket, 0)}</strong></td>")
+    lines.append(f"        <td class=\"num\"><strong>{grand_total}</strong></td>")
+    lines.append("      </tr>")
 
     lines.extend(
         [
@@ -853,8 +924,9 @@ def main() -> None:
     )
     if args.format_report_html is not None:
         args.format_report_html.parent.mkdir(parents=True, exist_ok=True)
+        formats = asyncio.run(_resolve_report_formats(candidates))
         args.format_report_html.write_text(
-            _render_format_breakdown_html(candidates),
+            _render_format_breakdown_html(candidates, formats),
             encoding="utf-8",
         )
         logger.info(
