@@ -677,7 +677,7 @@ def main() -> None:
     parser.add_argument(
         "--blocked-location",
         action="append",
-        default=[country:Russia, country:China, country:Ukraine, country:Africa, country:Israel],
+        default=["country:Russia", "country:China", "country:Ukraine", "country:Africa", "country:Israel"],
         help=(
             "Blocked location term. Repeat as needed. Supports raw terms "
             "or field-aware entries like city:Paris, country:France, source:example.com."
