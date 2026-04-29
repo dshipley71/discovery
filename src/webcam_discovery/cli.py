@@ -13,11 +13,15 @@ from webcam_discovery.agents.catalog import CatalogAgent
 from webcam_discovery.agents.directory_crawler import DirectoryAgent
 from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
+from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
+from webcam_discovery.agents.deep_discovery_agent import DeepDiscoveryAgent
 from webcam_discovery.agents.validator import ValidationAgent
 from webcam_discovery.agents.video_summarization_agent import VideoSummarizationAgent
 from webcam_discovery.config import settings
 from webcam_discovery.memory.factory import create_memory_backend
 from webcam_discovery.schemas import CameraCandidate
+from webcam_discovery.models.deep_discovery import PageCandidate, StreamCandidate
+from webcam_discovery.skills.candidate_relevance import CandidateRelevanceFilter
 from webcam_discovery.skills.location_expansion import LocationExpansionSkill
 from webcam_discovery.skills.visual_stream_analysis import VisualStreamAnalysis
 
@@ -75,6 +79,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     dir_agent = DirectoryAgent()
     search_agent = SearchAgent()
     candidates: list[CameraCandidate] = []
+    page_candidates: list[PageCandidate] = []
     seen: set[str] = set()
 
     async def _collect(gen):
@@ -105,9 +110,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
                         settings.log_dir / "search_queries.jsonl",
                         {"run_id": run_id, "query": q, "source": "planner_location_search"},
                     ),
-                    on_result=lambda r: _append_jsonl(
-                        settings.log_dir / "search_results.jsonl",
-                        {"run_id": run_id, **r},
+                    on_result=lambda r: (
+                        _append_jsonl(settings.log_dir / "search_results.jsonl", {"run_id": run_id, **r}),
+                        page_candidates.append(PageCandidate(run_id=run_id, user_query=args.query, source_query=r.get("query"), url=r.get("url", ""), title=r.get("title"), snippet=r.get("snippet"), target_locations=target_locations, camera_types=camera_types)),
+                        _append_jsonl(settings.candidates_dir / "search_page_candidates.jsonl", PageCandidate(run_id=run_id, user_query=args.query, source_query=r.get("query"), url=r.get("url", ""), title=r.get("title"), snippet=r.get("snippet"), target_locations=target_locations, camera_types=camera_types).model_dump()),
                     ),
                 )
             )
@@ -126,8 +132,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
             },
         )
 
+    stream_candidates: list[StreamCandidate] = [
+        StreamCandidate(run_id=run_id, user_query=args.query, source_query=next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None), candidate_url=c.url, source_page=c.source_refs[0] if c.source_refs else None, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6)
+        for c in candidates
+    ]
+    if getattr(args, "enable_deep_discovery", True) and page_candidates:
+        triaged = SearchResultTriageAgent().triage(page_candidates, target_locations, location_search_plan.agencies, camera_types)
+        deep_agent = DeepDiscoveryAgent(settings.log_dir, settings.candidates_dir, getattr(args, "max_links_per_page", 25), getattr(args, "max_js_assets_per_page", 20))
+        deep_streams = await deep_agent.discover(triaged, args.query, target_locations, location_search_plan.agencies, camera_types, getattr(args, "max_deep_depth", 3), getattr(args, "max_deep_pages", 100), getattr(args, "max_network_capture_pages", 10), getattr(args, "network_capture_timeout", 8))
+        stream_candidates.extend(deep_streams)
+
+    dedup = {s.candidate_url: s for s in stream_candidates}
+    decisions = CandidateRelevanceFilter().filter(list(dedup.values()), target_locations, location_search_plan.agencies, camera_types)
+    validation_candidates = []
+    for sc, decision in decisions:
+        _append_jsonl(settings.log_dir / "candidate_relevance.jsonl", decision.model_dump())
+        if decision.accepted:
+            validation_candidates.append(CameraCandidate(url=sc.candidate_url, source_refs=[f"query:{sc.source_query}" if sc.source_query else ""]))
+
     validator = ValidationAgent()
-    records = await validator.run(candidates=candidates)
+    records = await validator.run(candidates=validation_candidates)
     if args.max_streams:
         records = records[: args.max_streams]
 
@@ -187,6 +211,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-search-queries", type=int, default=25)
     run.add_argument("--max-search-results-per-query", type=int, default=10)
     run.add_argument("--ignore-sources-md", action="store_true")
+    run.add_argument("--enable-deep-discovery", action="store_true", default=True)
+    run.add_argument("--disable-deep-discovery", action="store_false", dest="enable_deep_discovery")
+    run.add_argument("--max-deep-depth", type=int, default=3)
+    run.add_argument("--max-deep-pages", type=int, default=100)
+    run.add_argument("--max-links-per-page", type=int, default=25)
+    run.add_argument("--max-js-assets-per-page", type=int, default=20)
+    run.add_argument("--max-network-capture-pages", type=int, default=10)
+    run.add_argument("--network-capture-timeout", type=int, default=8)
+    run.add_argument("--max-total-deep-dive-seconds", type=int, default=180)
     run.add_argument("--enable-memory", action="store_true")
     run.add_argument("--enable-visual-analysis", action="store_true")
     run.add_argument("--enable-video-summary", action="store_true")
