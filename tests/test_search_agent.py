@@ -80,9 +80,15 @@ def test_duckduckgo_search_suppresses_legacy_rename_warning(monkeypatch) -> None
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        urls = asyncio.run(search_agent_module._duckduckgo_search("Tokyo webcam"))
+        results = asyncio.run(search_agent_module._duckduckgo_search("Tokyo webcam"))
 
-    assert urls == ["https://allowed.example/live/master.m3u8"]
+    assert results == [
+        {
+            "url": "https://allowed.example/live/master.m3u8",
+            "title": "",
+            "snippet": "",
+        }
+    ]
 
 
 def test_search_agent_extracts_direct_hls_candidates(

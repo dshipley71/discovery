@@ -306,3 +306,14 @@ Any publicly accessible feed found via search that passes validation, regardless
 - **Always** verify that `url` resolves directly to a live HLS `.m3u8` playlist — HTML pages, embeds, JPEG refresh URLs, and any non-HLS protocol are invalid
 - **Always** include `latitude` and `longitude` on every record — run `GeoEnrichmentSkill` if missing; a record without coordinates cannot appear on the map
 - **Always** invoke `MapAgent` after any catalog update to regenerate `map.html`
+
+---
+
+## Agentic Planner / Memory / Analysis Extensions
+
+- `PlannerAgent` now supports real LLM-backed planning (`ollama` default; `openai-compatible` optional). No mock planner path is provided.
+- Optional `MemWeave` sidecar memory can be enabled via config/env/CLI and stores markdown run summaries under `memory/runs/`.
+- Optional `VisualStreamAnalysis` provides bounded stream behavior classification and maps detailed substatus to public `live|dead|unknown` output status.
+- Optional `VideoSummarizationAgent` generates bounded visual and optional audio summaries from real stream samples.
+- New command: `webcam-discovery run-agentic "<natural language query>"`.
+- New logs: `planner_runs.jsonl`, `visual_stream_analysis.jsonl`, `video_summaries.jsonl`, `memory_updates.jsonl`.

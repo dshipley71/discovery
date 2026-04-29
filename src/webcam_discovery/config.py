@@ -56,6 +56,39 @@ class Settings(BaseSettings):
     use_ffprobe_validation:          bool = True
     ffprobe_concurrency:             int  = 5    # simultaneous ffprobe subprocess calls
 
+    # Planner backend (real LLM only)
+    planner_provider: str = "ollama"   # ollama | openai-compatible
+    planner_model: str = "gemma3:27b"
+    planner_base_url: str = ""
+    planner_api_key: str = ""
+
+    # Optional memory layer
+    memory_enabled: bool = False
+    memory_backend: str = "memweave"
+    memory_workspace_dir: Path = Path("memory")
+    memory_search_before_planning: bool = True
+    memory_write_run_summaries: bool = True
+
+    # Visual stream analysis (bounded)
+    visual_stream_analysis_enabled: bool = False
+    visual_dense_sample_seconds: int = 1
+    visual_medium_sample_seconds: int = 5
+    visual_coarse_sample_seconds: int = 10
+    visual_total_sample_duration_seconds: int = 30
+    visual_playlist_growth_check_seconds: int = 6
+    visual_max_frames: int = 8
+    visual_timeout_seconds: int = 60
+
+    # Video summarization (bounded)
+    video_summary_enabled: bool = False
+    video_summary_sample_duration_seconds: int = 30
+    video_summary_sample_interval_seconds: int = 5
+    video_summary_max_frames: int = 8
+    video_summary_enable_audio: bool = True
+    video_summary_whisper_model: str = "small"
+    video_summary_audio_duration_seconds: int = 30
+    video_summary_timeout_seconds: int = 60
+
     model_config = {"env_file": ".env", "env_prefix": "WCD_"}
 
     # ── Hardcoded system constraints ──────────────────────────────────────────

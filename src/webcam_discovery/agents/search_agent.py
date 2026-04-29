@@ -289,7 +289,7 @@ def _load_ddgs_class() -> tuple[type, bool]:
             ) from exc
 
 
-async def _duckduckgo_search(query: str) -> list[str]:
+async def _duckduckgo_search(query: str) -> list[dict]:
     """
     Execute a DuckDuckGo search and return result URLs.
 
@@ -315,12 +315,18 @@ async def _duckduckgo_search(query: str) -> list[str]:
             None,
             _run_search,
         )
-        urls: list[str] = []
+        normalized_results: list[dict] = []
         for r in results:
             href = r.get("href", "")
             if href.startswith("http") and not _is_blocked(href):
-                urls.append(href)
-        return urls
+                normalized_results.append(
+                    {
+                        "url": href,
+                        "title": r.get("title", ""),
+                        "snippet": r.get("body", ""),
+                    }
+                )
+        return normalized_results
     except DuckDuckGoSearchBlocked:
         raise
     except Exception as exc:
@@ -513,6 +519,87 @@ class SearchAgent:
             len(seen_urls), len(city_plan),
         )
 
+    async def stream_queries(
+        self,
+        *,
+        custom_queries: list[str] | None = None,
+        raw_query: str | None = None,
+        max_results_per_query: int | None = None,
+        query_source: str = "planner_location_search",
+        on_query: Callable[[str], None] | None = None,
+        on_result: Callable[[dict], None] | None = None,
+    ) -> AsyncGenerator[CameraCandidate, None]:
+        """
+        Stream candidates using planner-derived custom queries.
+
+        Priority:
+        1. custom_queries (if provided)
+        2. raw_query-derived fallback terms
+        3. empty query plan (no unrelated hardcoded geography fallback)
+        """
+        queries = [q.strip() for q in (custom_queries or []) if q and q.strip()]
+        if not queries and raw_query:
+            rq = raw_query.strip()
+            queries = [
+                f"{rq} traffic camera live public",
+                f"{rq} live camera m3u8",
+                f"{rq} HLS camera",
+                f"{rq} public webcam stream",
+            ]
+        if not queries:
+            logger.warning("SearchAgent.stream_queries: no queries to run")
+            return
+
+        page_semaphore = asyncio.Semaphore(self.RESULT_PAGE_CONCURRENCY)
+        search_semaphore = asyncio.Semaphore(self.CONCURRENCY)
+        seen_urls: set[str] = set()
+        max_per_query = (
+            max_results_per_query
+            if max_results_per_query is not None
+            else self.MAX_RESULTS_PER_QUERY
+        )
+        progress = tqdm(
+            total=len(queries),
+            desc="SearchAgent custom queries",
+            unit="query",
+            dynamic_ncols=True,
+            disable=not self._show_progress,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0),
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; WebcamDiscoveryBot/1.0)"},
+            ) as client:
+                for q in queries:
+                    if on_query:
+                        on_query(q)
+                    if not self._duckduckgo_available:
+                        break
+                    try:
+                        candidates = await self._search_city(
+                            client=client,
+                            city=raw_query or "custom",
+                            queries=[q],
+                            search_semaphore=search_semaphore,
+                            page_semaphore=page_semaphore,
+                            max_results_per_query=max_per_query,
+                            on_result=on_result,
+                        )
+                    finally:
+                        progress.update(1)
+
+                    for c in candidates:
+                        refs = list(c.source_refs)
+                        if f"query_source:{query_source}" not in refs:
+                            refs.append(f"query_source:{query_source}")
+                            c = c.model_copy(update={"source_refs": refs})
+                        if c.url not in seen_urls:
+                            seen_urls.add(c.url)
+                            yield c
+        finally:
+            progress.close()
+
     async def _search_city(
         self,
         client: httpx.AsyncClient,
@@ -520,6 +607,8 @@ class SearchAgent:
         queries: list[str],
         search_semaphore: asyncio.Semaphore,
         page_semaphore: asyncio.Semaphore,
+        max_results_per_query: int | None = None,
+        on_result: Callable[[dict], None] | None = None,
         on_query_complete: Callable[[], None] | None = None,
     ) -> list[CameraCandidate]:
         """Generate queries for one city, search DuckDuckGo, and extract direct HLS URLs."""
@@ -541,7 +630,20 @@ class SearchAgent:
                         on_query_complete()
                 await asyncio.sleep(0.5)  # polite delay between requests
 
-            for url in urls[: self.MAX_RESULTS_PER_QUERY]:
+            limit = max_results_per_query if max_results_per_query is not None else self.MAX_RESULTS_PER_QUERY
+            for result in urls[:limit]:
+                if isinstance(result, str):
+                    result = {"url": result, "title": "", "snippet": ""}
+                url = result.get("url", "")
+                if on_result and url:
+                    on_result(
+                        {
+                            "query": query,
+                            "url": url,
+                            "title": result.get("title", ""),
+                            "snippet": result.get("snippet", ""),
+                        }
+                    )
                 if _is_blocked(url):
                     continue
                 if _HLS_RE.search(url):
@@ -677,7 +779,7 @@ def main() -> None:
     parser.add_argument(
         "--blocked-location",
         action="append",
-        default=[country:Russia, country:China, country:Ukraine, country:Africa, country:Israel],
+        default=[],
         help=(
             "Blocked location term. Repeat as needed. Supports raw terms "
             "or field-aware entries like city:Paris, country:France, source:example.com."

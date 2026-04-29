@@ -37,6 +37,10 @@ class CameraCandidate(BaseModel):
     source_directory: Optional[str]  = None
     source_refs:      list[str]      = []
     notes:            Optional[str]  = None
+    stream_substatus: Optional[str] = None
+    stream_confidence: Optional[float] = None
+    stream_reasons: list[str] = []
+    visual_metrics: dict = {}
 
 
 class CameraRecord(BaseModel):
@@ -64,6 +68,10 @@ class CameraRecord(BaseModel):
     last_verified:    Optional[str]  = None           # ISO date string
     status:           CameraStatus   = "unknown"
     notes:            Optional[str]  = None
+    stream_substatus: Optional[str] = None
+    stream_confidence: Optional[float] = None
+    stream_reasons: list[str] = []
+    visual_metrics: dict = {}
 
     @field_validator("latitude")
     @classmethod
