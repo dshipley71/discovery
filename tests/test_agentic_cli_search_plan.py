@@ -78,6 +78,13 @@ def test_run_agentic_writes_search_audit_files_and_ignores_sources(tmp_path, mon
         enable_video_summary=False,
         llm_provider=None,
         llm_model=None,
+        enable_deep_discovery=False,
+        max_links_per_page=25,
+        max_js_assets_per_page=20,
+        max_deep_depth=3,
+        max_deep_pages=100,
+        max_network_capture_pages=10,
+        network_capture_timeout=8,
     )
 
     asyncio.run(cli.run_agentic(args))
