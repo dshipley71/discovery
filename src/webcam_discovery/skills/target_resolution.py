@@ -39,6 +39,7 @@ ALIAS_MAP = {"pennsylvania": ["PA"], "united kingdom": ["UK", "Britain"]}
 class TargetResolutionSkill:
     def resolve(self, user_query: str, planner_locations: list[str] | None = None) -> TargetResolutionResult:
         q = user_query.strip()
+        q = re.sub(r"\band\s+ignore\s+sources?\.md\b", "", q, flags=re.I).strip()
         if q.casefold() in INSUFFICIENT:
             return TargetResolutionResult(user_query=q, insufficient_target=True, message=self._insufficient_message())
 

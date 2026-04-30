@@ -144,10 +144,12 @@ async def run_agentic(args: argparse.Namespace) -> None:
             },
         )
 
-    stream_candidates: list[StreamCandidate] = [
-        StreamCandidate(run_id=run_id, user_query=args.query, source_query=next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None), candidate_url=c.url, source_page=c.source_refs[0] if c.source_refs else None, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6)
-        for c in candidates
-    ]
+    stream_candidates: list[StreamCandidate] = []
+    for c in candidates:
+        sq = next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None)
+        src_page = next((ref for ref in c.source_refs if ref.startswith(("http://", "https://"))), None)
+        root = src_page.split("/")[0] if src_page else None
+        stream_candidates.append(StreamCandidate(run_id=run_id, user_query=args.query, source_query=sq, candidate_url=c.url, source_page=src_page, root_url=src_page, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6))
     if getattr(args, "enable_deep_discovery", True) and page_candidates:
         triaged = SearchResultTriageAgent().triage(page_candidates, target_locations, location_search_plan.agencies, camera_types)
         deep_agent = DeepDiscoveryAgent(settings.log_dir, settings.candidates_dir, getattr(args, "max_links_per_page", 25), getattr(args, "max_js_assets_per_page", 20))
@@ -194,9 +196,18 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "raw": len(stream_candidates),
             "relevance_passed": len(validation_candidates),
             "robots_passed": len(validation_candidates),
-            "http_live": len(records),
-            "ffprobe_live": len(records),
-            "playlist_live": len([r for r in records if (getattr(r, "notes", "") or "").find("playlist:live_playlist") >= 0]),
+            "http_live": len([r for r in records if r.status == "live"]),
+            "http_dead": len([r for r in records if r.status == "dead"]),
+            "http_unknown": len([r for r in records if r.status == "unknown"]),
+            "http_timeout": 0,
+            "http_other": max(0, len(records) - (len([r for r in records if r.status == "live"]) + len([r for r in records if r.status == "dead"]) + len([r for r in records if r.status == "unknown"]))),
+            "ffprobe_live": len([r for r in records if r.status == "live"]),
+            "ffprobe_dead": len([r for r in records if r.status == "dead"]),
+            "ffprobe_unknown": len([r for r in records if r.status == "unknown"]),
+            "playlist_live": len([r for r in records if "playlist:live_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_vod": len([r for r in records if "playlist:vod_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_static": len([r for r in records if "playlist:static_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_unknown": len([r for r in records if "playlist:unknown_playlist" in ((getattr(r, "notes", "") or "") or "playlist:playlist_fetch_failed" in ((getattr(r, "notes", "") or "")))]),
             "mapped": len(mapped_records),
             "needs_review_location_unknown": len(unknown_location),
             "rejected": sum(rejection_reasons.values()),
@@ -238,7 +249,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "summary_title": args.query,
         })
 
-    logger.info("run-agentic complete — {} records", len(records))
+    logger.info("run-agentic complete — mapped={}, needs_review_location_unknown={}, rejected={}", len(mapped_records), len(unknown_location), sum(rejection_reasons.values()))
 
 
 def build_parser() -> argparse.ArgumentParser:
