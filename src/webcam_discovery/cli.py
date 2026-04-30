@@ -14,6 +14,7 @@ from webcam_discovery.agents.directory_crawler import DirectoryAgent
 from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
 from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
+from webcam_discovery.agents.target_resolution_agent import TargetResolutionAgent
 from webcam_discovery.agents.deep_discovery_agent import DeepDiscoveryAgent
 from webcam_discovery.agents.validator import ValidationAgent
 from webcam_discovery.agents.video_summarization_agent import VideoSummarizationAgent
@@ -49,6 +50,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
     if args.enable_video_summary:
         settings.video_summary_enabled = True
 
+    if getattr(args, "catalog_mode", False):
+        args.max_search_queries = max(args.max_search_queries, 50)
+        args.max_search_results_per_query = max(args.max_search_results_per_query, 20)
+        args.max_deep_pages = max(getattr(args, "max_deep_pages", 100), 300)
+        args.max_candidates = max(args.max_candidates, 500)
+        args.max_streams = max(args.max_streams, 250)
+
     memory = create_memory_backend()
     memory_hints = memory.search(args.query, limit=5) if (memory and settings.memory_search_before_planning) else []
 
@@ -63,7 +71,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "memory_hints": memory_hints,
     })
 
-    target_locations = plan.target_locations or plan.parsed_intent.geography
+    target_resolution = TargetResolutionAgent().resolve(args.query, plan)
+    (settings.log_dir / "target_resolution.json").write_text(json.dumps(target_resolution.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    if target_resolution.insufficient_target:
+        logger.warning(target_resolution.message)
+        return
+
+    target_locations = [t.normalized_name or t.raw_text for t in target_resolution.targets]
     camera_types = plan.camera_types or plan.parsed_intent.camera_types
     location_search_plan = LocationExpansionSkill().expand(
         target_locations=target_locations,
@@ -165,6 +179,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             record.stream_reasons = result.stream_reasons
             record.visual_metrics = result.visual_metrics
             _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
+            _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
 
     if settings.video_summary_enabled:
         summarizer = VideoSummarizationAgent()
@@ -210,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-streams", type=int, default=10)
     run.add_argument("--max-search-queries", type=int, default=25)
     run.add_argument("--max-search-results-per-query", type=int, default=10)
+    run.add_argument("--catalog-mode", action="store_true")
     run.add_argument("--ignore-sources-md", action="store_true")
     run.add_argument("--enable-deep-discovery", action="store_true", default=True)
     run.add_argument("--disable-deep-discovery", action="store_false", dest="enable_deep_discovery")
