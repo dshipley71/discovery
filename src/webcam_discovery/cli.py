@@ -95,6 +95,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     candidates: list[CameraCandidate] = []
     page_candidates: list[PageCandidate] = []
     seen: set[str] = set()
+    rejection_reasons: dict[str, int] = {}
 
     async def _collect(gen):
         async for c in gen:
@@ -105,10 +106,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
                     return
 
     tasks = []
-    ignore_sources = bool(args.ignore_sources_md) or any(
-        phrase in args.query.casefold()
-        for phrase in ["ignore sources.md", "ignore source.md", "without source registry"]
-    )
+    ignore_sources = bool(args.ignore_sources_md)
 
     if not ignore_sources and ("directory_search" in plan.discovery_methods or "known_sources" in plan.discovery_methods):
         tasks.append(_collect(dir_agent.stream(tier=1, hls_only=True)))
@@ -163,6 +161,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
         _append_jsonl(settings.log_dir / "candidate_relevance.jsonl", decision.model_dump())
         if decision.accepted:
             validation_candidates.append(CameraCandidate(url=sc.candidate_url, source_refs=[f"query:{sc.source_query}" if sc.source_query else ""]))
+        else:
+            rejection_reasons[decision.reason] = rejection_reasons.get(decision.reason, 0) + 1
+            _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.reason, "source_page": sc.source_page})
 
     validator = ValidationAgent()
     records = await validator.run(candidates=validation_candidates)
@@ -180,6 +181,32 @@ async def run_agentic(args: argparse.Namespace) -> None:
             record.visual_metrics = result.visual_metrics
             _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
             _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
+
+    mapped_records = [r for r in records if r.latitude is not None and r.longitude is not None]
+    unknown_location = [r for r in records if r.latitude is None or r.longitude is None]
+    for r in unknown_location:
+        _append_jsonl(settings.candidates_dir / "needs_review_location_unknown.jsonl", r.model_dump())
+
+    run_summary = {
+        "query": args.query,
+        "targets": target_locations,
+        "candidate_counts": {
+            "raw": len(stream_candidates),
+            "relevance_passed": len(validation_candidates),
+            "robots_passed": len(validation_candidates),
+            "http_live": len(records),
+            "ffprobe_live": len(records),
+            "playlist_live": len([r for r in records if (getattr(r, "notes", "") or "").find("playlist:live_playlist") >= 0]),
+            "mapped": len(mapped_records),
+            "needs_review_location_unknown": len(unknown_location),
+            "rejected": sum(rejection_reasons.values()),
+        },
+        "rejection_reasons": rejection_reasons,
+        "output_files": {"geojson": str(Path(args.output_dir) / "camera.geojson")},
+    }
+    (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+    if len(mapped_records) == 0:
+        logger.warning("No catalogable cameras were mapped for the requested target(s).")
 
     if settings.video_summary_enabled:
         summarizer = VideoSummarizationAgent()

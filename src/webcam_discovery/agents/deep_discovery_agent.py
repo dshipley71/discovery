@@ -64,12 +64,23 @@ class DeepDiscoveryAgent:
                 self._append(self.log_dir / "deep_dive_fetches.jsonl", {"root_url": plan.root_url, "url": url, "depth": depth, "status_code": None, "content_type": "", "strategy": "same_domain_links", "error": str(exc)})
                 continue
             text = r.text
-            self._append(self.log_dir / "deep_dive_fetches.jsonl", {"root_url": plan.root_url, "url": url, "depth": depth, "status_code": r.status_code, "content_type": r.headers.get("content-type", ""), "strategy": "same_domain_links"})
+            ctype = (r.headers.get("content-type", "") or "").lower()
+            self._append(self.log_dir / "deep_dive_fetches.jsonl", {"root_url": plan.root_url, "url": url, "depth": depth, "status_code": r.status_code, "content_type": ctype, "strategy": "same_domain_links"})
             for m in HLS_RE.findall(text):
                 sc = StreamCandidate(user_query=user_query, source_query=plan.source_query, search_result_url=plan.root_url, root_url=plan.root_url, source_page=url, parent_pages=parents, depth=depth, discovery_strategy="static_html", candidate_url=urljoin(url, m), target_locations=plan.target_locations, camera_types=plan.camera_types, page_type=plan.page_type, page_relevance_score=plan.relevance_score, camera_likelihood_score=plan.camera_likelihood_score)
                 out.append(sc)
                 self._append(self.candidates_dir / "extracted_stream_candidates.jsonl", sc.model_dump())
-            soup = BeautifulSoup(text, "html.parser")
+            if "json" in ctype:
+                soup = None
+            elif "xml" in ctype:
+                try:
+                    soup = BeautifulSoup(text, features="xml")
+                except Exception:
+                    soup = BeautifulSoup(text, "html.parser")
+            else:
+                soup = BeautifulSoup(text, "html.parser")
+            if soup is None:
+                continue
             for iframe in soup.select("iframe[src]"):
                 iframe_url = urljoin(url, iframe["src"])
                 if urlparse(iframe_url).netloc == root_domain:
