@@ -44,6 +44,11 @@ class CameraCandidate(BaseModel):
     source_page:      Optional[str] = None
     source_record_id: Optional[str] = None
     raw_metadata:     dict[str, Any] = Field(default_factory=dict)
+    source_domain:    Optional[str] = None
+    source_query:     Optional[str] = None
+    target_locations: list[str] = Field(default_factory=list)
+    url_metadata_hints: dict[str, Any] = Field(default_factory=dict)
+    location_text_candidates: list[dict[str, Any]] = Field(default_factory=list)
     stream_substatus: Optional[str] = None
     stream_confidence: Optional[float] = None
     stream_reasons: list[str] = Field(default_factory=list)
@@ -79,6 +84,8 @@ class CameraRecord(BaseModel):
     stream_confidence: Optional[float] = None
     stream_reasons: list[str] = Field(default_factory=list)
     visual_metrics: dict[str, Any] = Field(default_factory=dict)
+    raw_metadata: dict[str, Any] = Field(default_factory=dict)
+    location_text_candidates: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("latitude")
     @classmethod
