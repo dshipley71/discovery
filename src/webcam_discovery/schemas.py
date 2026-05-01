@@ -6,8 +6,8 @@ All agents and skills import from here — never redefine these models elsewhere
 Part of the Public Webcam Discovery System.
 """
 from __future__ import annotations
-from typing import Literal, Optional
-from pydantic import BaseModel, field_validator
+from typing import Any, Literal, Optional
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Feed types ────────────────────────────────────────────────────────────────
@@ -35,12 +35,19 @@ class CameraCandidate(BaseModel):
     state_region:     Optional[str]  = None   # state / province / region extracted from URL path
     country:          Optional[str]  = None
     source_directory: Optional[str]  = None
-    source_refs:      list[str]      = []
+    source_refs:      list[str]      = Field(default_factory=list)
     notes:            Optional[str]  = None
+    latitude:         Optional[float] = None
+    longitude:        Optional[float] = None
+    viewer_url:       Optional[str] = None
+    feed_endpoint:    Optional[str] = None
+    source_page:      Optional[str] = None
+    source_record_id: Optional[str] = None
+    raw_metadata:     dict[str, Any] = Field(default_factory=dict)
     stream_substatus: Optional[str] = None
     stream_confidence: Optional[float] = None
-    stream_reasons: list[str] = []
-    visual_metrics: dict = {}
+    stream_reasons: list[str] = Field(default_factory=list)
+    visual_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CameraRecord(BaseModel):
@@ -61,17 +68,17 @@ class CameraRecord(BaseModel):
     url:              str                              # direct stream URL (.m3u8)
     feed_type:        FeedType        = "unknown"
     playlist_type:    Optional[Literal["master", "media"]] = None
-    variant_streams:  list[str]       = []            # variant URLs from master playlist
+    variant_streams:  list[str]       = Field(default_factory=list)            # variant URLs from master playlist
     source_directory: Optional[str]  = None
-    source_refs:      list[str]      = []
+    source_refs:      list[str]      = Field(default_factory=list)
     legitimacy_score: LegitimacyScore = "medium"
     last_verified:    Optional[str]  = None           # ISO date string
     status:           CameraStatus   = "unknown"
     notes:            Optional[str]  = None
     stream_substatus: Optional[str] = None
     stream_confidence: Optional[float] = None
-    stream_reasons: list[str] = []
-    visual_metrics: dict = {}
+    stream_reasons: list[str] = Field(default_factory=list)
+    visual_metrics: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("latitude")
     @classmethod

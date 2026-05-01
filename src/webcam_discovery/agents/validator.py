@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import json
+import hashlib
 from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
@@ -510,14 +511,15 @@ class ValidationAgent:
         )
 
         # ── Step 4: geo-enrich (batch async with cache warming) ───────────────
-        geo_results = await self._batch_geo_enrich(
-            geo_skill, [c for c, _ in to_enrich]
-        )
+        candidates_for_geo = [c for c, _ in to_enrich if c.latitude is None or c.longitude is None]
+        geo_results_all = await self._batch_geo_enrich(geo_skill, candidates_for_geo)
+        geo_result_by_url = {c.url: g for c, g in zip(candidates_for_geo, geo_results_all)}
 
         records: list[CameraRecord] = []
 
         # ── Step 5: build CameraRecord objects ────────────────────────────────
-        for (candidate, v), geo in zip(to_enrich, geo_results):
+        for (candidate, v) in to_enrich:
+            geo = geo_result_by_url.get(candidate.url)
             effective_url = _browser_stream_map.get(candidate.url, candidate.url)
             feed_type_result = type_skill.run(FeedTypeInput(
                 url=effective_url,
@@ -534,9 +536,23 @@ class ValidationAgent:
             continent  = "Unknown"
             region:  Optional[str] = None
 
+            coordinate_source = "feed" if candidate.latitude is not None and candidate.longitude is not None else "geocoder"
+            if candidate.latitude is not None and candidate.longitude is not None:
+                latitude = candidate.latitude
+                longitude = candidate.longitude
+            elif candidate.notes:
+                try:
+                    note_data = json.loads(candidate.notes)
+                    latitude = latitude if latitude is not None else note_data.get("latitude")
+                    longitude = longitude if longitude is not None else note_data.get("longitude")
+                    if latitude is not None and longitude is not None:
+                        coordinate_source = "legacy_notes"
+                except Exception:
+                    pass
+
             if isinstance(geo, Exception):
                 logger.warning("ValidationAgent: geo error for '{}': {}", city, geo)
-            elif geo is not None:
+            elif geo is not None and (latitude is None or longitude is None):
                 _append_jsonl(settings.log_dir / "geocoding_results.jsonl", [{"url": candidate.url, "latitude": geo.latitude, "longitude": geo.longitude, "country": geo.country, "region": geo.region, "continent": geo.continent}])
                 latitude   = geo.latitude
                 longitude  = geo.longitude
@@ -545,11 +561,12 @@ class ValidationAgent:
                 if geo.country:
                     country = geo.country
 
-            record_id = _make_slug(city, label) or _make_slug("camera", effective_url[-30:])
+            record_id = _make_slug(city, label) or f"unknown-{hashlib.sha1(effective_url.encode()).hexdigest()[:10]}"
 
             notes = candidate.notes or ""
             if latitude is None:
                 notes = f"{notes} location_unknown".strip()
+            notes = f"{notes} coordinate_source={coordinate_source}".strip()
 
             source_refs = list(candidate.source_refs) if candidate.source_refs else []
             if effective_url != candidate.url and candidate.url not in source_refs:

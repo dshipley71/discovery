@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 from urllib.parse import urljoin
+from urllib.parse import urlparse
 
 
 def walk_urls(payload: Any) -> list[tuple[str, str]]:
@@ -48,9 +49,13 @@ def extract_camera_records(payload: Any, base_url: str = "") -> list[dict]:
             "viewer_url": obj.get("viewer_url") or obj.get("url"),
             "label": obj.get("name") or obj.get("camera_name") or obj.get("title") or "camera",
             "city": obj.get("city"),
+            "state_region": obj.get("state") or obj.get("region") or obj.get("state_region"),
             "country": obj.get("country"),
             "latitude": lat,
             "longitude": lon,
+            "source_record_id": str(obj.get("id") or obj.get("camera_id") or obj.get("record_id") or ""),
+            "source_page": obj.get("page_url") or obj.get("source_url") or base_url,
+            "source_directory": urlparse(base_url).netloc or None,
             "metadata": obj,
         })
     return records
