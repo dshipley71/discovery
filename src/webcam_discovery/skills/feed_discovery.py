@@ -40,7 +40,27 @@ class FeedDiscoverySkill:
                     continue
                 result.endpoints_parsed += 1
                 for rec in extract_camera_records(payload, base_url=e):
-                    cand = CameraCandidate(url=rec["stream_url"], label=rec.get("label"), city=rec.get("city"), country=rec.get("country"), notes=json.dumps({"latitude": rec.get("latitude"), "longitude": rec.get("longitude"), "viewer_url": rec.get("viewer_url")}), source_refs=[e])
+                    source_page = rec.get("source_page")
+                    source_refs = [e]
+                    if source_page:
+                        source_refs.append(source_page)
+                    cand = CameraCandidate(
+                        url=rec["stream_url"],
+                        label=rec.get("label"),
+                        city=rec.get("city"),
+                        state_region=rec.get("state_region"),
+                        country=rec.get("country"),
+                        latitude=rec.get("latitude"),
+                        longitude=rec.get("longitude"),
+                        viewer_url=rec.get("viewer_url"),
+                        feed_endpoint=e,
+                        source_page=source_page,
+                        source_record_id=rec.get("source_record_id"),
+                        raw_metadata=rec.get("metadata") or {},
+                        notes=json.dumps({"coordinate_source": "feed"}),
+                        source_refs=source_refs,
+                        source_directory=rec.get("source_directory"),
+                    )
                     result.candidates.append(cand)
                     result.records_extracted += 1
                     if result.records_extracted >= max_records:

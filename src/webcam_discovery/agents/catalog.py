@@ -89,6 +89,11 @@ class CatalogAgent:
             "CatalogAgent: {} unique records after dedup (dropped {})",
             len(canonical_catalog), len(records) - len(canonical_catalog),
         )
+        summary = {
+            "records_received": len(records),
+            "records_deduplicated": len(records) - len(canonical_catalog),
+            "unique_records": len(canonical_catalog),
+        }
 
         # Step 2: Export to camera.geojson
         output_dir = Path(output_dir)
@@ -103,6 +108,13 @@ class CatalogAgent:
         logger.info(
             "CatalogAgent: exported {} features to '{}' ({} skipped)",
             export_result.exported, geojson_path, export_result.skipped,
+        )
+        summary.update({
+            "geojson_features_written": export_result.exported,
+            "geojson_features_skipped": export_result.skipped,
+        })
+        (settings.log_dir / "catalog_export_summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
         )
 
         # Step 3: Write cameras.md

@@ -306,6 +306,7 @@ Any publicly accessible feed found via search that passes validation, regardless
 - **Always** verify that `url` resolves directly to a live HLS `.m3u8` playlist — HTML pages, embeds, JPEG refresh URLs, and any non-HLS protocol are invalid
 - **Always** include `latitude` and `longitude` on every record — run `GeoEnrichmentSkill` if missing; a record without coordinates cannot appear on the map
 - **Always** invoke `MapAgent` after any catalog update to regenerate `map.html`
+- **Do not use or add a `tests/` directory in this repository for validation workflows**; use the Colab notebook validation path instead.
 
 ---
 

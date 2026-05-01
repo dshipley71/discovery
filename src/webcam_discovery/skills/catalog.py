@@ -351,6 +351,7 @@ class DeduplicationSkill:
 
     FUZZY_THRESHOLD = 85
     PROXIMITY_METERS = 50
+    GENERIC_LABELS = {"unknown", "unknown cam", "camera", "live", "stream"}
 
     def run(self, input: DeduplicationInput) -> DeduplicationOutput:
         """
@@ -399,8 +400,12 @@ class DeduplicationSkill:
                         merged_record=merged,
                     )
 
-            # 3. Fuzzy label match (same city, >85% similarity)
-            if existing.city.lower() == candidate.city.lower():
+            # 3. Fuzzy label match (same city, >85% similarity), except unknown/generic
+            existing_unknown = (existing.city or "").strip().lower() in {"unknown", ""}
+            candidate_unknown = (candidate.city or "").strip().lower() in {"unknown", ""}
+            existing_generic_label = (existing.label or "").strip().lower() in self.GENERIC_LABELS
+            candidate_generic_label = (candidate.label or "").strip().lower() in self.GENERIC_LABELS
+            if existing.city.lower() == candidate.city.lower() and not (existing_unknown and candidate_unknown) and not (existing_generic_label or candidate_generic_label):
                 similarity = fuzz.ratio(
                     existing.label.lower(), candidate.label.lower()
                 )
