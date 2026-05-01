@@ -80,6 +80,15 @@ class DeepDivePlan(BaseModel):
     reason: str | None = None
 
 
+class CandidatePriorityDecision(BaseModel):
+    candidate_url: str
+    priority: str
+    priority_score: float
+    priority_reason: str
+    sent_to_validation: bool = True
+    evidence: dict = Field(default_factory=dict)
+
+
 class CandidateRelevanceDecision(BaseModel):
     candidate_url: str
     accepted: bool

@@ -24,7 +24,8 @@ from webcam_discovery.config import settings
 from webcam_discovery.memory.factory import create_memory_backend
 from webcam_discovery.schemas import CameraCandidate
 from webcam_discovery.models.deep_discovery import PageCandidate, StreamCandidate
-from webcam_discovery.skills.candidate_relevance import CandidateRelevanceFilter
+from webcam_discovery.skills.candidate_priority import CandidatePriorityScorer
+from webcam_discovery.skills.url_metadata_extraction import URLMetadataExtractor
 from webcam_discovery.skills.location_expansion import LocationExpansionSkill
 from webcam_discovery.skills.visual_stream_analysis import VisualStreamAnalysis
 
@@ -104,7 +105,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "target_resolution": {"targets": target_locations, "insufficient_target": target_resolution.insufficient_target},
         "search": {"queries": len(location_search_plan.search_queries), "results": 0, "page_candidates": 0},
         "feed_discovery": {"enabled": bool(getattr(args, "enable_feed_discovery", True)), "endpoints_discovered": 0, "endpoints_parsed": 0, "records_extracted": 0, "candidates_created": 0, "candidates_with_coordinates": 0, "candidates_without_coordinates": 0},
-        "candidate_generation": {"raw_camera_candidates": 0, "direct_hls_candidates": 0, "deep_discovery_candidates": 0, "stream_candidates_before_relevance": 0, "stream_candidates_after_relevance": 0, "stream_candidates_sent_to_validation": 0},
+        "candidate_generation": {"raw_camera_candidates": 0, "direct_hls_candidates": 0, "deep_discovery_candidates": 0, "stream_candidates_before_priority": 0, "stream_candidates_sent_to_validation": 0},
+        "candidate_priority": {"high": 0, "medium": 0, "low": 0},
+        "url_metadata_extraction": {"processed": 0, "with_location_hint": 0},
         "validation": {"received": 0, "robots_passed": 0, "http_live": 0, "http_dead": 0, "http_unknown": 0, "ffprobe_live": 0, "ffprobe_dead": 0, "ffprobe_unknown": 0, "validated_records": 0, "records_with_coordinates": 0, "records_without_coordinates": 0},
         "catalog": {"records_received": 0, "unique_records": 0, "dedup_dropped": 0, "geojson_features_written": 0, "geojson_features_skipped": 0, "needs_review_location_unknown": 0},
         "rejections": {"total": 0, "by_reason": {}},
@@ -186,32 +189,36 @@ async def run_agentic(args: argparse.Namespace) -> None:
         stream_candidates.extend(deep_streams)
 
     funnel["candidate_generation"]["raw_camera_candidates"] = len(candidates)
-    funnel["candidate_generation"]["stream_candidates_before_relevance"] = len(stream_candidates)
+    funnel["candidate_generation"]["stream_candidates_before_priority"] = len(stream_candidates)
     funnel["candidate_generation"]["direct_hls_candidates"] = len(stream_candidates)
     max_stream_candidates = getattr(args, "max_stream_candidates", 2500)
     if len(stream_candidates) > max_stream_candidates:
         stream_candidates = stream_candidates[:max_stream_candidates]
     dedup = {s.candidate_url: s for s in stream_candidates}
-    decisions = CandidateRelevanceFilter().filter(list(dedup.values()), target_locations, location_search_plan.agencies, camera_types)
+    decisions = CandidatePriorityScorer().score(list(dedup.values()), target_locations, location_search_plan.agencies, camera_types)
     validation_candidates = []
+    extractor = URLMetadataExtractor()
     for sc, decision in decisions:
-        _append_jsonl(settings.log_dir / "candidate_relevance.jsonl", decision.model_dump())
-        if decision.accepted:
+        _append_jsonl(settings.log_dir / "candidate_priority.jsonl", decision.model_dump())
+        if decision.sent_to_validation:
             original = candidate_by_url.get(sc.candidate_url.strip().lower())
-            if original:
-                validation_candidates.append(original)
-            else:
-                validation_candidates.append(CameraCandidate(
-                    url=sc.candidate_url,
-                    source_refs=[x for x in [f"query:{sc.source_query}" if sc.source_query else None, sc.source_page, sc.root_url] if x],
-                    source_page=sc.source_page,
-                    raw_metadata={"target_locations": sc.target_locations, "camera_types": sc.camera_types, "discovery_strategy": sc.discovery_strategy},
-                ))
+            base = original if original else CameraCandidate(url=sc.candidate_url, source_refs=[x for x in [f"query:{sc.source_query}" if sc.source_query else None, sc.source_page, sc.root_url] if x], source_page=sc.source_page, raw_metadata={"target_locations": sc.target_locations, "camera_types": sc.camera_types, "discovery_strategy": sc.discovery_strategy})
+            hints = extractor.extract(base.url, context={"label": base.label, "source_page": base.source_page, "source_query": base.source_query or sc.source_query, "target_locations": target_locations})
+            base.url_metadata_hints = hints
+            base.location_text_candidates = hints.get("location_text_candidates", [])
+            base.source_query = base.source_query or sc.source_query
+            base.target_locations = target_locations
+            base.source_domain = urlparse(base.url).netloc or None
+            funnel["url_metadata_extraction"]["processed"] += 1
+            if hints.get("has_location_hint"):
+                funnel["url_metadata_extraction"]["with_location_hint"] += 1
+            validation_candidates.append(base)
+            _append_jsonl(settings.candidates_dir / ("prioritized_candidates.jsonl" if decision.priority in {"high", "medium"} else "deprioritized_candidates.jsonl"), {**decision.model_dump(), "sent_to_validation": True})
         else:
-            rejection_reasons[decision.reason] = rejection_reasons.get(decision.reason, 0) + 1
-            _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.reason, "source_page": sc.source_page, "source_query": sc.source_query, "feed_endpoint": (original.feed_endpoint if (original := candidate_by_url.get(sc.candidate_url.strip().lower())) else None), "source_domain": (urlparse(sc.candidate_url).netloc or None), "target_locations": sc.target_locations, "stage": "candidate_relevance"})
+            rejection_reasons[decision.priority_reason] = rejection_reasons.get(decision.priority_reason, 0) + 1
+            _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.priority_reason, "stage": "malformed_url" if decision.priority_reason == "malformed_url" else "policy"})
+        funnel["candidate_priority"][decision.priority] = funnel["candidate_priority"].get(decision.priority, 0) + 1
 
-    funnel["candidate_generation"]["stream_candidates_after_relevance"] = len(validation_candidates)
     funnel["candidate_generation"]["stream_candidates_sent_to_validation"] = len(validation_candidates)
     funnel["validation"]["received"] = len(validation_candidates)
     validator = ValidationAgent()
