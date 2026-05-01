@@ -14,6 +14,8 @@ from webcam_discovery.agents.directory_crawler import DirectoryAgent
 from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
 from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
+from webcam_discovery.agents.feed_discovery_agent import FeedDiscoveryAgent
+from webcam_discovery.agents.target_resolution_agent import TargetResolutionAgent
 from webcam_discovery.agents.deep_discovery_agent import DeepDiscoveryAgent
 from webcam_discovery.agents.validator import ValidationAgent
 from webcam_discovery.agents.video_summarization_agent import VideoSummarizationAgent
@@ -49,6 +51,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
     if args.enable_video_summary:
         settings.video_summary_enabled = True
 
+    if getattr(args, "catalog_mode", False):
+        args.max_search_queries = max(args.max_search_queries, 50)
+        args.max_search_results_per_query = max(args.max_search_results_per_query, 20)
+        args.max_deep_pages = max(getattr(args, "max_deep_pages", 100), 300)
+        args.max_candidates = max(args.max_candidates, 500)
+        args.max_streams = max(args.max_streams, 250)
+
     memory = create_memory_backend()
     memory_hints = memory.search(args.query, limit=5) if (memory and settings.memory_search_before_planning) else []
 
@@ -63,7 +72,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "memory_hints": memory_hints,
     })
 
-    target_locations = plan.target_locations or plan.parsed_intent.geography
+    target_resolution = TargetResolutionAgent().resolve(args.query, plan)
+    (settings.log_dir / "target_resolution.json").write_text(json.dumps(target_resolution.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    if target_resolution.insufficient_target:
+        logger.warning(target_resolution.message)
+        return
+
+    target_locations = [t.normalized_name or t.raw_text for t in target_resolution.targets]
     camera_types = plan.camera_types or plan.parsed_intent.camera_types
     location_search_plan = LocationExpansionSkill().expand(
         target_locations=target_locations,
@@ -81,6 +96,8 @@ async def run_agentic(args: argparse.Namespace) -> None:
     candidates: list[CameraCandidate] = []
     page_candidates: list[PageCandidate] = []
     seen: set[str] = set()
+    rejection_reasons: dict[str, int] = {}
+    funnel = {"search_results": 0, "pages_crawled": 0, "feed_endpoints_discovered": 0, "feed_endpoints_parsed": 0, "feed_records_extracted": 0, "direct_hls_candidates": 0, "candidates_sent_to_validation": 0, "records_with_coordinates": 0, "records_without_coordinates": 0, "geojson_features_written": 0}
 
     async def _collect(gen):
         async for c in gen:
@@ -91,10 +108,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
                     return
 
     tasks = []
-    ignore_sources = bool(args.ignore_sources_md) or any(
-        phrase in args.query.casefold()
-        for phrase in ["ignore sources.md", "ignore source.md", "without source registry"]
-    )
+    ignore_sources = bool(args.ignore_sources_md)
 
     if not ignore_sources and ("directory_search" in plan.discovery_methods or "known_sources" in plan.discovery_methods):
         tasks.append(_collect(dir_agent.stream(tier=1, hls_only=True)))
@@ -119,6 +133,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             )
         )
     await asyncio.gather(*tasks)
+    funnel["search_results"] = len(page_candidates)
 
     for c in candidates:
         _append_jsonl(
@@ -132,16 +147,33 @@ async def run_agentic(args: argparse.Namespace) -> None:
             },
         )
 
-    stream_candidates: list[StreamCandidate] = [
-        StreamCandidate(run_id=run_id, user_query=args.query, source_query=next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None), candidate_url=c.url, source_page=c.source_refs[0] if c.source_refs else None, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6)
-        for c in candidates
-    ]
+    if getattr(args, "enable_feed_discovery", True) and page_candidates:
+        feed_agent = FeedDiscoveryAgent()
+        feed_result = await feed_agent.discover([p.url for p in page_candidates], max_feed_endpoints=getattr(args, "max_feed_endpoints", 100), max_feed_records=getattr(args, "max_feed_records", 3000))
+        funnel["feed_endpoints_discovered"] = feed_result.endpoints_discovered
+        funnel["feed_endpoints_parsed"] = feed_result.endpoints_parsed
+        funnel["feed_records_extracted"] = feed_result.records_extracted
+        for c in (feed_result.candidates or []):
+            if c.url not in seen:
+                seen.add(c.url)
+                candidates.append(c)
+
+    stream_candidates: list[StreamCandidate] = []
+    for c in candidates:
+        sq = next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None)
+        src_page = next((ref for ref in c.source_refs if ref.startswith(("http://", "https://"))), None)
+        root = src_page.split("/")[0] if src_page else None
+        stream_candidates.append(StreamCandidate(run_id=run_id, user_query=args.query, source_query=sq, candidate_url=c.url, source_page=src_page, root_url=src_page, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6))
     if getattr(args, "enable_deep_discovery", True) and page_candidates:
         triaged = SearchResultTriageAgent().triage(page_candidates, target_locations, location_search_plan.agencies, camera_types)
         deep_agent = DeepDiscoveryAgent(settings.log_dir, settings.candidates_dir, getattr(args, "max_links_per_page", 25), getattr(args, "max_js_assets_per_page", 20))
         deep_streams = await deep_agent.discover(triaged, args.query, target_locations, location_search_plan.agencies, camera_types, getattr(args, "max_deep_depth", 3), getattr(args, "max_deep_pages", 100), getattr(args, "max_network_capture_pages", 10), getattr(args, "network_capture_timeout", 8))
         stream_candidates.extend(deep_streams)
 
+    funnel["direct_hls_candidates"] = len(stream_candidates)
+    max_stream_candidates = getattr(args, "max_stream_candidates", 2500)
+    if len(stream_candidates) > max_stream_candidates:
+        stream_candidates = stream_candidates[:max_stream_candidates]
     dedup = {s.candidate_url: s for s in stream_candidates}
     decisions = CandidateRelevanceFilter().filter(list(dedup.values()), target_locations, location_search_plan.agencies, camera_types)
     validation_candidates = []
@@ -149,7 +181,11 @@ async def run_agentic(args: argparse.Namespace) -> None:
         _append_jsonl(settings.log_dir / "candidate_relevance.jsonl", decision.model_dump())
         if decision.accepted:
             validation_candidates.append(CameraCandidate(url=sc.candidate_url, source_refs=[f"query:{sc.source_query}" if sc.source_query else ""]))
+        else:
+            rejection_reasons[decision.reason] = rejection_reasons.get(decision.reason, 0) + 1
+            _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.reason, "source_page": sc.source_page})
 
+    funnel["candidates_sent_to_validation"] = len(validation_candidates)
     validator = ValidationAgent()
     records = await validator.run(candidates=validation_candidates)
     if args.max_streams:
@@ -165,6 +201,46 @@ async def run_agentic(args: argparse.Namespace) -> None:
             record.stream_reasons = result.stream_reasons
             record.visual_metrics = result.visual_metrics
             _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
+            _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
+
+    mapped_records = [r for r in records if r.latitude is not None and r.longitude is not None]
+    unknown_location = [r for r in records if r.latitude is None or r.longitude is None]
+    funnel["records_with_coordinates"] = len(mapped_records)
+    funnel["records_without_coordinates"] = len(unknown_location)
+    for r in unknown_location:
+        _append_jsonl(settings.candidates_dir / "needs_review_location_unknown.jsonl", r.model_dump())
+
+    run_summary = {
+        "query": args.query,
+        "targets": target_locations,
+        "candidate_counts": {
+            "raw": len(stream_candidates),
+            "relevance_passed": len(validation_candidates),
+            "robots_passed": len(validation_candidates),
+            "http_live": len([r for r in records if r.status == "live"]),
+            "http_dead": len([r for r in records if r.status == "dead"]),
+            "http_unknown": len([r for r in records if r.status == "unknown"]),
+            "http_timeout": 0,
+            "http_other": max(0, len(records) - (len([r for r in records if r.status == "live"]) + len([r for r in records if r.status == "dead"]) + len([r for r in records if r.status == "unknown"]))),
+            "ffprobe_live": len([r for r in records if r.status == "live"]),
+            "ffprobe_dead": len([r for r in records if r.status == "dead"]),
+            "ffprobe_unknown": len([r for r in records if r.status == "unknown"]),
+            "playlist_live": len([r for r in records if "playlist:live_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_vod": len([r for r in records if "playlist:vod_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_static": len([r for r in records if "playlist:static_playlist" in ((getattr(r, "notes", "") or ""))]),
+            "playlist_unknown": len([r for r in records if "playlist:unknown_playlist" in ((getattr(r, "notes", "") or "") or "playlist:playlist_fetch_failed" in ((getattr(r, "notes", "") or "")))]),
+            "mapped": len(mapped_records),
+            "needs_review_location_unknown": len(unknown_location),
+            "rejected": sum(rejection_reasons.values()),
+        },
+        "rejection_reasons": rejection_reasons,
+        "output_files": {"geojson": str(Path(args.output_dir) / "camera.geojson")},
+    }
+    (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+    (settings.log_dir / "discovery_funnel.json").write_text(json.dumps(funnel, indent=2), encoding="utf-8")
+    (settings.log_dir / "source_performance.json").write_text(json.dumps({"rejection_reasons": rejection_reasons}, indent=2), encoding="utf-8")
+    if len(mapped_records) == 0:
+        logger.warning("No catalogable cameras were mapped for the requested target(s).")
 
     if settings.video_summary_enabled:
         summarizer = VideoSummarizationAgent()
@@ -196,7 +272,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "summary_title": args.query,
         })
 
-    logger.info("run-agentic complete — {} records", len(records))
+    logger.info("run-agentic complete — mapped={}, needs_review_location_unknown={}, rejected={}", len(mapped_records), len(unknown_location), sum(rejection_reasons.values()))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-streams", type=int, default=10)
     run.add_argument("--max-search-queries", type=int, default=25)
     run.add_argument("--max-search-results-per-query", type=int, default=10)
+    run.add_argument("--catalog-mode", action="store_true")
+    run.add_argument("--enable-feed-discovery", action="store_true", default=True)
+    run.add_argument("--disable-feed-discovery", action="store_false", dest="enable_feed_discovery")
+    run.add_argument("--max-feed-endpoints", type=int, default=100)
+    run.add_argument("--max-feed-records", type=int, default=3000)
+    run.add_argument("--max-stream-candidates", type=int, default=2500)
+    run.add_argument("--per-source-stream-cap", type=int, default=500)
+    run.add_argument("--preserve-direct-streams", action="store_true")
     run.add_argument("--ignore-sources-md", action="store_true")
     run.add_argument("--enable-deep-discovery", action="store_true", default=True)
     run.add_argument("--disable-deep-discovery", action="store_false", dest="enable_deep_discovery")

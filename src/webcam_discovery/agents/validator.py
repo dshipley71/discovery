@@ -67,6 +67,7 @@ from webcam_discovery.skills.validation import (
 )
 from webcam_discovery.skills.catalog import GeoEnrichmentSkill, GeoEnrichmentInput, _normalize_place_name
 from webcam_discovery.skills.traversal import unwrap_player_url   # ← FIX: import unwrapper
+from webcam_discovery.skills.hls_playlist_analysis import analyze_hls_playlist
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -451,6 +452,18 @@ class ValidationAgent:
                 n_live, n_unknown, n_dead, n_skipped,
             )
 
+        playlist_results = []
+        for candidate in allowed:
+            v = url_to_val.get(candidate.url)
+            if v is None or v.status != "live":
+                continue
+            effective_url = _browser_stream_map.get(candidate.url, candidate.url)
+            pa = await analyze_hls_playlist(effective_url, delay_seconds=1.0, timeout=settings.request_timeout)
+            playlist_results.append(pa.model_dump())
+            if pa.classification != "live_playlist":
+                url_to_val[candidate.url] = v.model_copy(update={"status": "unknown", "fail_reason": f"playlist:{pa.classification}"})
+        _append_jsonl(settings.log_dir / "hls_playlist_analysis.jsonl", playlist_results)
+
         # ── Step 3: build record list ─────────────────────────────────────────
         to_enrich: list[tuple[CameraCandidate, object]] = []
         dropped_dead = 0
@@ -524,6 +537,7 @@ class ValidationAgent:
             if isinstance(geo, Exception):
                 logger.warning("ValidationAgent: geo error for '{}': {}", city, geo)
             elif geo is not None:
+                _append_jsonl(settings.log_dir / "geocoding_results.jsonl", [{"url": candidate.url, "latitude": geo.latitude, "longitude": geo.longitude, "country": geo.country, "region": geo.region, "continent": geo.continent}])
                 latitude   = geo.latitude
                 longitude  = geo.longitude
                 continent  = geo.continent or "Unknown"

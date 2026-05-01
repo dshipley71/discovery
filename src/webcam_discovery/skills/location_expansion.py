@@ -11,25 +11,7 @@ class LocationSearchPlan(BaseModel):
     search_queries: list[str] = Field(default_factory=list)
 
 
-_LOCATION_KB: dict[str, dict[str, list[str]]] = {
-    "pennsylvania": {
-        "agencies": [
-            "PennDOT",
-            "511PA",
-            "Pennsylvania Department of Transportation",
-        ],
-        "locations": [
-            "Pennsylvania",
-            "Philadelphia",
-            "Pittsburgh",
-            "Harrisburg",
-            "Erie",
-            "Allentown",
-            "Scranton",
-        ],
-        "domains": ["511pa.com", "pa.gov", "penndot.pa.gov"],
-    }
-}
+_LOCATION_KB: dict[str, dict[str, list[str]]] = {}
 
 
 class LocationExpansionSkill:
@@ -54,35 +36,20 @@ class LocationExpansionSkill:
                 domains.extend(profile.get("domains", []))
             else:
                 expanded_locations.append(loc)
-                agencies.extend(
-                    [
-                        f"{loc} Department of Transportation",
-                        f"{loc} DOT",
-                        f"{loc} 511",
-                    ]
-                )
+                agencies.append(f"{loc} transportation")
 
         c_types = [c.casefold() for c in (camera_types or [])]
-        traffic_focus = (not c_types) or any("traffic" in c for c in c_types)
+        traffic_focus = any(any(k in c for k in ["traffic", "road", "dot", "highway", "511"]) for c in c_types)
 
         queries: list[str] = []
         for agency in agencies:
-            queries.extend(
-                [
-                    f"{agency} traffic cameras live",
-                    f"{agency} traffic camera map",
-                ]
-            )
+            if traffic_focus:
+                queries.extend([f"{agency} traffic cameras live", f"{agency} traffic camera map"])
 
         for domain in domains:
-            queries.extend(
-                [
-                    f"site:{domain} traffic cameras",
-                    f"site:{domain} live traffic camera",
-                    f"site:{domain} m3u8",
-                    f"site:{domain} HLS traffic camera",
-                ]
-            )
+            queries.extend([f"site:{domain} m3u8", f"site:{domain} HLS camera"])
+            if traffic_focus:
+                queries.extend([f"site:{domain} traffic cameras", f"site:{domain} live traffic camera"])
 
         for loc in expanded_locations or locations:
             if traffic_focus:
@@ -93,19 +60,10 @@ class LocationExpansionSkill:
                         f"{loc} DOT traffic cameras",
                     ]
                 )
-            queries.extend([
-                f"{loc} live camera m3u8",
-                f"{loc} HLS camera",
-            ])
+            queries.extend([f"{loc} public webcam m3u8", f"{loc} live camera HLS", f"{loc} public camera feed", f"{loc} live webcam stream"])
 
         if not queries and raw_query:
-            rq = raw_query.strip()
-            queries = [
-                f"{rq} traffic camera live public",
-                f"{rq} live camera m3u8",
-                f"{rq} HLS camera",
-                f"{rq} public webcam stream",
-            ]
+            return LocationSearchPlan(original_locations=locations, expanded_locations=[], agencies=[], domains=[], search_queries=[])
 
         deduped: list[str] = []
         seen: set[str] = set()
