@@ -6,6 +6,9 @@ from pathlib import Path
 
 import httpx
 
+from loguru import logger
+
+from webcam_discovery.http_client import build_async_client, is_ssl_cert_failure
 from webcam_discovery.schemas import CameraCandidate
 from webcam_discovery.skills.endpoint_patterns import discover_endpoint_urls
 from webcam_discovery.skills.feed_parsers import extract_camera_records
@@ -22,12 +25,14 @@ class FeedDiscoveryResult:
 class FeedDiscoverySkill:
     async def discover_from_pages(self, page_urls: list[str], max_endpoints: int = 100, max_records: int = 3000) -> FeedDiscoveryResult:
         result = FeedDiscoveryResult(candidates=[])
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        async with build_async_client(timeout=20, follow_redirects=True) as client:
             endpoint_urls: list[str] = []
             for u in page_urls:
                 try:
                     r = await client.get(u)
-                except Exception:
+                except Exception as exc:
+                    if is_ssl_cert_failure(exc):
+                        logger.warning("SSL certificate verification failed for {}", u)
                     continue
                 endpoint_urls.extend(discover_endpoint_urls(r.text))
             endpoint_urls = list(dict.fromkeys(endpoint_urls))[:max_endpoints]
@@ -36,7 +41,9 @@ class FeedDiscoverySkill:
                 try:
                     r = await client.get(e)
                     payload = r.json()
-                except Exception:
+                except Exception as exc:
+                    if is_ssl_cert_failure(exc):
+                        logger.warning("SSL certificate verification failed for {}", e)
                     continue
                 result.endpoints_parsed += 1
                 for rec in extract_camera_records(payload, base_url=e):

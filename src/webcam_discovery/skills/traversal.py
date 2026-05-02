@@ -72,6 +72,11 @@ def _make_soup(content: str) -> BeautifulSoup:
 from loguru import logger
 from pydantic import BaseModel
 
+from webcam_discovery.http_client import (
+    allow_insecure_ssl_fallback,
+    build_async_client,
+    is_ssl_cert_failure,
+)
 from webcam_discovery.schemas import CameraCandidate
 
 
@@ -385,7 +390,7 @@ class DirectoryTraversalSkill:
         pages_fetched = 0
         visited: set[str] = set()
 
-        async with httpx.AsyncClient(
+        async with build_async_client(
             timeout=httpx.Timeout(10.0),
             follow_redirects=True,
             max_redirects=3,
@@ -627,7 +632,7 @@ class FeedExtractionSkill:
         if self._shared_client is not None:
             return await self._fetch_and_extract(self._shared_client, page_url)
 
-        async with httpx.AsyncClient(**self._CLIENT_DEFAULTS) as client:
+        async with build_async_client(**self._CLIENT_DEFAULTS) as client:
             return await self._fetch_and_extract(client, page_url)
 
     async def _fetch_and_extract(
@@ -692,6 +697,26 @@ class FeedExtractionSkill:
                     logger.warning("FeedExtractionSkill timeout (gave up): {}", url)
                     return None
             except Exception as exc:
+                if is_ssl_cert_failure(exc):
+                    logger.warning("SSL certificate verification failed for {}", url)
+                    if not allow_insecure_ssl_fallback():
+                        logger.warning("SSL fallback disabled; skipping URL")
+                        return None
+                    logger.warning("SSL fallback enabled; retrying public discovery URL without certificate verification")
+                    try:
+                        async with httpx.AsyncClient(**self._CLIENT_DEFAULTS, verify=False, trust_env=True) as insecure_client:
+                            fallback_response = await insecure_client.get(url)
+                        if fallback_response.status_code != 200:
+                            return None
+                        ct = fallback_response.headers.get("content-type", "").lower()
+                        if any(k in ct for k in ("mpegurl", "x-mpegurl", "vnd.apple")):
+                            logger.debug("FeedExtractionSkill: direct stream content-type at {}", url)
+                            return None
+                        logger.warning("SSL fallback succeeded for {}", url)
+                        return fallback_response.text
+                    except Exception as fallback_exc:
+                        logger.warning("FeedExtractionSkill SSL fallback failed on {}: {}", url, repr(fallback_exc))
+                        return None
                 logger.warning("FeedExtractionSkill error on {}: {}", url, repr(exc))
                 return None
         return None
