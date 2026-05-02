@@ -28,7 +28,7 @@ from webcam_discovery.skills.candidate_priority import CandidatePriorityScorer
 from webcam_discovery.skills.url_metadata_extraction import URLMetadataExtractor
 from webcam_discovery.skills.location_expansion import LocationExpansionSkill
 from webcam_discovery.skills.visual_stream_analysis import VisualStreamAnalysis
-
+from webcam_discovery.models.stream_analysis import StreamAnalysisResult
 
 def _append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,14 +229,29 @@ async def run_agentic(args: argparse.Namespace) -> None:
     if settings.visual_stream_analysis_enabled:
         analyzer = VisualStreamAnalysis()
         for record in records:
-            result = await analyzer.analyze(record.url)
-            record.status = result.stream_status
-            record.stream_substatus = result.stream_substatus
-            record.stream_confidence = result.stream_confidence
-            record.stream_reasons = result.stream_reasons
-            record.visual_metrics = result.visual_metrics
-            _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
-            _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
+            try:
+                result = await analyzer.analyze(record.url)
+            except Exception as exc:
+                logger.warning("Visual analysis failed for {}: {}", record.url, exc)
+                result = StreamAnalysisResult(
+                    url=record.url,
+                    stream_status="unknown",
+                    stream_substatus="decode_failed",
+                    stream_confidence=0.2,
+                    stream_reasons=[f"Visual analysis failed: {type(exc).__name__}"],
+                    visual_metrics={
+                        "frames_decoded": 0,
+                        "visual_error": type(exc).__name__,
+                    },
+                )
+
+        record.status = result.stream_status
+        record.stream_substatus = result.stream_substatus
+        record.stream_confidence = result.stream_confidence
+        record.stream_reasons = result.stream_reasons
+        record.visual_metrics = result.visual_metrics
+        _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
+        _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
 
     mapped_records = [r for r in records if r.latitude is not None and r.longitude is not None]
     unknown_location = [r for r in records if r.latitude is None or r.longitude is None]
