@@ -14,6 +14,7 @@ from webcam_discovery.agents.catalog import CatalogAgent
 from webcam_discovery.agents.directory_crawler import DirectoryAgent
 from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
+from webcam_discovery.agents.scope_enforcement_agent import ScopeEnforcementAgent
 from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
 from webcam_discovery.agents.feed_discovery_agent import FeedDiscoveryAgent
 from webcam_discovery.agents.target_resolution_agent import TargetResolutionAgent
@@ -73,6 +74,16 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "plan": plan.model_dump(),
         "memory_hints": memory_hints,
     })
+
+    scope_agent = ScopeEnforcementAgent()
+    scope = await scope_agent.infer_scope(args.query, plan)
+    (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    if not scope.has_sufficient_scope:
+        message = scope.user_message or scope.insufficient_scope_reason or "I need a specific place, landmark, coordinates, IP address, hostname, agency, or public website before discovery."
+        logger.warning("Insufficient scope: {}", message)
+        (settings.log_dir / "scope_summary.json").write_text(json.dumps({"scope": {**scope.model_dump(), "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0}}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+    logger.info("Scope inferred: {} [{}], confidence={}", scope.scope_label or "(unspecified)", scope.scope_type or "unknown", scope.confidence)
 
     target_resolution = TargetResolutionAgent().resolve(args.query, plan)
     (settings.log_dir / "target_resolution.json").write_text(json.dumps(target_resolution.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -149,6 +160,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
         )
     await asyncio.gather(*tasks)
     funnel["search"]["results"] = len(page_candidates)
+    gated_pages: list[PageCandidate] = []
+    page_counts = {"accept": 0, "reject": 0, "review": 0}
+    for page in page_candidates:
+        decision = await scope_agent.evaluate_search_result(page, scope)
+        page_counts[decision.decision] = page_counts.get(decision.decision, 0) + 1
+        _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {
+            "run_id": run_id,
+            "query": page.source_query,
+            "result_url": page.url,
+            "result_title": page.title,
+            "result_snippet": page.snippet,
+            "decision": decision.decision,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "risk_flags": decision.risk_flags,
+        })
+        if decision.decision == "accept":
+            gated_pages.append(page)
+    page_candidates = gated_pages
+    logger.info("Search result scope gate: accepted={} rejected={} review={}", page_counts.get("accept",0), page_counts.get("reject",0), page_counts.get("review",0))
     funnel["search"]["page_candidates"] = len(page_candidates)
 
     for c in candidates:
@@ -187,6 +218,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
         deep_agent = DeepDiscoveryAgent(settings.log_dir, settings.candidates_dir, getattr(args, "max_links_per_page", 25), getattr(args, "max_js_assets_per_page", 20))
         deep_streams = await deep_agent.discover(triaged, args.query, target_locations, location_search_plan.agencies, camera_types, getattr(args, "max_deep_depth", 3), getattr(args, "max_deep_pages", 100), getattr(args, "max_network_capture_pages", 10), getattr(args, "network_capture_timeout", 8))
         stream_candidates.extend(deep_streams)
+
+    stream_counts = {"accept": 0, "reject": 0, "review": 0}
+    scoped_stream_candidates: list[StreamCandidate] = []
+    for sc in stream_candidates:
+        decision = await scope_agent.evaluate_stream_candidate(sc, scope)
+        stream_counts[decision.decision] = stream_counts.get(decision.decision, 0) + 1
+        _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {
+            "run_id": run_id,
+            "candidate_url": sc.candidate_url,
+            "source_page": sc.source_page,
+            "lineage": sc.parent_pages,
+            "decision": decision.decision,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "risk_flags": decision.risk_flags,
+        })
+        if decision.decision in {"accept", "review"}:
+            scoped_stream_candidates.append(sc)
+    stream_candidates = scoped_stream_candidates
+    logger.info("Stream candidate scope gate: accepted={} rejected={} review={}", stream_counts.get("accept",0), stream_counts.get("reject",0), stream_counts.get("review",0))
 
     funnel["candidate_generation"]["raw_camera_candidates"] = len(candidates)
     funnel["candidate_generation"]["stream_candidates_before_priority"] = len(stream_candidates)
@@ -288,6 +339,17 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "output_files": {"geojson": str(Path(args.output_dir) / "camera.geojson")},
     }
     (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+    (settings.log_dir / "scope_summary.json").write_text(json.dumps({"scope": {
+        "has_sufficient_scope": scope.has_sufficient_scope,
+        "scope_label": scope.scope_label,
+        "scope_type": scope.scope_type,
+        "search_results_accepted": page_counts.get("accept", 0),
+        "search_results_rejected": page_counts.get("reject", 0),
+        "search_results_review": page_counts.get("review", 0),
+        "stream_candidates_accepted": stream_counts.get("accept", 0),
+        "stream_candidates_rejected": stream_counts.get("reject", 0),
+        "stream_candidates_review": stream_counts.get("review", 0),
+    }}, indent=2), encoding="utf-8")
     funnel["rejections"]["total"] = sum(rejection_reasons.values())
     funnel["rejections"]["by_reason"] = rejection_reasons
     funnel["run"]["completed_at"] = datetime.utcnow().isoformat()
