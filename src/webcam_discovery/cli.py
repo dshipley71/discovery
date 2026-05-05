@@ -167,9 +167,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
     if not scope.has_sufficient_scope:
         message = scope.user_message or scope.insufficient_scope_reason or "I need a specific place, landmark, coordinates, IP address, hostname, agency, or public website before discovery."
         logger.warning("Insufficient scope: {}", message)
-        for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl"]:
+        for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
             (settings.log_dir / rel).touch()
-        scope_summary = {"scope": {**scope.model_dump(), **llm_metadata, "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0}}
+        scope_summary = {"scope": {**scope.model_dump(), **llm_metadata, "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "search_result_decision_parse_errors": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0, "stream_candidate_decision_parse_errors": 0}}
         (settings.log_dir / "scope_summary.json").write_text(json.dumps(scope_summary, ensure_ascii=False, indent=2), encoding="utf-8")
         run_summary = {
             "query": args.query,
@@ -193,7 +193,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
         (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
         return
     logger.info("Scope inferred: {} [{}], confidence={}", scope.scope_label or "(unspecified)", scope.scope_type or "unknown", scope.confidence)
-    for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl"]:
+    for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
         (settings.log_dir / rel).touch()
 
     target_resolution = TargetResolutionAgent().resolve(args.query, plan)
@@ -273,8 +273,31 @@ async def run_agentic(args: argparse.Namespace) -> None:
     funnel["search"]["results"] = len(page_candidates)
     gated_pages: list[PageCandidate] = []
     page_counts = {"accept": 0, "reject": 0, "review": 0}
+    search_result_decision_parse_errors = 0
     for page in page_candidates:
         decision = await scope_agent.evaluate_search_result(page, scope)
+        fallback_used = "scope_decision_parse_error" in (decision.risk_flags or [])
+        normalized = not fallback_used
+        if fallback_used:
+            search_result_decision_parse_errors += 1
+            logger.warning("Scope gate warning: malformed search-result decision for {}; rejected to prevent out-of-scope expansion.", page.url)
+            try:
+                _append_jsonl(settings.log_dir / "search_result_scope_decision_errors.jsonl", {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "stage": "search_result_scope_gate",
+                    "query": page.source_query,
+                    "scope_label": scope.scope_label,
+                    "scope_type": scope.scope_type,
+                    "url": page.url,
+                    "title": page.title,
+                    "snippet": page.snippet,
+                    "decision_fallback": decision.decision,
+                    "error_type": "ScopeDecisionParseError",
+                    "error": decision.reason,
+                    "raw_llm_response": decision.raw_llm_response,
+                })
+            except Exception as exc:
+                logger.warning("Failed to write search-result scope decision error artifact: {}", exc)
         page_counts[decision.decision] = page_counts.get(decision.decision, 0) + 1
         _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {
             "run_id": run_id,
@@ -289,6 +312,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "provider": settings.planner_provider,
             "model": settings.planner_model,
             "raw_llm_response": decision.raw_llm_response,
+            "normalized": normalized,
+            "fallback_used": fallback_used,
+            "fallback_reason": "scope_decision_parse_error" if fallback_used else None,
         })
         if decision.decision == "accept":
             gated_pages.append(page)
@@ -334,9 +360,32 @@ async def run_agentic(args: argparse.Namespace) -> None:
         stream_candidates.extend(deep_streams)
 
     stream_counts = {"accept": 0, "reject": 0, "review": 0}
+    stream_candidate_decision_parse_errors = 0
     scoped_stream_candidates: list[StreamCandidate] = []
     for sc in stream_candidates:
         decision = await scope_agent.evaluate_stream_candidate(sc, scope)
+        fallback_used = "scope_decision_parse_error" in (decision.risk_flags or [])
+        normalized = not fallback_used
+        if fallback_used:
+            stream_candidate_decision_parse_errors += 1
+            logger.warning("Scope gate warning: malformed stream-candidate decision for {}; rejected to prevent out-of-scope expansion.", sc.candidate_url)
+            try:
+                _append_jsonl(settings.log_dir / "stream_candidate_scope_decision_errors.jsonl", {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "stage": "stream_candidate_scope_gate",
+                    "query": sc.source_query,
+                    "scope_label": scope.scope_label,
+                    "scope_type": scope.scope_type,
+                    "candidate_url": sc.candidate_url,
+                    "source_page": sc.source_page,
+                    "lineage": sc.parent_pages,
+                    "decision_fallback": decision.decision,
+                    "error_type": "ScopeDecisionParseError",
+                    "error": decision.reason,
+                    "raw_llm_response": decision.raw_llm_response,
+                })
+            except Exception as exc:
+                logger.warning("Failed to write stream-candidate scope decision error artifact: {}", exc)
         stream_counts[decision.decision] = stream_counts.get(decision.decision, 0) + 1
         _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {
             "run_id": run_id,
@@ -350,8 +399,11 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "provider": settings.planner_provider,
             "model": settings.planner_model,
             "raw_llm_response": decision.raw_llm_response,
+            "normalized": normalized,
+            "fallback_used": fallback_used,
+            "fallback_reason": "scope_decision_parse_error" if fallback_used else None,
         })
-        if decision.decision in {"accept", "review"}:
+        if decision.decision in {"accept", "review"} and not fallback_used:
             scoped_stream_candidates.append(sc)
     stream_candidates = scoped_stream_candidates
     logger.info("Stream candidate scope gate: accepted={} rejected={} review={}", stream_counts.get("accept",0), stream_counts.get("reject",0), stream_counts.get("review",0))
@@ -466,9 +518,11 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "search_results_accepted": page_counts.get("accept", 0),
             "search_results_rejected": page_counts.get("reject", 0),
             "search_results_review": page_counts.get("review", 0),
+            "search_result_decision_parse_errors": search_result_decision_parse_errors,
             "stream_candidates_accepted": stream_counts.get("accept", 0),
             "stream_candidates_rejected": stream_counts.get("reject", 0),
             "stream_candidates_review": stream_counts.get("review", 0),
+            "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
         },
         "candidate_counts": {
             "raw": len(stream_candidates),
@@ -505,9 +559,11 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "search_results_accepted": page_counts.get("accept", 0),
         "search_results_rejected": page_counts.get("reject", 0),
         "search_results_review": page_counts.get("review", 0),
+        "search_result_decision_parse_errors": search_result_decision_parse_errors,
         "stream_candidates_accepted": stream_counts.get("accept", 0),
         "stream_candidates_rejected": stream_counts.get("reject", 0),
         "stream_candidates_review": stream_counts.get("review", 0),
+        "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
     }}, indent=2), encoding="utf-8")
     funnel["rejections"]["total"] = sum(rejection_reasons.values())
     funnel["rejections"]["by_reason"] = rejection_reasons
