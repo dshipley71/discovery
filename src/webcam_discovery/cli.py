@@ -4,8 +4,9 @@ import argparse
 import asyncio
 import json
 import uuid
+import time
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from pathlib import Path
 import math
 
@@ -38,6 +39,27 @@ def _append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    raw = " ".join((url or "").split())
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    kept = []
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        if k.lower().startswith("utm_"):
+            continue
+        kept.append((k, v))
+    normalized = parsed._replace(
+        scheme=(parsed.scheme or "").lower(),
+        netloc=(parsed.netloc or "").lower(),
+        path=(parsed.path or "").rstrip("/") or "/",
+        params="",
+        query=urlencode(kept, doseq=True),
+        fragment="",
+    )
+    return urlunparse(normalized)
 
 
 async def run_agentic(args: argparse.Namespace) -> None:
@@ -73,7 +95,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
     settings.max_scope_search_results = int(getattr(args, "max_scope_search_results", settings.max_scope_search_results))
     settings.max_scope_stream_candidates = int(getattr(args, "max_scope_stream_candidates", settings.max_scope_stream_candidates))
     settings.scope_decision_timeout_seconds = float(getattr(args, "scope_decision_timeout_seconds", settings.scope_decision_timeout_seconds))
-    settings.scope_decision_failure_mode = str(getattr(args, "scope_decision_failure_mode", settings.scope_decision_failure_mode))
+    settings.scope_gate_total_timeout_seconds = float(getattr(args, "scope_gate_total_timeout_seconds", settings.scope_gate_total_timeout_seconds))
+    settings.max_scope_gate_batches = int(getattr(args, "max_scope_gate_batches", settings.max_scope_gate_batches))
+    settings.scope_decision_failure_mode = str(getattr(args, "scope_timeout_fallback", getattr(args, "scope_decision_failure_mode", settings.scope_decision_failure_mode)))
     settings.disable_llm_search_result_scope_gate = bool(getattr(args, "disable_llm_search_result_scope_gate", settings.disable_llm_search_result_scope_gate))
     settings.disable_llm_stream_scope_gate = bool(getattr(args, "disable_llm_stream_scope_gate", settings.disable_llm_stream_scope_gate))
     if args.enable_memory:
@@ -85,6 +109,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     if not validation_enabled:
         settings.visual_stream_analysis_enabled = False
         settings.video_summary_enabled = False
+    stop_file = Path("/content/STOP_WEBCAM_DISCOVERY")
 
     if getattr(args, "catalog_mode", False):
         args.max_search_queries = max(args.max_search_queries, 50)
@@ -326,6 +351,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
         })
         if decision.decision == "accept":
             gated_pages.append(page)
+    if stop_file.exists():
+        logger.warning("Manual stop file detected before search-result scope gate: {}", stop_file)
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "stopped_by_user", "query": args.query}, indent=2), encoding="utf-8")
+        raise SystemExit(0)
     if settings.disable_llm_search_result_scope_gate:
         logger.warning("LLM search-result scope gate disabled (debug only).")
         page_candidates = page_candidates[: settings.max_scope_search_results]
@@ -333,42 +362,64 @@ async def run_agentic(args: argparse.Namespace) -> None:
     else:
         dedup_pages: dict[str, list[PageCandidate]] = {}
         for p in page_candidates:
-            dedup_pages.setdefault(p.url.strip().lower(), []).append(p)
+            dedup_pages.setdefault(_normalize_url_for_dedup(p.url), []).append(p)
         unique_pages = [v[0] for v in dedup_pages.values()]
         capped_pages = unique_pages[: settings.max_scope_search_results]
+        logger.info(
+            "Search results before scope gate: raw={} unique={} duplicates_dropped={} cap_per_query={}",
+            len(page_candidates), len(unique_pages), max(0, len(page_candidates)-len(unique_pages)), args.max_search_results_per_query
+        )
         for skipped in unique_pages[settings.max_scope_search_results:]:
             _append_jsonl(settings.log_dir / "scope_gate_skipped_search_results.jsonl", skipped.model_dump())
-        total_batches = max(1, math.ceil(len(capped_pages) / settings.scope_batch_size))
+        total_batches = min(settings.max_scope_gate_batches, max(1, math.ceil(len(capped_pages) / settings.scope_batch_size)))
         gated_pages = []
         page_counts = {"accept": 0, "reject": 0, "review": 0}
-        search_scope_summary = {"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_search_results, "timeout_seconds": settings.scope_decision_timeout_seconds, "failure_mode": settings.scope_decision_failure_mode, "total_seen": len(page_candidates), "total_evaluated": 0, "total_skipped_due_to_cap": max(0, len(unique_pages) - len(capped_pages)), "accepted": 0, "rejected": 0, "review": 0, "timeouts": 0, "parse_errors": 0, "fallback_decisions": 0, "elapsed_seconds": 0.0}
-        gate_started = datetime.utcnow()
-        for idx in range(0, len(capped_pages), settings.scope_batch_size):
+        search_scope_summary = {"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_search_results, "timeout_seconds": settings.scope_decision_timeout_seconds, "total_timeout_seconds": settings.scope_gate_total_timeout_seconds, "max_batches": settings.max_scope_gate_batches, "failure_mode": settings.scope_decision_failure_mode, "total_seen": len(page_candidates), "search_results_raw": len(page_candidates), "search_results_unique": len(unique_pages), "search_results_duplicates_dropped": max(0, len(page_candidates)-len(unique_pages)), "total_evaluated": 0, "total_skipped_due_to_cap": max(0, len(unique_pages) - len(capped_pages)), "accepted": 0, "rejected": 0, "review": 0, "timeouts": 0, "parse_errors": 0, "fallback_decisions": 0, "elapsed_seconds": 0.0}
+        gate_started = time.monotonic()
+        logger.info("SearchResultScopeGate: starting raw={} unique={} max_eval={} batch_size={} max_batches={} total_timeout={}s", len(page_candidates), len(unique_pages), len(capped_pages), settings.scope_batch_size, settings.max_scope_gate_batches, settings.scope_gate_total_timeout_seconds)
+        for idx in range(0, min(len(capped_pages), settings.max_scope_gate_batches * settings.scope_batch_size), settings.scope_batch_size):
+            if stop_file.exists():
+                logger.warning("Manual stop file detected during search-result scope gate: {}", stop_file)
+                break
+            if (time.monotonic() - gate_started) >= settings.scope_gate_total_timeout_seconds:
+                logger.warning("SearchResultScopeGate: global timeout reached at {:.1f}s", (time.monotonic()-gate_started))
+                break
             batch = capped_pages[idx: idx + settings.scope_batch_size]
             batch_no = (idx // settings.scope_batch_size) + 1
-            logger.info("ScopeEnforcementAgent: search-result scope gate batch {}/{} start count={} timeout={}s", batch_no, total_batches, len(batch), settings.scope_decision_timeout_seconds)
+            logger.info("SearchResultScopeGate: batch {}/{} size={} timeout={}s", batch_no, total_batches, len(batch), settings.scope_decision_timeout_seconds)
             decisions = await scope_agent.evaluate_search_results_batch(batch, scope, batch_size=settings.scope_batch_size)
             acc = rej = rev = 0
             for item_idx, (page, decision) in enumerate(zip(batch, decisions)):
                 fallback_used = any(flag in {"scope_decision_parse_error", "scope_decision_failure_fallback"} for flag in (decision.risk_flags or []))
                 if fallback_used:
                     search_scope_summary["fallback_decisions"] += 1
+                if "scope_gate_timeout" in (decision.risk_flags or []):
+                    _append_jsonl(settings.log_dir / "search_result_scope_decision_errors.jsonl", {"run_id": run_id, "stage": "search_result_scope_gate", "error_type": "timeout", "error": decision.reason, "timeout_seconds": settings.scope_decision_timeout_seconds, "batch_index": batch_no, "batch_total": total_batches, "affected_urls": [page.url]})
+                    search_scope_summary["timeouts"] += 1
                 page_counts[decision.decision] = page_counts.get(decision.decision, 0) + 1
                 acc += decision.decision == "accept"
                 rej += decision.decision == "reject"
                 rev += decision.decision == "review"
                 search_scope_summary["total_evaluated"] += 1
-                _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {"stage":"search_result_scope_gate","batch_index":batch_no,"item_index":item_idx,"url":page.url,"title":page.title,"snippet":page.snippet,"source_query":page.source_query,"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"error":None})
+                _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {"run_id": run_id, "stage":"search_result_scope_gate","batch_index":batch_no,"batch_total": total_batches,"item_index":item_idx,"result_url":page.url,"title":page.title,"snippet":page.snippet,"source_queries":[p.source_query for p in dedup_pages.get(_normalize_url_for_dedup(page.url), [page]) if p.source_query],"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"batch_timeout" if "scope_gate_timeout" in (decision.risk_flags or []) else None,"timeout_seconds": settings.scope_decision_timeout_seconds if "scope_gate_timeout" in (decision.risk_flags or []) else None,"error":None})
                 if decision.decision == "accept":
                     for dup in dedup_pages.get(page.url.strip().lower(), [page]):
                         gated_pages.append(dup)
-            logger.info("ScopeEnforcementAgent: search-result scope gate batch {}/{} done accepted={} rejected={} review={} elapsed={:.1f}s", batch_no, total_batches, acc, rej, rev, 0.0)
+            logger.info("SearchResultScopeGate: batch {}/{} completed accepted={} rejected={} review={} elapsed={:.1f}s", batch_no, total_batches, acc, rej, rev, (time.monotonic() - gate_started))
+            if stop_file.exists():
+                logger.warning("Manual stop file detected after search-result scope gate batch: {}", stop_file)
+                break
         search_scope_summary["accepted"] = page_counts.get("accept", 0)
         search_scope_summary["rejected"] = page_counts.get("reject", 0)
         search_scope_summary["review"] = page_counts.get("review", 0)
-        search_scope_summary["elapsed_seconds"] = (datetime.utcnow() - gate_started).total_seconds()
+        search_scope_summary["elapsed_seconds"] = (time.monotonic() - gate_started)
         (settings.log_dir / "search_result_scope_gate_summary.json").write_text(json.dumps(search_scope_summary, indent=2), encoding="utf-8")
+        (settings.log_dir / "search_result_scope_summary.json").write_text(json.dumps(search_scope_summary, indent=2), encoding="utf-8")
         page_candidates = gated_pages
+    if not page_candidates:
+        logger.info("Search result scope gate completed: accepted=0 rejected={} review={}. No accepted in-scope pages are available for discovery.", page_counts.get("reject", 0), page_counts.get("review", 0))
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "completed_no_in_scope_pages", "query": args.query, "scope": scope.model_dump(), "search_result_scope": {"accepted": page_counts.get("accept", 0), "rejected": page_counts.get("reject", 0), "review": page_counts.get("review", 0)}}, indent=2), encoding="utf-8")
+        raise SystemExit(0)
     logger.info("Search result scope gate: accepted={} rejected={} review={}", page_counts.get("accept",0), page_counts.get("reject",0), page_counts.get("review",0))
     funnel["search"]["page_candidates"] = len(page_candidates)
 
@@ -385,6 +436,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
         )
 
     if getattr(args, "enable_feed_discovery", True) and page_candidates:
+        if stop_file.exists():
+            (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "stopped_by_user", "query": args.query}, indent=2), encoding="utf-8")
+            raise SystemExit(0)
         feed_agent = FeedDiscoveryAgent()
         feed_result = await feed_agent.discover([p.url for p in page_candidates], max_feed_endpoints=getattr(args, "max_feed_endpoints", 100), max_feed_records=getattr(args, "max_feed_records", 3000))
         funnel["feed_discovery"]["endpoints_discovered"] = feed_result.endpoints_discovered
@@ -404,6 +458,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
         root = src_page.split("/")[0] if src_page else None
         stream_candidates.append(StreamCandidate(run_id=run_id, user_query=args.query, source_query=sq, candidate_url=c.url, source_page=src_page, root_url=src_page, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6))
     if getattr(args, "enable_deep_discovery", True) and page_candidates:
+        if stop_file.exists():
+            (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "stopped_by_user", "query": args.query}, indent=2), encoding="utf-8")
+            raise SystemExit(0)
         triaged = SearchResultTriageAgent().triage(page_candidates, target_locations, location_search_plan.agencies, camera_types)
         deep_agent = DeepDiscoveryAgent(settings.log_dir, settings.candidates_dir, getattr(args, "max_links_per_page", 25), getattr(args, "max_js_assets_per_page", 20))
         deep_streams = await deep_agent.discover(triaged, args.query, target_locations, location_search_plan.agencies, camera_types, getattr(args, "max_deep_depth", 3), getattr(args, "max_deep_pages", 100), getattr(args, "max_network_capture_pages", 10), getattr(args, "network_capture_timeout", 8))
@@ -515,6 +572,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
     records = []
     validation_skipped = not validation_enabled
     if validation_enabled:
+        if stop_file.exists():
+            (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "stopped_by_user", "query": args.query}, indent=2), encoding="utf-8")
+            raise SystemExit(0)
         validator = ValidationAgent()
         records = await validator.run(candidates=validation_candidates)
         if args.max_streams:
@@ -735,7 +795,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-scope-search-results", type=int, default=settings.max_scope_search_results)
     run.add_argument("--max-scope-stream-candidates", type=int, default=settings.max_scope_stream_candidates)
     run.add_argument("--scope-decision-timeout-seconds", type=float, default=settings.scope_decision_timeout_seconds)
+    run.add_argument("--scope-gate-total-timeout-seconds", type=float, default=settings.scope_gate_total_timeout_seconds)
+    run.add_argument("--max-scope-gate-batches", type=int, default=settings.max_scope_gate_batches)
     run.add_argument("--scope-decision-failure-mode", type=str, choices=["review", "reject"], default=settings.scope_decision_failure_mode)
+    run.add_argument("--scope-timeout-fallback", type=str, choices=["review", "reject"], default=settings.scope_decision_failure_mode)
     run.add_argument("--disable-llm-search-result-scope-gate", action="store_true")
     run.add_argument("--disable-llm-stream-scope-gate", action="store_true")
     return parser
