@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from loguru import logger
 
 from webcam_discovery.agents.planner_agent import PlannerAgent
+from webcam_discovery.config import settings
+from webcam_discovery.llm.base import get_llm_request_policy
 from webcam_discovery.models.deep_discovery import PageCandidate, StreamCandidate
 from webcam_discovery.models.planner import PlannerPlan
 from webcam_discovery.prompts.scope_enforcement import (
@@ -23,9 +26,12 @@ class ScopeEnforcementAgent:
         self.backend = PlannerAgent().backend
 
     async def infer_scope(self, user_query: str, planner_plan: PlannerPlan) -> ScopeEnforcementResult:
+        policy = get_llm_request_policy("scope_inference")
+        logger.info("ScopeEnforcementAgent: requesting LLM scope inference provider={} model={} timeout_read={}s attempts={}", settings.planner_provider, settings.planner_model, policy.read_timeout, policy.max_attempts)
         raw = await self.backend.generate(
             build_scope_inference_prompt(user_query, planner_plan.model_dump()),
             system_prompt=SYSTEM_PROMPT,
+            stage="scope_inference",
         )
         parsed = self._extract_json(raw)
         return ScopeEnforcementResult.model_validate({**parsed, "raw_llm_response": parsed})
@@ -35,9 +41,11 @@ class ScopeEnforcementAgent:
         page: PageCandidate,
         scope: ScopeEnforcementResult,
     ) -> ScopeDecision:
+        logger.info("ScopeEnforcementAgent: evaluating search result scope batch=1 count=1")
         raw = await self.backend.generate(
             build_search_result_scope_prompt(page.model_dump(), scope.model_dump()),
             system_prompt=SYSTEM_PROMPT,
+            stage="scope_search_result",
         )
         parsed = self._extract_json(raw)
         return ScopeDecision.model_validate({**parsed, "raw_llm_response": parsed})
@@ -51,6 +59,7 @@ class ScopeEnforcementAgent:
         raw = await self.backend.generate(
             build_stream_scope_prompt(payload, scope.model_dump()),
             system_prompt=SYSTEM_PROMPT,
+            stage="scope_stream_candidate",
         )
         parsed = self._extract_json(raw)
         return ScopeDecision.model_validate({**parsed, "raw_llm_response": parsed})

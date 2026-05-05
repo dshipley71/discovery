@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     planner_model: str = "gemma3:27b"
     planner_base_url: str = ""
     planner_api_key: str = ""
+    llm_connect_timeout_seconds: float = 20.0
+    llm_read_timeout_seconds: float = 180.0
+    llm_write_timeout_seconds: float = 60.0
+    llm_pool_timeout_seconds: float = 20.0
+    llm_max_attempts: int = 3
+    llm_retry_backoff_seconds: float = 5.0
 
     # Optional memory layer
     memory_enabled: bool = False
@@ -104,6 +110,33 @@ class Settings(BaseSettings):
         """Create all runtime directories if they do not exist."""
         for d in [self.log_dir, self.snapshot_dir, self.candidates_dir]:
             d.mkdir(parents=True, exist_ok=True)
+
+    def resolve_stage_float(self, stage_prefix: str, suffix: str, default: float) -> float:
+        if not stage_prefix:
+            return default
+        key = f"{stage_prefix}_{suffix}"
+        value = getattr(self, key, None)
+        return float(default if value is None else value)
+
+    def resolve_stage_int(self, stage_prefix: str, suffix: str, default: int) -> int:
+        if not stage_prefix:
+            return default
+        key = f"{stage_prefix}_{suffix}"
+        value = getattr(self, key, None)
+        return int(default if value is None else value)
+
+    planner_connect_timeout_seconds: float | None = None
+    planner_read_timeout_seconds: float | None = None
+    planner_write_timeout_seconds: float | None = None
+    planner_pool_timeout_seconds: float | None = None
+    planner_max_attempts: int | None = None
+    planner_retry_backoff_seconds: float | None = None
+    scope_connect_timeout_seconds: float | None = None
+    scope_read_timeout_seconds: float | None = None
+    scope_write_timeout_seconds: float | None = None
+    scope_pool_timeout_seconds: float | None = None
+    scope_max_attempts: int | None = None
+    scope_retry_backoff_seconds: float | None = None
 
 
 # Module-level singleton — import this everywhere

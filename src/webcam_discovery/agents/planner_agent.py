@@ -55,7 +55,16 @@ parsed_intent must include geography, agencies, camera_types.
 Set validation_enabled/public_source_only/skip_restricted_sources true.
 Prefer discovery_methods from [directory_search, web_search, known_sources].
 """.strip()
-        raw = await self.backend.generate(prompt, system_prompt=SYSTEM_PROMPT)
+        from webcam_discovery.llm.base import get_llm_request_policy
+        policy = get_llm_request_policy("planner")
+        logger.info(
+            "PlannerAgent: requesting LLM plan provider={} model={} timeout_read={}s attempts={}",
+            settings.planner_provider,
+            settings.planner_model,
+            policy.read_timeout,
+            policy.max_attempts,
+        )
+        raw = await self.backend.generate(prompt, system_prompt=SYSTEM_PROMPT, stage="planner")
         plan_dict = self._extract_json(raw)
         plan_dict = self._normalize_plan_dict(plan_dict)
         plan = PlannerPlan.model_validate(plan_dict)
