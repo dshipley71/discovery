@@ -50,8 +50,7 @@ See `docs/DIRECTORY_STRUCTURE.md` for the full layout and rationale.
 Use the new command to run a natural-language, planner-driven workflow:
 
 ```bash
-webcam-discovery run-agentic "Get me all the live traffic cameras from Pennsylvania" \
-  --ignore-sources-md \
+webcam-discovery run-agentic "Get me public HLS cameras near <specific place or landmark>" \
   --max-search-queries 25 \
   --max-search-results-per-query 10 \
   --max-candidates 20 --max-streams 5 --enable-visual-analysis
@@ -96,6 +95,25 @@ webcam-discovery run-agentic "..." --enable-visual-analysis
 ```
 
 Writes `logs/visual_stream_analysis.jsonl` with live/dead/unknown plus substatus and metrics.
+
+### Developer/debug validation controls
+
+```text
+--disable-ffprobe-validation
+    Developer/debug flag. Runs normal validation but skips ffprobe/ffmpeg frame-level checks.
+    HTTP/HLS probing, robots.txt checks, playlist checks, geocoding, and catalog handling still run
+    for records that pass the non-ffprobe validation path. Useful for faster scope-enforcement
+    and candidate-funnel debugging.
+
+--disable-validation
+    Developer/debug flag. Skips ValidationAgent entirely. The run may write unvalidated candidates
+    for review, but they are not cataloged as cameras and are not written as mapped GeoJSON features.
+    Do not use for production catalog generation.
+```
+
+When `--disable-validation` is used, the CLI writes `logs/validation_skipped.json` and may write
+`candidates/unvalidated_stream_candidates.jsonl`; `logs/run_summary.json` reports validation as
+skipped with zero validated and mapped camera records.
 
 ### Optional video summarization
 

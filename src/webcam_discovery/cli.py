@@ -38,10 +38,29 @@ def _append_jsonl(path: Path, row: dict) -> None:
 
 
 async def run_agentic(args: argparse.Namespace) -> None:
-    settings.ensure_dirs()
     from webcam_discovery.pipeline import configure_logging
 
+    output_dir = Path(args.output_dir)
+    settings.catalog_output_dir = output_dir
+    settings.log_dir = output_dir / "logs"
+    settings.candidates_dir = output_dir / "candidates"
+    settings.snapshot_dir = output_dir / "snapshots"
+
+    validation_enabled = not getattr(args, "disable_validation", False)
+    if getattr(args, "disable_ffprobe_validation", False):
+        settings.use_ffprobe_validation = False
+    if not validation_enabled:
+        settings.use_ffprobe_validation = False
+        settings.visual_stream_analysis_enabled = False
+        settings.video_summary_enabled = False
+
+    settings.ensure_dirs()
     configure_logging()
+
+    if getattr(args, "disable_ffprobe_validation", False) and validation_enabled:
+        logger.warning("ffprobe validation disabled by CLI flag; HTTP/HLS validation will still run.")
+    if not validation_enabled:
+        logger.warning("Validation disabled by CLI flag. Unvalidated candidates will be written for review only and will not be cataloged as cameras.")
 
     if args.llm_provider:
         settings.planner_provider = args.llm_provider
@@ -53,6 +72,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
         settings.visual_stream_analysis_enabled = True
     if args.enable_video_summary:
         settings.video_summary_enabled = True
+    if not validation_enabled:
+        settings.visual_stream_analysis_enabled = False
+        settings.video_summary_enabled = False
 
     if getattr(args, "catalog_mode", False):
         args.max_search_queries = max(args.max_search_queries, 50)
@@ -77,13 +99,40 @@ async def run_agentic(args: argparse.Namespace) -> None:
 
     scope_agent = ScopeEnforcementAgent()
     scope = await scope_agent.infer_scope(args.query, plan)
-    (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    llm_metadata = {"provider": settings.planner_provider, "model": settings.planner_model}
+    scope_payload = {**scope.model_dump(), **llm_metadata}
+    (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if not scope.has_sufficient_scope:
         message = scope.user_message or scope.insufficient_scope_reason or "I need a specific place, landmark, coordinates, IP address, hostname, agency, or public website before discovery."
         logger.warning("Insufficient scope: {}", message)
-        (settings.log_dir / "scope_summary.json").write_text(json.dumps({"scope": {**scope.model_dump(), "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0}}, ensure_ascii=False, indent=2), encoding="utf-8")
+        for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl"]:
+            (settings.log_dir / rel).touch()
+        scope_summary = {"scope": {**scope.model_dump(), **llm_metadata, "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0}}
+        (settings.log_dir / "scope_summary.json").write_text(json.dumps(scope_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_summary = {
+            "query": args.query,
+            "targets": [],
+            "scope": scope_summary["scope"],
+            "validation": {
+                "validation_enabled": validation_enabled,
+                "validation_skipped": not validation_enabled,
+                "ffprobe_validation_enabled": bool(settings.use_ffprobe_validation and validation_enabled),
+            },
+            "candidate_counts": {
+                "raw": 0,
+                "relevance_passed": 0,
+                "validated_records": 0,
+                "mapped": 0,
+                "unvalidated_candidates": 0,
+            },
+            "stopped_before_discovery": True,
+            "reason": "insufficient_scope",
+        }
+        (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
         return
     logger.info("Scope inferred: {} [{}], confidence={}", scope.scope_label or "(unspecified)", scope.scope_type or "unknown", scope.confidence)
+    for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl"]:
+        (settings.log_dir / rel).touch()
 
     target_resolution = TargetResolutionAgent().resolve(args.query, plan)
     (settings.log_dir / "target_resolution.json").write_text(json.dumps(target_resolution.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -175,6 +224,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "confidence": decision.confidence,
             "reason": decision.reason,
             "risk_flags": decision.risk_flags,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            "raw_llm_response": decision.raw_llm_response,
         })
         if decision.decision == "accept":
             gated_pages.append(page)
@@ -233,6 +285,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "confidence": decision.confidence,
             "reason": decision.reason,
             "risk_flags": decision.risk_flags,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            "raw_llm_response": decision.raw_llm_response,
         })
         if decision.decision in {"accept", "review"}:
             scoped_stream_candidates.append(sc)
@@ -272,12 +327,32 @@ async def run_agentic(args: argparse.Namespace) -> None:
 
     funnel["candidate_generation"]["stream_candidates_sent_to_validation"] = len(validation_candidates)
     funnel["validation"]["received"] = len(validation_candidates)
-    validator = ValidationAgent()
-    records = await validator.run(candidates=validation_candidates)
-    if args.max_streams:
-        records = records[: args.max_streams]
+    records = []
+    validation_skipped = not validation_enabled
+    if validation_enabled:
+        validator = ValidationAgent()
+        records = await validator.run(candidates=validation_candidates)
+        if args.max_streams:
+            records = records[: args.max_streams]
+    else:
+        unvalidated_path = settings.candidates_dir / "unvalidated_stream_candidates.jsonl"
+        unvalidated_path.write_text(
+            "".join(c.model_dump_json() + "\n" for c in validation_candidates),
+            encoding="utf-8",
+        )
+        validation_skipped_payload = {
+            "validation_skipped": True,
+            "reason": "disabled_by_cli_flag",
+            "unvalidated_candidate_count": len(validation_candidates),
+            "warning": "Validation was disabled. Candidates are not confirmed live, reachable, public, or mappable.",
+        }
+        (settings.log_dir / "validation_skipped.json").write_text(json.dumps(validation_skipped_payload, indent=2), encoding="utf-8")
+        logger.warning(
+            "Validation skipped by CLI flag; wrote {} unvalidated candidate(s) for review only. Zero mapped cameras will be produced.",
+            len(validation_candidates),
+        )
 
-    if settings.visual_stream_analysis_enabled:
+    if validation_enabled and settings.visual_stream_analysis_enabled:
         analyzer = VisualStreamAnalysis()
         for record in records:
             try:
@@ -296,13 +371,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
                     },
                 )
 
-        record.status = result.stream_status
-        record.stream_substatus = result.stream_substatus
-        record.stream_confidence = result.stream_confidence
-        record.stream_reasons = result.stream_reasons
-        record.visual_metrics = result.visual_metrics
-        _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
-        _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
+            record.status = result.stream_status
+            record.stream_substatus = result.stream_substatus
+            record.stream_confidence = result.stream_confidence
+            record.stream_reasons = result.stream_reasons
+            record.visual_metrics = result.visual_metrics
+            _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
+            _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
 
     mapped_records = [r for r in records if r.latitude is not None and r.longitude is not None]
     unknown_location = [r for r in records if r.latitude is None or r.longitude is None]
@@ -315,6 +390,24 @@ async def run_agentic(args: argparse.Namespace) -> None:
     run_summary = {
         "query": args.query,
         "targets": target_locations,
+        "validation": {
+            "validation_enabled": validation_enabled,
+            "validation_skipped": validation_skipped,
+            "ffprobe_validation_enabled": bool(settings.use_ffprobe_validation and validation_enabled),
+        },
+        "scope": {
+            "has_sufficient_scope": scope.has_sufficient_scope,
+            "scope_label": scope.scope_label,
+            "scope_type": scope.scope_type,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            "search_results_accepted": page_counts.get("accept", 0),
+            "search_results_rejected": page_counts.get("reject", 0),
+            "search_results_review": page_counts.get("review", 0),
+            "stream_candidates_accepted": stream_counts.get("accept", 0),
+            "stream_candidates_rejected": stream_counts.get("reject", 0),
+            "stream_candidates_review": stream_counts.get("review", 0),
+        },
         "candidate_counts": {
             "raw": len(stream_candidates),
             "relevance_passed": len(validation_candidates),
@@ -324,14 +417,16 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "http_unknown": len([r for r in records if r.status == "unknown"]),
             "http_timeout": 0,
             "http_other": max(0, len(records) - (len([r for r in records if r.status == "live"]) + len([r for r in records if r.status == "dead"]) + len([r for r in records if r.status == "unknown"]))),
-            "ffprobe_live": len([r for r in records if r.status == "live"]),
-            "ffprobe_dead": len([r for r in records if r.status == "dead"]),
-            "ffprobe_unknown": len([r for r in records if r.status == "unknown"]),
+            "ffprobe_live": len([r for r in records if r.status == "live"]) if settings.use_ffprobe_validation and validation_enabled else 0,
+            "ffprobe_dead": len([r for r in records if r.status == "dead"]) if settings.use_ffprobe_validation and validation_enabled else 0,
+            "ffprobe_unknown": len([r for r in records if r.status == "unknown"]) if settings.use_ffprobe_validation and validation_enabled else 0,
             "playlist_live": len([r for r in records if "playlist:live_playlist" in ((getattr(r, "notes", "") or ""))]),
             "playlist_vod": len([r for r in records if "playlist:vod_playlist" in ((getattr(r, "notes", "") or ""))]),
             "playlist_static": len([r for r in records if "playlist:static_playlist" in ((getattr(r, "notes", "") or ""))]),
             "playlist_unknown": len([r for r in records if "playlist:unknown_playlist" in ((getattr(r, "notes", "") or "") or "playlist:playlist_fetch_failed" in ((getattr(r, "notes", "") or "")))]),
             "mapped": len(mapped_records),
+            "unvalidated_candidates": len(validation_candidates) if validation_skipped else 0,
+            "validated_records": len(records),
             "needs_review_location_unknown": len(unknown_location),
             "rejected": sum(rejection_reasons.values()),
         },
@@ -343,6 +438,8 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "has_sufficient_scope": scope.has_sufficient_scope,
         "scope_label": scope.scope_label,
         "scope_type": scope.scope_type,
+        "provider": settings.planner_provider,
+        "model": settings.planner_model,
         "search_results_accepted": page_counts.get("accept", 0),
         "search_results_rejected": page_counts.get("reject", 0),
         "search_results_review": page_counts.get("review", 0),
@@ -403,7 +500,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "summary_title": args.query,
         })
 
-    logger.info("run-agentic complete — mapped={}, needs_review_location_unknown={}, rejected={}", len(mapped_records), len(unknown_location), sum(rejection_reasons.values()))
+    if validation_skipped:
+        logger.warning("run-agentic complete — validation skipped; mapped=0; unvalidated_candidates={}", len(validation_candidates))
+    else:
+        logger.info("run-agentic complete — mapped={}, needs_review_location_unknown={}, rejected={}", len(mapped_records), len(unknown_location), sum(rejection_reasons.values()))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -436,6 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--network-capture-timeout", type=int, default=8)
     run.add_argument("--max-total-deep-dive-seconds", type=int, default=180)
     run.add_argument("--enable-memory", action="store_true")
+    run.add_argument("--disable-ffprobe-validation", action="store_true", help="Developer/debug: run ValidationAgent but skip ffprobe/ffmpeg frame-level validation")
+    run.add_argument("--disable-validation", action="store_true", help="Developer/debug: skip ValidationAgent entirely and write unvalidated candidates for review only")
     run.add_argument("--enable-visual-analysis", action="store_true")
     run.add_argument("--enable-video-summary", action="store_true")
     run.add_argument("--llm-provider", type=str, choices=["ollama", "openai-compatible"])
