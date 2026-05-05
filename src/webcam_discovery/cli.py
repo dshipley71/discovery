@@ -15,6 +15,7 @@ from webcam_discovery.agents.directory_crawler import DirectoryAgent
 from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
 from webcam_discovery.agents.scope_enforcement_agent import ScopeEnforcementAgent
+from webcam_discovery.agents.scope_enforcement_agent import ScopeInferenceParseError
 from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
 from webcam_discovery.agents.feed_discovery_agent import FeedDiscoveryAgent
 from webcam_discovery.agents.target_resolution_agent import TargetResolutionAgent
@@ -114,9 +115,55 @@ async def run_agentic(args: argparse.Namespace) -> None:
         (settings.log_dir / "scope_error.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": exc.stage, "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": exc.error_type, "message": exc.message}}, indent=2), encoding="utf-8")
         raise SystemExit(2) from exc
+    except ScopeInferenceParseError as exc:
+        logger.error("Scope inference failed before discovery: the LLM returned a response that could not be parsed into the required scope schema.")
+        logger.error("No search, feed discovery, deep discovery, validation, cataloging, or map generation was performed.")
+        error_payload = {
+            "stage": "scope_inference",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "user_query": args.query,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            "raw_llm_response": exc.raw_llm_response,
+            "normalized_payload": exc.normalized_payload,
+            "discovery_started": False,
+        }
+        (settings.log_dir / "scope_inference_error.json").write_text(json.dumps(error_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": "scope_inference", "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": type(exc).__name__, "message": str(exc)}}, indent=2), encoding="utf-8")
+        raise SystemExit(2) from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.error("Scope inference failed before discovery: the LLM returned a response that could not be parsed into the required scope schema.")
+        logger.error("No search, feed discovery, deep discovery, validation, cataloging, or map generation was performed.")
+        error_payload = {
+            "stage": "scope_inference",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "user_query": args.query,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            "raw_llm_response": None,
+            "normalized_payload": None,
+            "discovery_started": False,
+        }
+        (settings.log_dir / "scope_inference_error.json").write_text(json.dumps(error_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": "scope_inference", "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": type(exc).__name__, "message": str(exc)}}, indent=2), encoding="utf-8")
+        raise SystemExit(2) from exc
     llm_metadata = {"provider": settings.planner_provider, "model": settings.planner_model}
     scope_payload = {**scope.model_dump(), **llm_metadata}
     (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (settings.log_dir / "scope_summary.json").write_text(json.dumps({
+        "query": args.query,
+        "plan_summary": getattr(plan, "summary", None),
+        "provider": settings.planner_provider,
+        "model": settings.planner_model,
+        "has_sufficient_scope": scope.has_sufficient_scope,
+        "scope_label": scope.scope_label,
+        "scope_type": scope.scope_type,
+        "confidence": scope.confidence,
+        "normalized_scope_payload": scope.model_dump(),
+        "raw_llm_response": scope.raw_llm_response,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     if not scope.has_sufficient_scope:
         message = scope.user_message or scope.insufficient_scope_reason or "I need a specific place, landmark, coordinates, IP address, hostname, agency, or public website before discovery."
         logger.warning("Insufficient scope: {}", message)

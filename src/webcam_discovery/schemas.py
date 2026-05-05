@@ -66,7 +66,7 @@ class ScopeEnforcementResult(BaseModel):
     excluded_locations: list[str] = Field(default_factory=list)
     included_sources: list[str] = Field(default_factory=list)
     excluded_sources: list[str] = Field(default_factory=list)
-    agency_or_owner: str | None = None
+    agency_or_owners: list[str] = Field(default_factory=list)
     coordinates: list[dict[str, float]] = Field(default_factory=list)
     hostnames: list[str] = Field(default_factory=list)
     ip_addresses: list[str] = Field(default_factory=list)
