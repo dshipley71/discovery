@@ -46,33 +46,122 @@ class ScopeEnforcementAgent:
                 normalized_payload=normalized,
             ) from exc
 
-    async def evaluate_search_result(
-        self,
-        page: PageCandidate,
-        scope: ScopeEnforcementResult,
-    ) -> ScopeDecision:
+    async def evaluate_search_result(self, page: PageCandidate, scope: ScopeEnforcementResult) -> ScopeDecision:
         logger.info("ScopeEnforcementAgent: evaluating search result scope batch=1 count=1")
         raw = await self.backend.generate(
             build_search_result_scope_prompt(page.model_dump(), scope.model_dump()),
             system_prompt=SYSTEM_PROMPT,
             stage="scope_search_result",
         )
-        parsed = self._extract_json(raw)
-        return ScopeDecision.model_validate({**parsed, "raw_llm_response": parsed})
+        return self._parse_scope_decision(raw=raw, stage="search_result_scope_gate")
 
-    async def evaluate_stream_candidate(
-        self,
-        candidate: StreamCandidate | CameraCandidate,
-        scope: ScopeEnforcementResult,
-    ) -> ScopeDecision:
+    async def evaluate_stream_candidate(self, candidate: StreamCandidate | CameraCandidate, scope: ScopeEnforcementResult) -> ScopeDecision:
         payload = candidate.model_dump() if hasattr(candidate, "model_dump") else {}
         raw = await self.backend.generate(
             build_stream_scope_prompt(payload, scope.model_dump()),
             system_prompt=SYSTEM_PROMPT,
             stage="scope_stream_candidate",
         )
-        parsed = self._extract_json(raw)
-        return ScopeDecision.model_validate({**parsed, "raw_llm_response": parsed})
+        return self._parse_scope_decision(raw=raw, stage="stream_candidate_scope_gate")
+
+    def _parse_scope_decision(self, *, raw: Any, stage: str) -> ScopeDecision:
+        try:
+            parsed = self._extract_json(raw) if isinstance(raw, str) else raw
+            if not isinstance(parsed, dict):
+                raise ValueError("Scope decision payload is not a JSON object.")
+            normalized = self._normalize_scope_decision_payload(parsed)
+            return ScopeDecision.model_validate(normalized)
+        except Exception as exc:  # never break discovery flow from malformed scope gate payload
+            return self._safe_fallback_scope_decision(
+                stage=stage,
+                reason="LLM scope decision could not be parsed safely; rejecting candidate to prevent out-of-scope expansion.",
+                raw_llm_response=raw,
+                error=exc,
+            )
+
+    @staticmethod
+    def _coerce_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            result: list[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    result.append(text)
+            return result
+        text = str(value).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return default
+        if num > 1.0 and num <= 100.0:
+            num = num / 100.0
+        return max(0.0, min(1.0, num))
+
+    @staticmethod
+    def _coerce_decision(value: Any) -> str:
+        if value is None:
+            return "review"
+        text = str(value).strip().lower()
+        if text in {"accept", "reject", "review"}:
+            return text
+        aliases = {"accepted": "accept", "rejected": "reject", "approve": "accept", "deny": "reject"}
+        return aliases.get(text, "review")
+
+    @staticmethod
+    def _coerce_reason(value: Any) -> str:
+        if value is None:
+            return "No reason provided by LLM."
+        if isinstance(value, str):
+            value = value.strip()
+            return value or "No reason provided by LLM."
+        if isinstance(value, list):
+            joined = " ".join(str(v).strip() for v in value if v is not None and str(v).strip())
+            return joined or "No reason provided by LLM."
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _normalize_scope_decision_payload(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {
+            "decision": self._coerce_decision(parsed.get("decision")),
+            "confidence": self._coerce_float(parsed.get("confidence"), default=0.0),
+            "reason": self._coerce_reason(parsed.get("reason")),
+            "matched_scope_terms": self._coerce_list(parsed.get("matched_scope_terms")),
+            "missing_evidence": self._coerce_list(parsed.get("missing_evidence")),
+            "risk_flags": self._coerce_list(parsed.get("risk_flags")),
+            "raw_llm_response": parsed,
+        }
+        return normalized
+
+    def _safe_fallback_scope_decision(self, *, stage: str, reason: str, raw_llm_response: Any, error: Exception | str | None = None) -> ScopeDecision:
+        if error is not None:
+            logger.warning("Scope gate parse error at stage={}: {}", stage, error)
+        fallback_payload = {
+            "decision": "reject",
+            "confidence": 0.0,
+            "reason": reason,
+            "matched_scope_terms": [],
+            "missing_evidence": ["Scope decision parse failure."],
+            "risk_flags": ["scope_decision_parse_error"],
+            "raw_llm_response": raw_llm_response,
+        }
+        try:
+            return ScopeDecision.model_validate(fallback_payload)
+        except ValidationError:
+            return ScopeDecision(decision="reject", confidence=0.0, reason=reason)
 
     @staticmethod
     def _extract_json(text: str) -> dict:
