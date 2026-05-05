@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from loguru import logger
+from pydantic import ValidationError
 
 from webcam_discovery.agents.planner_agent import PlannerAgent
 from webcam_discovery.config import settings
@@ -34,7 +36,15 @@ class ScopeEnforcementAgent:
             stage="scope_inference",
         )
         parsed = self._extract_json(raw)
-        return ScopeEnforcementResult.model_validate({**parsed, "raw_llm_response": parsed})
+        normalized = self.normalize_scope_result_payload(parsed)
+        try:
+            return ScopeEnforcementResult.model_validate({**normalized, "raw_llm_response": parsed})
+        except ValidationError as exc:
+            raise ScopeInferenceParseError(
+                "Scope inference payload failed schema validation.",
+                raw_llm_response=parsed,
+                normalized_payload=normalized,
+            ) from exc
 
     async def evaluate_search_result(
         self,
@@ -79,3 +89,72 @@ class ScopeEnforcementAgent:
             if start >= 0 and end > start:
                 return json.loads(stripped[start : end + 1])
             raise
+
+    @staticmethod
+    def normalize_scope_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(payload or {})
+
+        def to_list(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, list):
+                return [str(v) for v in value if v is not None and str(v).strip()]
+            return [str(value)]
+
+        list_fields = [
+            "normalized_targets",
+            "target_aliases",
+            "included_locations",
+            "excluded_locations",
+            "included_sources",
+            "excluded_sources",
+            "hostnames",
+            "ip_addresses",
+            "camera_types",
+        ]
+        for field in list_fields:
+            normalized[field] = to_list(normalized.get(field))
+
+        legacy_agency = normalized.pop("agency_or_owner", None)
+        agencies = normalized.get("agency_or_owners")
+        merged_agencies = to_list(agencies)
+        if legacy_agency is not None:
+            merged_agencies.extend(to_list(legacy_agency))
+        normalized["agency_or_owners"] = merged_agencies
+
+        coords = normalized.get("coordinates")
+        if isinstance(coords, dict):
+            coords = [coords]
+        if not isinstance(coords, list):
+            coords = []
+        normalized["coordinates"] = [c for c in coords if isinstance(c, dict)]
+
+        for scalar_field in ["scope_type", "scope_label", "scope_summary", "insufficient_scope_reason", "user_message"]:
+            value = normalized.get(scalar_field)
+            if isinstance(value, list):
+                normalized[scalar_field] = " ".join(str(v) for v in value if v is not None).strip() or None
+
+        confidence = normalized.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        normalized["confidence"] = max(0.0, min(1.0, confidence))
+
+        has_scope = normalized.get("has_sufficient_scope")
+        if not isinstance(has_scope, bool):
+            raise ScopeInferenceParseError(
+                "Missing or invalid has_sufficient_scope; expected boolean.",
+                raw_llm_response=payload,
+                normalized_payload=normalized,
+            )
+        return normalized
+
+
+class ScopeInferenceParseError(ValueError):
+    def __init__(self, message: str, raw_llm_response: Any, normalized_payload: Any) -> None:
+        super().__init__(message)
+        self.raw_llm_response = raw_llm_response
+        self.normalized_payload = normalized_payload
