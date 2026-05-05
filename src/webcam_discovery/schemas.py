@@ -55,6 +55,38 @@ class CameraCandidate(BaseModel):
     visual_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class ScopeEnforcementResult(BaseModel):
+    has_sufficient_scope: bool
+    scope_type: str | None = None
+    scope_label: str | None = None
+    scope_summary: str | None = None
+    normalized_targets: list[str] = Field(default_factory=list)
+    target_aliases: list[str] = Field(default_factory=list)
+    included_locations: list[str] = Field(default_factory=list)
+    excluded_locations: list[str] = Field(default_factory=list)
+    included_sources: list[str] = Field(default_factory=list)
+    excluded_sources: list[str] = Field(default_factory=list)
+    agency_or_owner: str | None = None
+    coordinates: list[dict[str, float]] = Field(default_factory=list)
+    hostnames: list[str] = Field(default_factory=list)
+    ip_addresses: list[str] = Field(default_factory=list)
+    camera_types: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    insufficient_scope_reason: str | None = None
+    user_message: str | None = None
+    raw_llm_response: dict[str, Any] | str | None = None
+
+
+class ScopeDecision(BaseModel):
+    decision: Literal["accept", "reject", "review"]
+    confidence: float = 0.0
+    reason: str
+    matched_scope_terms: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+    raw_llm_response: dict[str, Any] | str | None = None
+
+
 class CameraRecord(BaseModel):
     """
     Validated, geo-enriched camera record.
