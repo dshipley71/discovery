@@ -138,6 +138,15 @@ class Settings(BaseSettings):
     scope_max_attempts: int | None = None
     scope_retry_backoff_seconds: float | None = None
 
+    # Scope gate operational controls
+    scope_batch_size: int = 10
+    max_scope_search_results: int = 50
+    max_scope_stream_candidates: int = 250
+    scope_decision_timeout_seconds: float = 45.0
+    scope_decision_failure_mode: str = "reject"  # review | reject
+    disable_llm_search_result_scope_gate: bool = False
+    disable_llm_stream_scope_gate: bool = False
+
 
 # Module-level singleton — import this everywhere
 settings = Settings()

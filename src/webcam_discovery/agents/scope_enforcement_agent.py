@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import time
 from typing import Any
 from loguru import logger
 from pydantic import ValidationError
@@ -47,22 +49,63 @@ class ScopeEnforcementAgent:
             ) from exc
 
     async def evaluate_search_result(self, page: PageCandidate, scope: ScopeEnforcementResult) -> ScopeDecision:
-        logger.info("ScopeEnforcementAgent: evaluating search result scope batch=1 count=1")
-        raw = await self.backend.generate(
-            build_search_result_scope_prompt(page.model_dump(), scope.model_dump()),
-            system_prompt=SYSTEM_PROMPT,
-            stage="scope_search_result",
-        )
-        return self._parse_scope_decision(raw=raw, stage="search_result_scope_gate")
+        decisions = await self.evaluate_search_results_batch([page], scope, batch_size=1)
+        return decisions[0]
 
     async def evaluate_stream_candidate(self, candidate: StreamCandidate | CameraCandidate, scope: ScopeEnforcementResult) -> ScopeDecision:
-        payload = candidate.model_dump() if hasattr(candidate, "model_dump") else {}
-        raw = await self.backend.generate(
-            build_stream_scope_prompt(payload, scope.model_dump()),
-            system_prompt=SYSTEM_PROMPT,
-            stage="scope_stream_candidate",
+        decisions = await self.evaluate_stream_candidates_batch([candidate], scope, batch_size=1)
+        return decisions[0]
+
+    async def evaluate_search_results_batch(self, pages: list[PageCandidate], scope: ScopeEnforcementResult, *, batch_size: int | None = None) -> list[ScopeDecision]:
+        return await self._evaluate_batch(
+            items=pages,
+            scope=scope,
+            stage="search_result_scope_gate",
+            llm_stage="scope_search_result",
+            batch_size=batch_size,
+            prompt_builder=build_search_result_scope_prompt,
         )
-        return self._parse_scope_decision(raw=raw, stage="stream_candidate_scope_gate")
+
+    async def evaluate_stream_candidates_batch(self, candidates: list[StreamCandidate | CameraCandidate], scope: ScopeEnforcementResult, *, batch_size: int | None = None) -> list[ScopeDecision]:
+        return await self._evaluate_batch(
+            items=candidates,
+            scope=scope,
+            stage="stream_candidate_scope_gate",
+            llm_stage="scope_stream_candidate",
+            batch_size=batch_size,
+            prompt_builder=build_stream_scope_prompt,
+        )
+
+    async def _evaluate_batch(self, *, items: list[Any], scope: ScopeEnforcementResult, stage: str, llm_stage: str, batch_size: int | None, prompt_builder: Any) -> list[ScopeDecision]:
+        if not items:
+            return []
+        payload_items = [i.model_dump() if hasattr(i, "model_dump") else dict(i) for i in items]
+        prompt_payload = {"items": payload_items, "scope_rules": "Do not accept solely because query text matches target or URL is .m3u8"}
+        prompt = prompt_builder(prompt_payload, scope.model_dump())
+        timeout = float(settings.scope_decision_timeout_seconds)
+        started = time.perf_counter()
+        try:
+            raw = await asyncio.wait_for(
+                self.backend.generate(prompt, system_prompt=SYSTEM_PROMPT, stage=llm_stage),
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.warning("ScopeEnforcementAgent: {} batch timed out/failed after {}s; fallback={}", stage, timeout, settings.scope_decision_failure_mode)
+            return [self._fallback_for_failure(stage=stage, raw_llm_response={"error": str(exc), "timeout_seconds": timeout}) for _ in items]
+        parsed = self._extract_json(raw) if isinstance(raw, str) else raw
+        rows = parsed.get("decisions") if isinstance(parsed, dict) else None
+        if not isinstance(rows, list):
+            rows = [parsed] if isinstance(parsed, dict) else []
+        out: list[ScopeDecision] = []
+        for idx, item in enumerate(items):
+            if idx >= len(rows):
+                out.append(self._fallback_for_failure(stage=stage, raw_llm_response={"error": "missing_batch_decision", "raw": parsed}))
+                continue
+            out.append(self._parse_scope_decision(raw=rows[idx], stage=stage))
+        if len(rows) > len(items):
+            logger.warning("ScopeEnforcementAgent: {} returned extra decisions; extra={} ignored", stage, len(rows) - len(items))
+        logger.debug("ScopeEnforcementAgent: {} batch done count={} elapsed={:.2f}s", stage, len(items), time.perf_counter() - started)
+        return out
 
     def _parse_scope_decision(self, *, raw: Any, stage: str) -> ScopeDecision:
         try:
@@ -162,6 +205,19 @@ class ScopeEnforcementAgent:
             return ScopeDecision.model_validate(fallback_payload)
         except ValidationError:
             return ScopeDecision(decision="reject", confidence=0.0, reason=reason)
+
+    def _fallback_for_failure(self, *, stage: str, raw_llm_response: Any) -> ScopeDecision:
+        mode = (settings.scope_decision_failure_mode or "reject").strip().lower()
+        decision = "review" if mode == "review" else "reject"
+        return ScopeDecision(
+            decision=decision,
+            confidence=0.0,
+            reason=f"LLM scope decision unavailable at {stage}; applied fallback={decision}.",
+            matched_scope_terms=[],
+            missing_evidence=["llm_scope_decision_unavailable"],
+            risk_flags=["scope_decision_failure_fallback"],
+            raw_llm_response=raw_llm_response,
+        )
 
     @staticmethod
     def _extract_json(text: str) -> dict:
