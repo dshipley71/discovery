@@ -30,6 +30,7 @@ from webcam_discovery.skills.url_metadata_extraction import URLMetadataExtractor
 from webcam_discovery.skills.location_expansion import LocationExpansionSkill
 from webcam_discovery.skills.visual_stream_analysis import VisualStreamAnalysis
 from webcam_discovery.models.stream_analysis import StreamAnalysisResult
+from webcam_discovery.llm.base import LLMRequestError
 
 def _append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +88,15 @@ async def run_agentic(args: argparse.Namespace) -> None:
     memory_hints = memory.search(args.query, limit=5) if (memory and settings.memory_search_before_planning) else []
 
     planner = PlannerAgent()
-    plan = await planner.plan(args.query, context=PlannerContext(memory_hints=memory_hints))
+    try:
+        plan = await planner.plan(args.query, context=PlannerContext(memory_hints=memory_hints))
+    except LLMRequestError as exc:
+        logger.error("Planner LLM request timed out before discovery started.")
+        logger.error("No discovery, validation, catalog, or map generation was performed.")
+        payload = {"status": "failed_before_discovery", "failed_stage": exc.stage, "provider": exc.provider, "model": exc.model, "attempts": exc.attempts, "error_type": exc.error_type, "message": exc.message, "query": args.query}
+        (settings.log_dir / "planner_error.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": exc.stage, "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": exc.error_type, "message": exc.message}}, indent=2), encoding="utf-8")
+        raise SystemExit(2) from exc
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     _append_jsonl(settings.log_dir / "planner_runs.jsonl", {
         "timestamp": datetime.utcnow().isoformat(),
@@ -98,7 +107,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
     })
 
     scope_agent = ScopeEnforcementAgent()
-    scope = await scope_agent.infer_scope(args.query, plan)
+    try:
+        scope = await scope_agent.infer_scope(args.query, plan)
+    except LLMRequestError as exc:
+        payload = {"status": "failed_before_discovery", "failed_stage": exc.stage, "provider": exc.provider, "model": exc.model, "attempts": exc.attempts, "error_type": exc.error_type, "message": exc.message, "query": args.query}
+        (settings.log_dir / "scope_error.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": exc.stage, "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": exc.error_type, "message": exc.message}}, indent=2), encoding="utf-8")
+        raise SystemExit(2) from exc
     llm_metadata = {"provider": settings.planner_provider, "model": settings.planner_model}
     scope_payload = {**scope.model_dump(), **llm_metadata}
     (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope_payload, ensure_ascii=False, indent=2), encoding="utf-8")
