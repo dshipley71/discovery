@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from pathlib import Path
 import math
+import sys
 
 from loguru import logger
 
@@ -18,6 +19,7 @@ from webcam_discovery.agents.planner_agent import PlannerAgent, PlannerContext
 from webcam_discovery.agents.search_agent import SearchAgent
 from webcam_discovery.agents.scope_enforcement_agent import ScopeEnforcementAgent
 from webcam_discovery.agents.scope_enforcement_agent import ScopeInferenceParseError
+from webcam_discovery.agents.query_clarification_agent import QueryClarificationAgent
 from webcam_discovery.agents.search_result_triage_agent import SearchResultTriageAgent
 from webcam_discovery.agents.feed_discovery_agent import FeedDiscoveryAgent
 from webcam_discovery.agents.target_resolution_agent import TargetResolutionAgent
@@ -83,6 +85,40 @@ def _validation_status_counts(records) -> dict[str, int]:
     return counts
 
 
+def _write_final_validation_artifacts(records) -> None:
+    """Overwrite final validation artifacts so status counts match run_summary/catalog."""
+    rows = []
+    for record in records:
+        refs = list(getattr(record, "source_refs", []) or [])
+        rows.append({
+            "url": getattr(record, "url", None),
+            "camera_id": getattr(record, "id", None),
+            "source_page": next((ref for ref in refs if isinstance(ref, str) and ref.startswith(("http://", "https://"))), None),
+            "source_query": next((ref[6:] for ref in refs if isinstance(ref, str) and ref.startswith("query:")), None),
+            "lineage": refs,
+            "http_status": None,
+            "hls_status": getattr(record, "hls_status", None),
+            "stream_status": getattr(record, "status", "unknown"),
+            "stream_substatus": getattr(record, "stream_substatus", None),
+            "validation_confidence": getattr(record, "validation_confidence", None),
+            "validation_reason": getattr(record, "validation_reason", None),
+            "geocode_source": getattr(record, "geocode_source", None),
+            "geocode_confidence": getattr(record, "geocode_confidence", None),
+            "geocode_precision": getattr(record, "geocode_precision", None),
+            "latitude": getattr(record, "latitude", None),
+            "longitude": getattr(record, "longitude", None),
+        })
+    (settings.log_dir / "validation_results.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    counts = {"live": 0, "dead": 0, "unknown": 0, "restricted": 0, "timeout": 0, "offline_http": 0, "decode_failed": 0, "skipped": 0}
+    for row in rows:
+        key = _status_bucket(row.get("stream_status"))
+        counts[key] = counts.get(key, 0) + 1
+    (settings.log_dir / "camera_status_summary.json").write_text(json.dumps(counts, indent=2), encoding="utf-8")
+
+
 def _empty_run_summary(query: str, *, status: str, reason: str | None = None) -> dict:
     return {
         "status": status,
@@ -132,6 +168,8 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "rejected_candidates.jsonl",
         "unvalidated_stream_candidates.jsonl",
         "needs_review_location_unknown.jsonl",
+        "agentic_candidates_validation_dropped.jsonl",
+        "catalog_cap_dropped.jsonl",
     ]:
         try:
             (settings.candidates_dir / rel).unlink()
@@ -141,8 +179,12 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "search_result_scope_decisions.jsonl",
         "stream_candidate_scope_decisions.jsonl",
         "validation_results.jsonl",
+        "http_hls_probe_results.jsonl",
+        "http_hls_probe_summary.json",
         "geocoding_results.jsonl",
         "camera_status_summary.json",
+        "query_clarification.json",
+        "query_clarification_response.json",
         "run_summary.json",
     ]:
         try:
@@ -209,6 +251,98 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "plan": plan.model_dump(),
         "memory_hints": memory_hints,
     })
+
+    # One-time LLM clarification preflight. This runs before scope enforcement and
+    # before any discovery so ambiguous places (for example "Paris") or missing
+    # scope can be resolved without broad searches. If the user does not provide
+    # an answer, normal scope enforcement remains responsible for stopping the run.
+    clarification_result = None
+    if not getattr(args, "disable_clarification", False):
+        try:
+            clarification_result = await QueryClarificationAgent().analyze(args.query, plan)
+        except LLMRequestError as exc:
+            logger.warning(
+                "QueryClarificationAgent unavailable at stage={} provider={} model={}; continuing to scope enforcement.",
+                exc.stage,
+                exc.provider,
+                exc.model,
+            )
+        except Exception as exc:
+            logger.warning("QueryClarificationAgent failed; continuing to scope enforcement: {}", exc)
+
+    if clarification_result is not None:
+        clarification_payload = {
+            "run_id": run_id,
+            "query": args.query,
+            "provider": settings.planner_provider,
+            "model": settings.planner_model,
+            **clarification_result.model_dump(),
+        }
+        (settings.log_dir / "query_clarification.json").write_text(
+            json.dumps(clarification_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if clarification_result.needs_clarification:
+            questions = clarification_result.questions[:3]
+            answer = (getattr(args, "clarification_answer", None) or "").strip()
+            if not answer and sys.stdin is not None and sys.stdin.isatty():
+                logger.warning("Query clarification required before discovery: {}", clarification_result.reason)
+                for idx, question in enumerate(questions, start=1):
+                    print(f"Clarification {idx}: {question}")
+                answer = input("Answer once, or leave blank to stop before discovery: ").strip()
+            if answer:
+                original_query = args.query
+                clarified_query = f"{original_query} Clarification answer: {answer}"
+                args.query = clarified_query
+                logger.info("Using clarified query: {}", args.query)
+                (settings.log_dir / "query_clarification_response.json").write_text(
+                    json.dumps({
+                        "run_id": run_id,
+                        "original_query": original_query,
+                        "questions": questions,
+                        "answer": answer,
+                        "clarified_query": clarified_query,
+                        "provider": settings.planner_provider,
+                        "model": settings.planner_model,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                try:
+                    plan = await planner.plan(args.query, context=PlannerContext(memory_hints=memory_hints))
+                    _append_jsonl(settings.log_dir / "planner_runs.jsonl", {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "run_id": run_id,
+                        "query": args.query,
+                        "original_query": original_query,
+                        "clarified": True,
+                        "plan": plan.model_dump(),
+                        "memory_hints": memory_hints,
+                    })
+                except LLMRequestError as exc:
+                    logger.error("Planner failed after clarification before discovery started.")
+                    payload = {"status": "failed_before_discovery", "failed_stage": exc.stage, "provider": exc.provider, "model": exc.model, "attempts": exc.attempts, "error_type": exc.error_type, "message": exc.message, "query": args.query, "original_query": original_query}
+                    (settings.log_dir / "planner_error.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": exc.stage, "query": args.query, "original_query": original_query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": exc.error_type, "message": exc.message}}, indent=2), encoding="utf-8")
+                    raise SystemExit(2) from exc
+            else:
+                logger.warning("Clarification required; no clarification answer provided. Discovery will not run.")
+                for question in questions:
+                    logger.warning("Clarification question: {}", question)
+                for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
+                    (settings.log_dir / rel).touch()
+                summary = _empty_run_summary(args.query, status="needs_clarification", reason=clarification_result.reason)
+                summary["clarification"] = {
+                    "needed": True,
+                    "clarification_type": clarification_result.clarification_type,
+                    "questions": questions,
+                    "candidate_interpretations": clarification_result.candidate_interpretations,
+                    "provider": settings.planner_provider,
+                    "model": settings.planner_model,
+                    "asked_once": True,
+                    "discovery_started": False,
+                }
+                (settings.log_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                return
 
     scope_agent = ScopeEnforcementAgent()
     try:
@@ -475,7 +609,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
                 rej += decision.decision == "reject"
                 rev += decision.decision == "review"
                 search_scope_summary["total_evaluated"] += 1
-                _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {"run_id": run_id, "stage":"search_result_scope_gate","batch_index":batch_no,"batch_total": total_batches,"item_index":item_idx,"result_url":page.url,"title":page.title,"snippet":page.snippet,"source_queries":[p.source_query for p in dedup_pages.get(_normalize_url_for_dedup(page.url), [page]) if p.source_query],"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"batch_timeout" if "scope_gate_timeout" in (decision.risk_flags or []) else None,"timeout_seconds": settings.scope_decision_timeout_seconds if "scope_gate_timeout" in (decision.risk_flags or []) else None,"error":None})
+                _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {"run_id": run_id, "stage":"search_result_scope_gate","batch_index":batch_no,"batch_total": total_batches,"item_index":item_idx,"result_url":page.url,"title":page.title,"snippet":page.snippet,"source_queries":[p.source_query for p in dedup_pages.get(_normalize_url_for_dedup(page.url), [page]) if p.source_query],"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"batch_timeout" if "scope_gate_timeout" in (decision.risk_flags or []) else None,"timeout_seconds": settings.scope_decision_timeout_seconds if "scope_gate_timeout" in (decision.risk_flags or []) else None,"provider":settings.planner_provider,"model":settings.planner_model,"raw_llm_response":decision.raw_llm_response,"normalized":not fallback_used,"error":None})
                 if decision.decision == "accept":
                     for dup in dedup_pages.get(page.url.strip().lower(), [page]):
                         gated_pages.append(dup)
@@ -545,6 +679,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
 
     agentic_candidates_path = settings.candidates_dir / "agentic_candidates.jsonl"
     write_agentic_candidates(agentic_candidates_path, [*candidates, *stream_candidates], run_id=run_id, user_query=args.query)
+    validation_cap = getattr(args, "max_validation_candidates", None)
+    if validation_cap is None and getattr(args, "max_streams", None):
+        validation_cap = args.max_streams
     handoff_streams, handoff_candidate_by_url, agentic_handoff_summary = load_agentic_candidate_handoff(
         agentic_candidates_path,
         unique_output_path=settings.candidates_dir / "agentic_candidates_unique.jsonl",
@@ -552,7 +689,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
         fallback_run_id=run_id,
         fallback_user_query=args.query,
         target_locations=target_locations,
-        max_candidates=getattr(args, "max_validation_candidates", None),
+        max_candidates=validation_cap,
     )
     for key, candidate in handoff_candidate_by_url.items():
         candidate_by_url[key] = candidate
@@ -585,13 +722,13 @@ async def run_agentic(args: argparse.Namespace) -> None:
             batch_no = (idx // settings.scope_batch_size) + 1
             logger.info("ScopeEnforcementAgent: stream candidate scope gate batch {}/{} start count={} timeout={}s", batch_no, total_batches, len(batch), settings.scope_decision_timeout_seconds)
             batch_decisions = await scope_agent.evaluate_stream_candidates_batch(batch, scope, batch_size=settings.scope_batch_size)
-            for sc, decision in zip(batch, batch_decisions):
+            for item_idx, (sc, decision) in enumerate(zip(batch, batch_decisions)):
                 fallback_used = any(flag in {"scope_decision_parse_error", "scope_decision_failure_fallback"} for flag in (decision.risk_flags or []))
                 validation_allowed = decision.decision == "accept" or (decision.decision == "review" and getattr(args, "allow_scope_review_candidates_to_validation", True))
                 if fallback_used and validation_allowed:
                     stream_candidates_allowed_after_fallback += 1
                 stream_counts[decision.decision] = stream_counts.get(decision.decision, 0) + 1
-                _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {"stage":"stream_candidate_scope_gate","batch_index":batch_no,"item_index":0,"candidate_url":sc.candidate_url,"source_page":sc.source_page,"lineage":sc.parent_pages,"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"scope_decision_failure_fallback" if fallback_used else None,"validation_allowed":validation_allowed,"error":None})
+                _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {"run_id":run_id,"stage":"stream_candidate_scope_gate","batch_index":batch_no,"item_index":item_idx,"candidate_url":sc.candidate_url,"source_page":sc.source_page,"lineage":sc.parent_pages,"source_query":sc.source_query,"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"scope_decision_failure_fallback" if fallback_used else None,"validation_allowed":validation_allowed,"provider":settings.planner_provider,"model":settings.planner_model,"raw_llm_response":decision.raw_llm_response,"normalized":not fallback_used,"error":None})
                 if validation_allowed:
                     scoped_stream_candidates.append(sc)
                 else:
@@ -643,8 +780,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
             raise SystemExit(0)
         validator = ValidationAgent()
         records = await validator.run(candidates=validation_candidates)
-        if args.max_streams:
+        if args.max_streams and len(records) > args.max_streams:
+            dropped_records = records[args.max_streams:]
+            drop_rows = []
+            for record in dropped_records:
+                drop_rows.append({
+                    "url": record.url,
+                    "camera_id": record.id,
+                    "stage": "catalog_cap",
+                    "reason": "max_streams_cap",
+                    "cap": args.max_streams,
+                    "record_count_before_cap": len(records),
+                    "record_count_after_cap": args.max_streams,
+                })
+            (settings.candidates_dir / "catalog_cap_dropped.jsonl").write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in drop_rows),
+                encoding="utf-8",
+            )
+            rejection_reasons["max_streams_cap"] = rejection_reasons.get("max_streams_cap", 0) + len(dropped_records)
             records = records[: args.max_streams]
+            _write_final_validation_artifacts(records)
     else:
         unvalidated_path = settings.candidates_dir / "unvalidated_stream_candidates.jsonl"
         unvalidated_path.write_text(
@@ -689,6 +844,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             record.visual_metrics = result.visual_metrics
             _append_jsonl(settings.log_dir / "visual_stream_analysis.jsonl", result.model_dump())
             _append_jsonl(settings.log_dir / "temporal_status.jsonl", result.model_dump())
+        _write_final_validation_artifacts(records)
 
     mapped_records = [r for r in records if r.latitude is not None and r.longitude is not None]
     unknown_location = [r for r in records if r.latitude is None or r.longitude is None]
@@ -896,6 +1052,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--enable-video-summary", action="store_true")
     run.add_argument("--llm-provider", type=str, choices=["ollama", "openai-compatible"])
     run.add_argument("--llm-model", type=str)
+    run.add_argument("--clarification-answer", type=str, default=None, help="One-time answer to an LLM clarification question for ambiguous or underspecified queries")
+    run.add_argument("--disable-clarification", action="store_true", help="Developer/debug: skip one-time LLM clarification preflight and rely on scope enforcement only")
     run.add_argument("--scope-batch-size", type=int, default=settings.scope_batch_size)
     run.add_argument("--max-scope-search-results", type=int, default=settings.max_scope_search_results)
     run.add_argument("--max-scope-stream-candidates", type=int, default=settings.max_scope_stream_candidates)

@@ -354,11 +354,11 @@ class ValidationAgent:
             }
             for result in validation_results
         ]
-        _append_jsonl(settings.log_dir / "validation_results.jsonl", validation_result_rows)
+        _append_jsonl(settings.log_dir / "http_hls_probe_results.jsonl", validation_result_rows)
         status_summary = Counter(row["stream_status"] for row in validation_result_rows)
         for key in ["live", "dead", "unknown", "restricted", "timeout", "offline_http", "decode_failed", "skipped"]:
             status_summary.setdefault(key, 0)
-        (settings.log_dir / "camera_status_summary.json").write_text(json.dumps(dict(status_summary), indent=2), encoding="utf-8")
+        (settings.log_dir / "http_hls_probe_summary.json").write_text(json.dumps(dict(status_summary), indent=2), encoding="utf-8")
 
         n_live    = sum(1 for r in validation_results if r.status == "live")
         n_timeout = sum(1 for r in validation_results if r.fail_reason == "timeout")
@@ -696,6 +696,36 @@ class ValidationAgent:
                 logger.warning(
                     "ValidationAgent: record build error for '{}': {}", candidate.url, exc
                 )
+
+        final_validation_rows = [
+            {
+                "url": record.url,
+                "camera_id": record.id,
+                "source_page": next((ref for ref in record.source_refs if isinstance(ref, str) and ref.startswith(("http://", "https://"))), None),
+                "source_query": next((ref[6:] for ref in record.source_refs if isinstance(ref, str) and ref.startswith("query:")), None),
+                "lineage": record.source_refs,
+                "http_status": None,
+                "hls_status": record.hls_status,
+                "stream_status": record.status,
+                "stream_substatus": record.stream_substatus,
+                "validation_confidence": record.validation_confidence,
+                "validation_reason": record.validation_reason,
+                "geocode_source": record.geocode_source,
+                "geocode_confidence": record.geocode_confidence,
+                "geocode_precision": record.geocode_precision,
+                "latitude": record.latitude,
+                "longitude": record.longitude,
+            }
+            for record in records
+        ]
+        (settings.log_dir / "validation_results.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in final_validation_rows),
+            encoding="utf-8",
+        )
+        final_status_summary = Counter(row["stream_status"] for row in final_validation_rows)
+        for key in ["live", "dead", "unknown", "restricted", "timeout", "offline_http", "decode_failed", "skipped"]:
+            final_status_summary.setdefault(key, 0)
+        (settings.log_dir / "camera_status_summary.json").write_text(json.dumps(dict(final_status_summary), indent=2), encoding="utf-8")
 
         located   = sum(1 for r in records if r.latitude is not None)
         unlocated = len(records) - located

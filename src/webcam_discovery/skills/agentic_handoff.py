@@ -230,11 +230,14 @@ def load_agentic_candidate_handoff(
             continue
         unique_rows_by_key[key] = row
 
-    unique_rows = list(unique_rows_by_key.values())
+    all_unique_rows = list(unique_rows_by_key.values())
     capped_count = 0
-    if max_candidates is not None and max_candidates >= 0 and len(unique_rows) > max_candidates:
-        capped_count = len(unique_rows) - max_candidates
-        unique_rows = unique_rows[:max_candidates]
+    capped_rows: list[dict[str, Any]] = []
+    unique_rows = all_unique_rows
+    if max_candidates is not None and max_candidates >= 0 and len(all_unique_rows) > max_candidates:
+        capped_count = len(all_unique_rows) - max_candidates
+        unique_rows = all_unique_rows[:max_candidates]
+        capped_rows = all_unique_rows[max_candidates:]
 
     streams: list[StreamCandidate] = []
     cameras: dict[str, CameraCandidate] = {}
@@ -253,15 +256,29 @@ def load_agentic_candidate_handoff(
 
     if unique_output_path:
         unique_output_path.parent.mkdir(parents=True, exist_ok=True)
-        unique_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in unique_rows), encoding="utf-8")
+        unique_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in all_unique_rows), encoding="utf-8")
+    dropped_rows: list[dict[str, Any]] = []
+    for row in capped_rows:
+        dropped_rows.append({
+            **row,
+            "sent_to_scope_review": False,
+            "validation_allowed": False,
+            "skip_reason": "max_validation_candidates_cap",
+            "cap": max_candidates,
+            "candidate_count_before_cap": len(all_unique_rows),
+            "candidate_count_after_cap": len(unique_rows),
+        })
     if handoff_output_path:
         handoff_output_path.parent.mkdir(parents=True, exist_ok=True)
-        handoff_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in handoff_rows), encoding="utf-8")
+        handoff_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in [*handoff_rows, *dropped_rows]), encoding="utf-8")
+        if dropped_rows:
+            drop_path = handoff_output_path.parent / "agentic_candidates_validation_dropped.jsonl"
+            drop_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in dropped_rows), encoding="utf-8")
 
     summary = {
         "raw": len(rows),
         "malformed_rows": malformed,
-        "unique_hls": len(unique_rows),
+        "unique_hls": len(all_unique_rows),
         "skipped_non_hls": skipped_non_hls,
         "duplicates_removed": duplicate_count,
         "capped": capped_count,
