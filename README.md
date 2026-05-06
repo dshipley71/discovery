@@ -196,14 +196,13 @@ Writes `logs/video_summaries.jsonl` from bounded frame/audio samples.
 
 `webcam-discovery run-agentic` now performs an LLM-based clarification preflight before discovery. The preflight is designed for ambiguous or underspecified natural-language requests, not for broad heuristic parsing. For example, `Get me all traffic cameras from Paris` should stop and ask one concise clarification question such as whether the user means Paris, France, Paris, Texas, or another Paris. A query such as `Get me all traffic camera` should stop and ask for a specific place, landmark, agency, coordinates, hostname, IP address, or public website.
 
-Clarification is asked only once. In an interactive terminal, the CLI prompts for one answer. In Colab or other non-interactive runs, the app writes `logs/query_clarification.json` and `logs/run_summary.json` with `status=needs_clarification`, then exits before search/feed discovery. To run non-interactively with the answer already supplied, pass:
+Clarification is asked only once. The CLI and Colab notebook do not accept a separate clarification-answer flag. If clarification is required, the app writes `logs/query_clarification.json` and `logs/run_summary.json` with `status=needs_clarification`, then exits before search/feed discovery. The user should rerun with a clearer natural-language query:
 
 ```bash
-webcam-discovery run-agentic "Get me all traffic cameras from Paris" \
-  --clarification-answer "Paris, France"
+webcam-discovery run-agentic "Get me all traffic cameras from Paris, France"
 ```
 
-If the single clarification answer is still insufficient, the normal LLM scope enforcement rules apply and discovery stops before broad search. Use `--disable-clarification` only for developer/debug validation of the underlying scope enforcement behavior.
+If the rerun query is still ambiguous or underspecified, the normal LLM scope enforcement rules apply and discovery stops before broad search. Use `--disable-clarification` only for developer/debug validation of the underlying scope enforcement behavior.
 
 ## Validation Status Accounting
 

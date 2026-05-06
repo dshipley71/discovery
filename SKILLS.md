@@ -79,9 +79,9 @@ Camera coordinates must be derived from evidence, not invented. Prefer source/AP
 
 1. Ask only when the query is ambiguous/conflicting or lacks a searchable place/source indicator.
 2. Ask no more than three questions and only one clarification turn.
-3. If a clarification answer is supplied, build a clarified query and continue to scope enforcement.
-4. If no answer is supplied in non-interactive execution, stop before discovery with `status=needs_clarification`.
-5. If the answer is still insufficient, do not ask again; the normal scope enforcement rules apply.
+3. Do not accept a separate clarification-answer flag; stop before discovery and instruct the user to rerun with a clearer natural-language query.
+4. Write `logs/query_clarification.json` and stop before discovery with `status=needs_clarification`.
+5. If the rerun query is still insufficient or ambiguous, do not ask repeatedly; the normal scope enforcement rules apply.
 
 ## FinalValidationArtifactSkill
 

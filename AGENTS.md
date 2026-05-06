@@ -335,7 +335,7 @@ Examples:
 - `Get me all traffic camera` is underspecified and should ask for a place, landmark, coordinates, IP address, hostname, agency, or public website.
 - `Get me public live HLS traffic cameras from Paris, France` is sufficiently scoped and should proceed to normal LLM scope enforcement.
 
-The clarification agent may ask only one turn and must provide no more than three questions. If an answer is provided via the CLI or interactive input, the agent must construct a clarified query and continue to planner/scope enforcement. If no answer is available in a non-interactive environment, stop before discovery, write `logs/query_clarification.json`, and write `logs/run_summary.json` with `status=needs_clarification`. If the answer is still insufficient, do not ask again; continue to normal scope enforcement and let the existing insufficient-scope rules stop discovery.
+The clarification agent may ask only one turn and must provide no more than three questions. The CLI must stop before discovery and instruct the user to rerun with a clearer natural-language query; do not use a separate clarification-answer flag or hidden interactive query rewrite path. Write `logs/query_clarification.json` and `logs/run_summary.json` with `status=needs_clarification`. If the rerun query is still insufficient or ambiguous, do not ask repeatedly; let the normal scope enforcement rules stop discovery.
 
 ## Validation Reporting Consistency Rules
 

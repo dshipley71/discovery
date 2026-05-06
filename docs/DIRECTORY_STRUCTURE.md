@@ -436,7 +436,6 @@ names and relative paths. With this layout, all paths resolve as follows:
 
 ```text
 logs/query_clarification.json                 # one-time LLM clarification preflight result
-logs/query_clarification_response.json        # supplied clarification answer and clarified query
 logs/http_hls_probe_results.jsonl             # early HTTP/HLS probe rows, not final camera truth
 logs/http_hls_probe_summary.json              # early HTTP/HLS probe counts
 logs/validation_results.jsonl                 # final validation status rows after all classification/caps

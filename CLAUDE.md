@@ -116,8 +116,8 @@ from pydantic import BaseModel
 ## Current implementation notes — clarification and reporting
 
 - Add or preserve LLM clarification preflight before discovery. Do not implement ambiguous-place handling as a hardcoded parser; the LLM decides whether clarification is needed.
-- Clarification is a single turn only. If no answer is supplied, write `logs/query_clarification.json` and `run_summary.json` with `status=needs_clarification`, then stop before discovery.
-- `--clarification-answer` supplies the one answer for non-interactive Colab runs. `--disable-clarification` is debug-only.
+- Clarification is a single turn only. Write `logs/query_clarification.json` and `run_summary.json` with `status=needs_clarification`, then stop before discovery. The user reruns with a clearer query.
+- Do not add or use a `--clarification-answer` flag. `--disable-clarification` is debug-only.
 - Keep `http_hls_probe_results.jsonl` separate from final `validation_results.jsonl`.
 - Ensure `camera_status_summary.json`, `run_summary.json.validation`, and `camera.geojson` feature counts reconcile after final status classification and caps.
 - Add provider/model/raw response metadata to all LLM scope-decision artifacts.
