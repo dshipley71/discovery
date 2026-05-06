@@ -116,6 +116,67 @@ def _append_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _hls_status(result: ValidationResult) -> str:
+    if result.status == "live" and result.playlist_type == "master":
+        return "valid_master_playlist"
+    if result.status == "live" and result.playlist_type == "media":
+        return "valid_media_playlist"
+    if result.status == "live":
+        return "valid_hls"
+    if result.fail_reason in {"not_hls", "no_m3u8_magic"}:
+        return "invalid_hls"
+    return "unknown"
+
+
+def _stream_status(result: ValidationResult) -> str:
+    reason = (result.fail_reason or "").lower()
+    if result.status == "live":
+        return "live"
+    if reason == "timeout":
+        return "timeout"
+    if "auth" in reason or "login" in reason or reason in {"http_401", "http_403"}:
+        return "restricted"
+    if reason.startswith("http_"):
+        return "offline_http"
+    if "decode" in reason or reason in {"no_m3u8_magic", "not_hls"}:
+        return "decode_failed"
+    if result.status == "dead":
+        return "dead"
+    return "unknown"
+
+
+def _stream_substatus(result: ValidationResult) -> str:
+    status = _stream_status(result)
+    if status == "live":
+        return "active_live_static_view"
+    if status == "restricted":
+        return "restricted_http"
+    if status == "offline_http":
+        return "offline_http"
+    if status == "decode_failed":
+        return "decode_failed"
+    if status == "timeout":
+        return "dead_link"
+    if status == "dead":
+        return "dead_link"
+    return "unknown"
+
+
+def _validation_confidence(result: ValidationResult) -> float:
+    status = _stream_status(result)
+    if status == "live" and result.legitimacy_score == "high":
+        return 0.9
+    if status == "live":
+        return 0.75
+    if status in {"restricted", "offline_http", "timeout", "decode_failed", "dead"}:
+        return 0.65
+    return 0.35
+
+
+def _geocode_confidence_to_float(confidence: str | None) -> float:
+    return {"high": 0.85, "medium": 0.6, "low": 0.35}.get((confidence or "").lower(), 0.25)
+
+
 def _unwrap_candidates(candidates: list[CameraCandidate]) -> list[CameraCandidate]:
     """
     Unwrap any player-wrapper URLs in the candidate list.
@@ -278,17 +339,26 @@ class ValidationAgent:
         validation_result_rows = [
             {
                 "url": result.url,
+                "http_status": result.status_code,
                 "status": result.status,
-                "status_code": result.status_code,
+                "stream_status": _stream_status(result),
+                "stream_substatus": _stream_substatus(result),
+                "hls_status": _hls_status(result),
                 "content_type": result.content_type,
                 "legitimacy_score": result.legitimacy_score,
                 "fail_reason": result.fail_reason,
+                "validation_confidence": _validation_confidence(result),
+                "validation_reason": result.fail_reason or "http_hls_probe",
                 "playlist_type": result.playlist_type,
                 "variant_streams": result.variant_streams,
             }
             for result in validation_results
         ]
         _append_jsonl(settings.log_dir / "validation_results.jsonl", validation_result_rows)
+        status_summary = Counter(row["stream_status"] for row in validation_result_rows)
+        for key in ["live", "dead", "unknown", "restricted", "timeout", "offline_http", "decode_failed", "skipped"]:
+            status_summary.setdefault(key, 0)
+        (settings.log_dir / "camera_status_summary.json").write_text(json.dumps(dict(status_summary), indent=2), encoding="utf-8")
 
         n_live    = sum(1 for r in validation_results if r.status == "live")
         n_timeout = sum(1 for r in validation_results if r.fail_reason == "timeout")
@@ -477,11 +547,10 @@ class ValidationAgent:
             if v.status == "dead":
                 dropped_dead += 1
                 logger.info(
-                    "ValidationAgent: drop dead stream {} (fail_reason={})",
+                    "ValidationAgent: retaining dead/offline stream {} for audited status output (fail_reason={})",
                     candidate.url,
                     v.fail_reason or "unknown",
                 )
-                continue
 
             if not settings.use_ffprobe_validation:
                 min_legit = settings.min_legitimacy
@@ -536,7 +605,10 @@ class ValidationAgent:
             continent  = "Unknown"
             region:  Optional[str] = None
 
-            coordinate_source = "feed" if candidate.latitude is not None and candidate.longitude is not None else "geocoder"
+            coordinate_source = "source_metadata" if candidate.latitude is not None and candidate.longitude is not None else "unknown"
+            geocode_precision = "camera" if candidate.latitude is not None and candidate.longitude is not None else "unknown"
+            geocode_confidence = 0.9 if candidate.latitude is not None and candidate.longitude is not None else 0.0
+            geocode_reason = "coordinates supplied by candidate/source metadata" if candidate.latitude is not None and candidate.longitude is not None else "coordinates not resolved yet"
             if candidate.latitude is not None and candidate.longitude is not None:
                 latitude = candidate.latitude
                 longitude = candidate.longitude
@@ -547,13 +619,20 @@ class ValidationAgent:
                     longitude = longitude if longitude is not None else note_data.get("longitude")
                     if latitude is not None and longitude is not None:
                         coordinate_source = "legacy_notes"
+                        geocode_precision = "camera"
+                        geocode_confidence = 0.7
+                        geocode_reason = "coordinates recovered from legacy notes JSON"
                 except Exception:
                     pass
 
             if isinstance(geo, Exception):
                 logger.warning("ValidationAgent: geo error for '{}': {}", city, geo)
             elif geo is not None and (latitude is None or longitude is None):
-                _append_jsonl(settings.log_dir / "geocoding_results.jsonl", [{"url": candidate.url, "latitude": geo.latitude, "longitude": geo.longitude, "country": geo.country, "region": geo.region, "continent": geo.continent}])
+                coordinate_source = "llm_candidate_context" if getattr(geo_skill, "_use_llm", False) else "geocoder"
+                geocode_confidence = _geocode_confidence_to_float(getattr(geo, "confidence", None))
+                geocode_precision = "city_area" if geocode_confidence >= 0.6 else "city_centroid"
+                geocode_reason = "resolved from candidate label/city/country/source context" if geo.latitude is not None and geo.longitude is not None else "no coordinates resolved"
+                _append_jsonl(settings.log_dir / "geocoding_results.jsonl", [{"url": candidate.url, "latitude": geo.latitude, "longitude": geo.longitude, "country": geo.country, "region": geo.region, "continent": geo.continent, "geocode_source": coordinate_source, "geocode_confidence": geocode_confidence, "geocode_precision": geocode_precision, "geocode_reason": geocode_reason}])
                 latitude   = geo.latitude
                 longitude  = geo.longitude
                 continent  = geo.continent or "Unknown"
@@ -589,9 +668,19 @@ class ValidationAgent:
                     source_directory=candidate.source_directory,
                     source_refs=source_refs or [effective_url],
                     legitimacy_score=v.legitimacy_score,
-                    status=v.status,
+                    status=_stream_status(v),
                     last_verified=None,
                     notes=notes or None,
+                    stream_substatus=_stream_substatus(v),
+                    stream_confidence=_validation_confidence(v),
+                    stream_reasons=[v.fail_reason or "http_hls_probe"],
+                    hls_status=_hls_status(v),
+                    validation_confidence=_validation_confidence(v),
+                    validation_reason=v.fail_reason or "http_hls_probe",
+                    geocode_source=coordinate_source,
+                    geocode_confidence=geocode_confidence,
+                    geocode_precision=geocode_precision,
+                    geocode_reason=geocode_reason,
                 )
                 records.append(record)
                 logger.debug(

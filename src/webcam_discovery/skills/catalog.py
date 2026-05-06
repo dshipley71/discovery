@@ -357,7 +357,7 @@ class DeduplicationSkill:
         """
         Check candidate_record against existing_catalog for duplicates.
 
-        Priority order: URL normalization → coordinate proximity → fuzzy label match.
+        Priority order: normalized stream URL only.  Approximate coordinates, city names, generic labels, CDN hosts, and cloud regions must not collapse distinct cameras.
 
         Args:
             input: DeduplicationInput with candidate_record and existing_catalog.
@@ -379,47 +379,9 @@ class DeduplicationSkill:
                     merged_record=merged,
                 )
 
-            # 2. Coordinate proximity match (within 50m, same city)
-            if (
-                existing.latitude is not None
-                and existing.longitude is not None
-                and candidate.latitude is not None
-                and candidate.longitude is not None
-                and existing.city.lower() == candidate.city.lower()
-            ):
-                dist = _haversine_distance_m(
-                    existing.latitude, existing.longitude,
-                    candidate.latitude, candidate.longitude,
-                )
-                if dist <= self.PROXIMITY_METERS:
-                    merged = self._merge(existing, candidate)
-                    logger.debug("Dedup proximity match: {} ≡ {} ({:.1f}m)", candidate.id, existing.id, dist)
-                    return DeduplicationOutput(
-                        is_duplicate=True,
-                        canonical_record=existing,
-                        merged_record=merged,
-                    )
-
-            # 3. Fuzzy label match (same city, >85% similarity), except unknown/generic
-            existing_unknown = (existing.city or "").strip().lower() in {"unknown", ""}
-            candidate_unknown = (candidate.city or "").strip().lower() in {"unknown", ""}
-            existing_generic_label = (existing.label or "").strip().lower() in self.GENERIC_LABELS
-            candidate_generic_label = (candidate.label or "").strip().lower() in self.GENERIC_LABELS
-            if existing.city.lower() == candidate.city.lower() and not (existing_unknown and candidate_unknown) and not (existing_generic_label or candidate_generic_label):
-                similarity = fuzz.ratio(
-                    existing.label.lower(), candidate.label.lower()
-                )
-                if similarity > self.FUZZY_THRESHOLD:
-                    merged = self._merge(existing, candidate)
-                    logger.debug(
-                        "Dedup fuzzy match: '{}' ≈ '{}' ({:.0f}%)",
-                        candidate.label, existing.label, similarity,
-                    )
-                    return DeduplicationOutput(
-                        is_duplicate=True,
-                        canonical_record=existing,
-                        merged_record=merged,
-                    )
+            # Do not deduplicate by coordinates, labels, city names, or source pages.
+            # Multiple distinct cameras may legitimately share approximate or fallback
+            # coordinates; stream URL / stable source identity is the safe catalog key.
 
         return DeduplicationOutput(is_duplicate=False)
 

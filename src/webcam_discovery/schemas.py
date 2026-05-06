@@ -19,7 +19,7 @@ FeedType = Literal[
 ]
 
 LegitimacyScore = Literal["high", "medium", "low"]
-CameraStatus    = Literal["live", "dead", "unknown"]
+CameraStatus    = Literal["live", "dead", "unknown", "restricted", "timeout", "offline_http", "decode_failed"]
 
 
 # ── Inter-agent models ────────────────────────────────────────────────────────
@@ -118,6 +118,13 @@ class CameraRecord(BaseModel):
     visual_metrics: dict[str, Any] = Field(default_factory=dict)
     raw_metadata: dict[str, Any] = Field(default_factory=dict)
     location_text_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    hls_status: Optional[str] = None
+    validation_confidence: Optional[float] = None
+    validation_reason: Optional[str] = None
+    geocode_source: Optional[str] = None
+    geocode_confidence: Optional[float] = None
+    geocode_precision: Optional[str] = None
+    geocode_reason: Optional[str] = None
 
     @field_validator("latitude")
     @classmethod

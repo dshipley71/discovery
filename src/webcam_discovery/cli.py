@@ -32,6 +32,12 @@ from webcam_discovery.skills.candidate_priority import CandidatePriorityScorer
 from webcam_discovery.skills.url_metadata_extraction import URLMetadataExtractor
 from webcam_discovery.skills.location_expansion import LocationExpansionSkill
 from webcam_discovery.skills.visual_stream_analysis import VisualStreamAnalysis
+from webcam_discovery.skills.agentic_handoff import (
+    is_direct_hls_url,
+    load_agentic_candidate_handoff,
+    normalize_stream_url,
+    write_agentic_candidates,
+)
 from webcam_discovery.models.stream_analysis import StreamAnalysisResult
 from webcam_discovery.llm.base import LLMRequestError
 
@@ -62,6 +68,42 @@ def _normalize_url_for_dedup(url: str) -> str:
     return urlunparse(normalized)
 
 
+def _status_bucket(status: str | None) -> str:
+    value = (status or "unknown").strip().lower()
+    if value in {"live", "dead", "unknown", "restricted", "timeout", "offline_http", "decode_failed"}:
+        return value
+    return "unknown"
+
+
+def _validation_status_counts(records) -> dict[str, int]:
+    counts = {"live": 0, "dead": 0, "unknown": 0, "restricted": 0, "timeout": 0, "offline_http": 0, "decode_failed": 0, "skipped": 0}
+    for record in records:
+        key = _status_bucket(getattr(record, "status", None))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _empty_run_summary(query: str, *, status: str, reason: str | None = None) -> dict:
+    return {
+        "status": status,
+        "query": query,
+        "reason": reason,
+        "agentic_candidates": {"raw": 0, "unique_hls": 0, "duplicates_removed": 0, "sent_to_validation": 0},
+        "scope_gates": {
+            "search_results_accepted": 0,
+            "search_results_rejected": 0,
+            "search_results_review": 0,
+            "stream_candidates_accepted": 0,
+            "stream_candidates_rejected": 0,
+            "stream_candidates_review": 0,
+            "stream_candidates_allowed_for_validation_after_fallback": 0,
+        },
+        "validation": {"live": 0, "dead": 0, "unknown": 0, "restricted": 0, "timeout": 0, "decode_failed": 0, "skipped": 0},
+        "geocoding": {"with_coordinates": 0, "without_coordinates": 0, "camera_precision": 0, "city_area_precision": 0, "fallback_precision": 0},
+        "catalog": {"features_written": 0, "deduplicated": 0, "review_only": 0},
+    }
+
+
 async def run_agentic(args: argparse.Namespace) -> None:
     from webcam_discovery.pipeline import configure_logging
 
@@ -80,6 +122,33 @@ async def run_agentic(args: argparse.Namespace) -> None:
         settings.video_summary_enabled = False
 
     settings.ensure_dirs()
+    # Ensure this run's durable audit artifacts are not polluted by a previous run in the same output directory.
+    for rel in [
+        "agentic_candidates.jsonl",
+        "agentic_candidates_unique.jsonl",
+        "agentic_candidates_validation_handoff.jsonl",
+        "prioritized_candidates.jsonl",
+        "deprioritized_candidates.jsonl",
+        "rejected_candidates.jsonl",
+        "unvalidated_stream_candidates.jsonl",
+        "needs_review_location_unknown.jsonl",
+    ]:
+        try:
+            (settings.candidates_dir / rel).unlink()
+        except FileNotFoundError:
+            pass
+    for rel in [
+        "search_result_scope_decisions.jsonl",
+        "stream_candidate_scope_decisions.jsonl",
+        "validation_results.jsonl",
+        "geocoding_results.jsonl",
+        "camera_status_summary.json",
+        "run_summary.json",
+    ]:
+        try:
+            (settings.log_dir / rel).unlink()
+        except FileNotFoundError:
+            pass
     configure_logging()
 
     if getattr(args, "disable_ffprobe_validation", False) and validation_enabled:
@@ -98,6 +167,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     settings.scope_gate_total_timeout_seconds = float(getattr(args, "scope_gate_total_timeout_seconds", settings.scope_gate_total_timeout_seconds))
     settings.max_scope_gate_batches = int(getattr(args, "max_scope_gate_batches", settings.max_scope_gate_batches))
     settings.scope_decision_failure_mode = str(getattr(args, "scope_timeout_fallback", getattr(args, "scope_decision_failure_mode", settings.scope_decision_failure_mode)))
+    settings.stream_scope_decision_failure_mode = str(getattr(args, "stream_scope_fallback", settings.stream_scope_decision_failure_mode))
     settings.disable_llm_search_result_scope_gate = bool(getattr(args, "disable_llm_search_result_scope_gate", settings.disable_llm_search_result_scope_gate))
     settings.disable_llm_stream_scope_gate = bool(getattr(args, "disable_llm_stream_scope_gate", settings.disable_llm_stream_scope_gate))
     if args.enable_memory:
@@ -233,6 +303,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
     (settings.log_dir / "target_resolution.json").write_text(json.dumps(target_resolution.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
     if target_resolution.insufficient_target:
         logger.warning(target_resolution.message)
+        (settings.log_dir / "run_summary.json").write_text(
+            json.dumps(_empty_run_summary(args.query, status="insufficient_target", reason=target_resolution.message), indent=2),
+            encoding="utf-8",
+        )
         return
 
     target_locations = [t.normalized_name or t.raw_text for t in target_resolution.targets]
@@ -417,23 +491,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
         (settings.log_dir / "search_result_scope_summary.json").write_text(json.dumps(search_scope_summary, indent=2), encoding="utf-8")
         page_candidates = gated_pages
     if not page_candidates:
-        logger.info("Search result scope gate completed: accepted=0 rejected={} review={}. No accepted in-scope pages are available for discovery.", page_counts.get("reject", 0), page_counts.get("review", 0))
-        (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "completed_no_in_scope_pages", "query": args.query, "scope": scope.model_dump(), "search_result_scope": {"accepted": page_counts.get("accept", 0), "rejected": page_counts.get("reject", 0), "review": page_counts.get("review", 0)}}, indent=2), encoding="utf-8")
-        raise SystemExit(0)
+        direct_hls_candidates_seen = sum(1 for c in candidates if is_direct_hls_url(c.url))
+        if direct_hls_candidates_seen == 0:
+            logger.info("Search result scope gate completed: accepted=0 rejected={} review={}. No accepted in-scope pages or direct HLS candidates are available for discovery.", page_counts.get("reject", 0), page_counts.get("review", 0))
+            summary = _empty_run_summary(args.query, status="completed_no_in_scope_pages", reason="no accepted pages and no direct HLS candidates")
+            summary["scope_gates"].update({
+                "search_results_accepted": page_counts.get("accept", 0),
+                "search_results_rejected": page_counts.get("reject", 0),
+                "search_results_review": page_counts.get("review", 0),
+            })
+            (settings.log_dir / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            raise SystemExit(0)
+        logger.info(
+            "Search result scope gate accepted no pages, but {} direct HLS candidate(s) already exist; continuing to agentic_candidates.jsonl handoff.",
+            direct_hls_candidates_seen,
+        )
     logger.info("Search result scope gate: accepted={} rejected={} review={}", page_counts.get("accept",0), page_counts.get("reject",0), page_counts.get("review",0))
     funnel["search"]["page_candidates"] = len(page_candidates)
 
-    for c in candidates:
-        _append_jsonl(
-            settings.candidates_dir / "agentic_candidates.jsonl",
-            {
-                "run_id": run_id,
-                "source_query": next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), ""),
-                "candidate_url": c.url,
-                "candidate_type": "hls_or_page",
-                "discovered_by": "SearchAgent",
-            },
-        )
+    # agentic_candidates.jsonl is written after feed/deep discovery so it represents
+    # the complete discovery-to-validation handoff for this run.
 
     if getattr(args, "enable_feed_discovery", True) and page_candidates:
         if stop_file.exists():
@@ -452,10 +529,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
     candidate_by_url: dict[str, CameraCandidate] = {}
     stream_candidates: list[StreamCandidate] = []
     for c in candidates:
+        candidate_by_url[normalize_stream_url(c.url)] = c
         candidate_by_url[c.url.strip().lower()] = c
-        sq = next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None)
-        src_page = next((ref for ref in c.source_refs if ref.startswith(("http://", "https://"))), None)
-        root = src_page.split("/")[0] if src_page else None
+        sq = c.source_query or next((ref[6:] for ref in c.source_refs if ref.startswith("query:")), None)
+        src_page = c.source_page or next((ref for ref in c.source_refs if ref.startswith(("http://", "https://"))), None)
         stream_candidates.append(StreamCandidate(run_id=run_id, user_query=args.query, source_query=sq, candidate_url=c.url, source_page=src_page, root_url=src_page, discovery_strategy="search_direct", target_locations=target_locations, camera_types=camera_types, page_relevance_score=0.6, camera_likelihood_score=0.6))
     if getattr(args, "enable_deep_discovery", True) and page_candidates:
         if stop_file.exists():
@@ -466,8 +543,34 @@ async def run_agentic(args: argparse.Namespace) -> None:
         deep_streams = await deep_agent.discover(triaged, args.query, target_locations, location_search_plan.agencies, camera_types, getattr(args, "max_deep_depth", 3), getattr(args, "max_deep_pages", 100), getattr(args, "max_network_capture_pages", 10), getattr(args, "network_capture_timeout", 8))
         stream_candidates.extend(deep_streams)
 
+    agentic_candidates_path = settings.candidates_dir / "agentic_candidates.jsonl"
+    write_agentic_candidates(agentic_candidates_path, [*candidates, *stream_candidates], run_id=run_id, user_query=args.query)
+    handoff_streams, handoff_candidate_by_url, agentic_handoff_summary = load_agentic_candidate_handoff(
+        agentic_candidates_path,
+        unique_output_path=settings.candidates_dir / "agentic_candidates_unique.jsonl",
+        handoff_output_path=settings.candidates_dir / "agentic_candidates_validation_handoff.jsonl",
+        fallback_run_id=run_id,
+        fallback_user_query=args.query,
+        target_locations=target_locations,
+        max_candidates=getattr(args, "max_validation_candidates", None),
+    )
+    for key, candidate in handoff_candidate_by_url.items():
+        candidate_by_url[key] = candidate
+    stream_candidates = handoff_streams
+    logger.info(
+        "Agentic candidate handoff: loaded={} unique_hls={} skipped_non_hls={} duplicates={} capped={}",
+        agentic_handoff_summary.get("raw", 0),
+        agentic_handoff_summary.get("unique_hls", 0),
+        agentic_handoff_summary.get("skipped_non_hls", 0),
+        agentic_handoff_summary.get("duplicates_removed", 0),
+        agentic_handoff_summary.get("capped", 0),
+    )
+    if not stream_candidates:
+        logger.warning("agentic_candidates.jsonl contains no unique direct HLS candidates to validate.")
+
     stream_counts = {"accept": 0, "reject": 0, "review": 0}
     stream_candidate_decision_parse_errors = 0
+    stream_candidates_allowed_after_fallback = 0
     scoped_stream_candidates: list[StreamCandidate] = []
     if settings.disable_llm_stream_scope_gate:
         logger.warning("LLM stream-candidate scope gate disabled (debug only).")
@@ -484,55 +587,17 @@ async def run_agentic(args: argparse.Namespace) -> None:
             batch_decisions = await scope_agent.evaluate_stream_candidates_batch(batch, scope, batch_size=settings.scope_batch_size)
             for sc, decision in zip(batch, batch_decisions):
                 fallback_used = any(flag in {"scope_decision_parse_error", "scope_decision_failure_fallback"} for flag in (decision.risk_flags or []))
+                validation_allowed = decision.decision == "accept" or (decision.decision == "review" and getattr(args, "allow_scope_review_candidates_to_validation", True))
+                if fallback_used and validation_allowed:
+                    stream_candidates_allowed_after_fallback += 1
                 stream_counts[decision.decision] = stream_counts.get(decision.decision, 0) + 1
-                _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {"stage":"stream_candidate_scope_gate","batch_index":batch_no,"item_index":0,"candidate_url":sc.candidate_url,"source_page":sc.source_page,"lineage":sc.parent_pages,"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"error":None})
-                if decision.decision in {"accept", "review"} and not fallback_used:
+                _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {"stage":"stream_candidate_scope_gate","batch_index":batch_no,"item_index":0,"candidate_url":sc.candidate_url,"source_page":sc.source_page,"lineage":sc.parent_pages,"decision":decision.decision,"confidence":decision.confidence,"reason":decision.reason,"matched_scope_terms":decision.matched_scope_terms,"missing_evidence":decision.missing_evidence,"risk_flags":decision.risk_flags,"elapsed_seconds":0.0,"fallback_used":fallback_used,"fallback_reason":"scope_decision_failure_fallback" if fallback_used else None,"validation_allowed":validation_allowed,"error":None})
+                if validation_allowed:
                     scoped_stream_candidates.append(sc)
+                else:
+                    _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.reason, "stage": "stream_scope_gate", "fallback_used": fallback_used})
             logger.info("ScopeEnforcementAgent: stream candidate scope gate batch {}/{} done accepted={} rejected={} review={} elapsed={:.1f}s", batch_no, total_batches, stream_counts.get('accept',0), stream_counts.get('reject',0), stream_counts.get('review',0), 0.0)
-        (settings.log_dir / "stream_candidate_scope_gate_summary.json").write_text(json.dumps({"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_stream_candidates, "timeout_seconds": settings.scope_decision_timeout_seconds, "failure_mode": settings.scope_decision_failure_mode, "total_seen": len(stream_candidates), "total_evaluated": len(stream_candidates), "total_skipped_due_to_cap": 0, "accepted": stream_counts.get("accept",0), "rejected": stream_counts.get("reject",0), "review": stream_counts.get("review",0), "timeouts": 0, "parse_errors": stream_candidate_decision_parse_errors, "fallback_decisions": 0, "elapsed_seconds": (datetime.utcnow()-gate_started).total_seconds()}, indent=2), encoding="utf-8")
-    for sc in []:
-        decision = await scope_agent.evaluate_stream_candidate(sc, scope)
-        fallback_used = "scope_decision_parse_error" in (decision.risk_flags or [])
-        normalized = not fallback_used
-        if fallback_used:
-            stream_candidate_decision_parse_errors += 1
-            logger.warning("Scope gate warning: malformed stream-candidate decision for {}; rejected to prevent out-of-scope expansion.", sc.candidate_url)
-            try:
-                _append_jsonl(settings.log_dir / "stream_candidate_scope_decision_errors.jsonl", {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "stage": "stream_candidate_scope_gate",
-                    "query": sc.source_query,
-                    "scope_label": scope.scope_label,
-                    "scope_type": scope.scope_type,
-                    "candidate_url": sc.candidate_url,
-                    "source_page": sc.source_page,
-                    "lineage": sc.parent_pages,
-                    "decision_fallback": decision.decision,
-                    "error_type": "ScopeDecisionParseError",
-                    "error": decision.reason,
-                    "raw_llm_response": decision.raw_llm_response,
-                })
-            except Exception as exc:
-                logger.warning("Failed to write stream-candidate scope decision error artifact: {}", exc)
-        stream_counts[decision.decision] = stream_counts.get(decision.decision, 0) + 1
-        _append_jsonl(settings.log_dir / "stream_candidate_scope_decisions.jsonl", {
-            "run_id": run_id,
-            "candidate_url": sc.candidate_url,
-            "source_page": sc.source_page,
-            "lineage": sc.parent_pages,
-            "decision": decision.decision,
-            "confidence": decision.confidence,
-            "reason": decision.reason,
-            "risk_flags": decision.risk_flags,
-            "provider": settings.planner_provider,
-            "model": settings.planner_model,
-            "raw_llm_response": decision.raw_llm_response,
-            "normalized": normalized,
-            "fallback_used": fallback_used,
-            "fallback_reason": "scope_decision_parse_error" if fallback_used else None,
-        })
-        if decision.decision in {"accept", "review"} and not fallback_used:
-            scoped_stream_candidates.append(sc)
+        (settings.log_dir / "stream_candidate_scope_gate_summary.json").write_text(json.dumps({"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_stream_candidates, "timeout_seconds": settings.scope_decision_timeout_seconds, "failure_mode": settings.stream_scope_decision_failure_mode, "total_seen": len(stream_candidates), "total_evaluated": len(stream_candidates), "total_skipped_due_to_cap": 0, "accepted": stream_counts.get("accept",0), "rejected": stream_counts.get("reject",0), "review": stream_counts.get("review",0), "timeouts": 0, "parse_errors": stream_candidate_decision_parse_errors, "fallback_allowed_for_validation": stream_candidates_allowed_after_fallback, "elapsed_seconds": (datetime.utcnow()-gate_started).total_seconds()}, indent=2), encoding="utf-8")
     stream_candidates = scoped_stream_candidates
     logger.info("Stream candidate scope gate: accepted={} rejected={} review={}", stream_counts.get("accept",0), stream_counts.get("reject",0), stream_counts.get("review",0))
 
@@ -549,7 +614,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     for sc, decision in decisions:
         _append_jsonl(settings.log_dir / "candidate_priority.jsonl", decision.model_dump())
         if decision.sent_to_validation:
-            original = candidate_by_url.get(sc.candidate_url.strip().lower())
+            original = candidate_by_url.get(normalize_stream_url(sc.candidate_url)) or candidate_by_url.get(sc.candidate_url.strip().lower())
             base = original if original else CameraCandidate(url=sc.candidate_url, source_refs=[x for x in [f"query:{sc.source_query}" if sc.source_query else None, sc.source_page, sc.root_url] if x], source_page=sc.source_page, raw_metadata={"target_locations": sc.target_locations, "camera_types": sc.camera_types, "discovery_strategy": sc.discovery_strategy})
             hints = extractor.extract(base.url, context={"label": base.label, "source_page": base.source_page, "source_query": base.source_query or sc.source_query, "target_locations": target_locations})
             base.url_metadata_hints = hints
@@ -561,6 +626,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             if hints.get("has_location_hint"):
                 funnel["url_metadata_extraction"]["with_location_hint"] += 1
             validation_candidates.append(base)
+            _append_jsonl(settings.candidates_dir / "agentic_candidates_validation_handoff.jsonl", {"candidate_url": base.url, "normalized_stream_url": normalize_stream_url(base.url), "sent_to_validation": True, "priority": decision.priority, "priority_reason": decision.priority_reason, "source_page": base.source_page, "source_query": base.source_query})
             _append_jsonl(settings.candidates_dir / ("prioritized_candidates.jsonl" if decision.priority in {"high", "medium"} else "deprioritized_candidates.jsonl"), {**decision.model_dump(), "sent_to_validation": True})
         else:
             rejection_reasons[decision.priority_reason] = rejection_reasons.get(decision.priority_reason, 0) + 1
@@ -632,54 +698,81 @@ async def run_agentic(args: argparse.Namespace) -> None:
     for r in unknown_location:
         _append_jsonl(settings.candidates_dir / "needs_review_location_unknown.jsonl", r.model_dump())
 
+    validation_counts = _validation_status_counts(records)
+    if validation_skipped:
+        validation_counts["skipped"] = len(validation_candidates)
+    geocode_summary = {
+        "with_coordinates": len(mapped_records),
+        "without_coordinates": len(unknown_location),
+        "camera_precision": len([r for r in records if getattr(r, "geocode_precision", None) in {"camera", "intersection", "road_segment"}]),
+        "city_area_precision": len([r for r in records if getattr(r, "geocode_precision", None) in {"city_area", "city_centroid"}]),
+        "fallback_precision": len([r for r in records if getattr(r, "geocode_source", None) == "scope_fallback"]),
+    }
     run_summary = {
+        "status": "completed",
         "query": args.query,
         "targets": target_locations,
+        "agentic_candidates": {
+            "raw": agentic_handoff_summary.get("raw", 0),
+            "unique_hls": agentic_handoff_summary.get("unique_hls", 0),
+            "duplicates_removed": agentic_handoff_summary.get("duplicates_removed", 0),
+            "skipped_non_hls": agentic_handoff_summary.get("skipped_non_hls", 0),
+            "sent_to_validation": len(validation_candidates),
+        },
+        "scope_gates": {
+            "search_results_accepted": page_counts.get("accept", 0),
+            "search_results_rejected": page_counts.get("reject", 0),
+            "search_results_review": page_counts.get("review", 0),
+            "stream_candidates_accepted": stream_counts.get("accept", 0),
+            "stream_candidates_rejected": stream_counts.get("reject", 0),
+            "stream_candidates_review": stream_counts.get("review", 0),
+            "stream_candidates_allowed_for_validation_after_fallback": stream_candidates_allowed_after_fallback,
+            "search_result_decision_parse_errors": search_result_decision_parse_errors,
+            "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
+        },
         "validation": {
+            **validation_counts,
             "validation_enabled": validation_enabled,
             "validation_skipped": validation_skipped,
             "ffprobe_validation_enabled": bool(settings.use_ffprobe_validation and validation_enabled),
         },
+        "geocoding": geocode_summary,
+        "catalog": {"features_written": len(mapped_records), "deduplicated": 0, "review_only": len(unknown_location)},
         "scope": {
             "has_sufficient_scope": scope.has_sufficient_scope,
             "scope_label": scope.scope_label,
             "scope_type": scope.scope_type,
             "provider": settings.planner_provider,
             "model": settings.planner_model,
-            "search_results_accepted": page_counts.get("accept", 0),
-            "search_results_rejected": page_counts.get("reject", 0),
-            "search_results_review": page_counts.get("review", 0),
-            "search_result_decision_parse_errors": search_result_decision_parse_errors,
-            "stream_candidates_accepted": stream_counts.get("accept", 0),
-            "stream_candidates_rejected": stream_counts.get("reject", 0),
-            "stream_candidates_review": stream_counts.get("review", 0),
-            "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
         },
         "candidate_counts": {
             "raw": len(stream_candidates),
             "relevance_passed": len(validation_candidates),
-            "robots_passed": len(validation_candidates),
-            "http_live": len([r for r in records if r.status == "live"]),
-            "http_dead": len([r for r in records if r.status == "dead"]),
-            "http_unknown": len([r for r in records if r.status == "unknown"]),
-            "http_timeout": 0,
-            "http_other": max(0, len(records) - (len([r for r in records if r.status == "live"]) + len([r for r in records if r.status == "dead"]) + len([r for r in records if r.status == "unknown"]))),
-            "ffprobe_live": len([r for r in records if r.status == "live"]) if settings.use_ffprobe_validation and validation_enabled else 0,
-            "ffprobe_dead": len([r for r in records if r.status == "dead"]) if settings.use_ffprobe_validation and validation_enabled else 0,
-            "ffprobe_unknown": len([r for r in records if r.status == "unknown"]) if settings.use_ffprobe_validation and validation_enabled else 0,
-            "playlist_live": len([r for r in records if "playlist:live_playlist" in ((getattr(r, "notes", "") or ""))]),
-            "playlist_vod": len([r for r in records if "playlist:vod_playlist" in ((getattr(r, "notes", "") or ""))]),
-            "playlist_static": len([r for r in records if "playlist:static_playlist" in ((getattr(r, "notes", "") or ""))]),
-            "playlist_unknown": len([r for r in records if "playlist:unknown_playlist" in ((getattr(r, "notes", "") or "") or "playlist:playlist_fetch_failed" in ((getattr(r, "notes", "") or "")))]),
-            "mapped": len(mapped_records),
-            "unvalidated_candidates": len(validation_candidates) if validation_skipped else 0,
             "validated_records": len(records),
+            "mapped": len(mapped_records),
             "needs_review_location_unknown": len(unknown_location),
+            "unvalidated_candidates": len(validation_candidates) if validation_skipped else 0,
             "rejected": sum(rejection_reasons.values()),
         },
         "rejection_reasons": rejection_reasons,
-        "output_files": {"geojson": str(Path(args.output_dir) / "camera.geojson")},
+        "output_files": {
+            "agentic_candidates": str(settings.candidates_dir / "agentic_candidates.jsonl"),
+            "agentic_candidates_unique": str(settings.candidates_dir / "agentic_candidates_unique.jsonl"),
+            "validation_handoff": str(settings.candidates_dir / "agentic_candidates_validation_handoff.jsonl"),
+            "geojson": str(Path(args.output_dir) / "camera.geojson"),
+            "map": str(Path(args.output_dir) / "map.html"),
+        },
     }
+    logger.info(
+        "Validation: live={} dead={} restricted={} unknown={} timeout={} decode_failed={} skipped={}",
+        validation_counts.get("live", 0),
+        validation_counts.get("dead", 0),
+        validation_counts.get("restricted", 0),
+        validation_counts.get("unknown", 0),
+        validation_counts.get("timeout", 0),
+        validation_counts.get("decode_failed", 0),
+        validation_counts.get("skipped", 0),
+    )
     (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
     (settings.log_dir / "scope_summary.json").write_text(json.dumps({"scope": {
         "has_sufficient_scope": scope.has_sufficient_scope,
@@ -726,6 +819,18 @@ async def run_agentic(args: argparse.Namespace) -> None:
             _append_jsonl(settings.log_dir / "video_summaries.jsonl", summary.__dict__)
 
     await CatalogAgent().run(records=records, output_dir=args.output_dir, snapshot_dir=settings.snapshot_dir)
+    catalog_summary_path = settings.log_dir / "catalog_export_summary.json"
+    if catalog_summary_path.exists():
+        try:
+            catalog_summary = json.loads(catalog_summary_path.read_text(encoding="utf-8"))
+            run_summary["catalog"] = {
+                "features_written": catalog_summary.get("geojson_features_written", 0),
+                "deduplicated": catalog_summary.get("records_deduplicated", 0),
+                "review_only": len(unknown_location),
+            }
+            (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Could not update run_summary.json with catalog summary: {}", exc)
 
     if memory and settings.memory_write_run_summaries:
         status_counts = {"live": 0, "dead": 0, "unknown": 0}
@@ -799,6 +904,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-scope-gate-batches", type=int, default=settings.max_scope_gate_batches)
     run.add_argument("--scope-decision-failure-mode", type=str, choices=["review", "reject"], default=settings.scope_decision_failure_mode)
     run.add_argument("--scope-timeout-fallback", type=str, choices=["review", "reject"], default=settings.scope_decision_failure_mode)
+    run.add_argument("--validate-agentic-candidates", action=argparse.BooleanOptionalAction, default=True, help="Use candidates/agentic_candidates.jsonl as the validation handoff after discovery")
+    run.add_argument("--allow-scope-review-candidates-to-validation", action=argparse.BooleanOptionalAction, default=True, help="Allow stream candidates marked review by the LLM scope gate to proceed to validation")
+    run.add_argument("--stream-scope-fallback", type=str, choices=["review", "reject", "accept_for_validation"], default=settings.stream_scope_decision_failure_mode, help="Fallback for stream-candidate LLM scope failures; review/accept_for_validation still records audit risk flags")
+    run.add_argument("--max-validation-candidates", type=int, default=None, help="Optional cap on unique direct HLS candidates loaded from agentic_candidates.jsonl")
     run.add_argument("--disable-llm-search-result-scope-gate", action="store_true")
     run.add_argument("--disable-llm-stream-scope-gate", action="store_true")
     return parser

@@ -58,7 +58,14 @@ class CatalogAgent:
             ]
 
         if not records:
-            logger.warning("CatalogAgent: no records to catalog")
+            logger.warning("CatalogAgent: no records to catalog; writing empty catalog artifacts")
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            geojson_path = output_dir / "camera.geojson"
+            geojson_path.write_text(json.dumps({"type": "FeatureCollection", "features": [], "metadata": {"total": 0, "live": 0, "dead": 0, "unknown": 0, "unmapped": 0}}, indent=2), encoding="utf-8")
+            (output_dir / "cameras.md").write_text("# Public Webcam Catalog\n\nTotal cameras: 0\n", encoding="utf-8")
+            MapAgent(output_dir=output_dir).run()
+            (settings.log_dir / "catalog_export_summary.json").write_text(json.dumps({"records_received": 0, "records_deduplicated": 0, "unique_records": 0, "geojson_features_written": 0, "geojson_features_skipped": 0}, indent=2), encoding="utf-8")
             return
 
         logger.info("CatalogAgent: processing {} records", len(records))

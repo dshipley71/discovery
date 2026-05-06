@@ -192,30 +192,50 @@ class ScopeEnforcementAgent:
     def _safe_fallback_scope_decision(self, *, stage: str, reason: str, raw_llm_response: Any, error: Exception | str | None = None) -> ScopeDecision:
         if error is not None:
             logger.warning("Scope gate parse error at stage={}: {}", stage, error)
+        if stage == "stream_candidate_scope_gate":
+            mode = (settings.stream_scope_decision_failure_mode or "review").strip().lower()
+            decision = "reject" if mode == "reject" else "review"
+            risk_flags = ["scope_decision_parse_error", "scope_decision_failure_fallback"]
+            if decision == "review":
+                risk_flags.append("validation_allowed_after_scope_fallback")
+            fallback_reason = (
+                "LLM stream-candidate scope decision could not be parsed safely; "
+                f"applied fallback={mode}."
+            )
+        else:
+            decision = "reject"
+            risk_flags = ["scope_decision_parse_error"]
+            fallback_reason = reason
         fallback_payload = {
-            "decision": "reject",
+            "decision": decision,
             "confidence": 0.0,
-            "reason": reason,
+            "reason": fallback_reason,
             "matched_scope_terms": [],
             "missing_evidence": ["Scope decision parse failure."],
-            "risk_flags": ["scope_decision_parse_error"],
+            "risk_flags": risk_flags,
             "raw_llm_response": raw_llm_response,
         }
         try:
             return ScopeDecision.model_validate(fallback_payload)
         except ValidationError:
-            return ScopeDecision(decision="reject", confidence=0.0, reason=reason)
+            return ScopeDecision(decision=decision, confidence=0.0, reason=fallback_reason)
 
     def _fallback_for_failure(self, *, stage: str, raw_llm_response: Any) -> ScopeDecision:
-        mode = (settings.scope_decision_failure_mode or "reject").strip().lower()
-        decision = "review" if mode == "review" else "reject"
+        if stage == "stream_candidate_scope_gate":
+            mode = (settings.stream_scope_decision_failure_mode or "review").strip().lower()
+        else:
+            mode = (settings.scope_decision_failure_mode or "reject").strip().lower()
+        decision = "review" if mode in {"review", "accept_for_validation"} else "reject"
+        risk_flags = ["scope_decision_failure_fallback"]
+        if stage == "stream_candidate_scope_gate" and decision == "review":
+            risk_flags.append("validation_allowed_after_scope_fallback")
         return ScopeDecision(
             decision=decision,
             confidence=0.0,
-            reason=f"LLM scope decision unavailable at {stage}; applied fallback={decision}.",
+            reason=f"LLM scope decision unavailable at {stage}; applied fallback={mode}.",
             matched_scope_terms=[],
             missing_evidence=["llm_scope_decision_unavailable"],
-            risk_flags=["scope_decision_failure_fallback"],
+            risk_flags=risk_flags,
             raw_llm_response=raw_llm_response,
         )
 

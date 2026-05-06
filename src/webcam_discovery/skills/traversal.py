@@ -276,6 +276,11 @@ def unwrap_player_url(url: str) -> str:
     pre-processing step on every candidate URL it receives.
     """
     parsed = urlparse(url)
+    # Direct HLS URLs may carry required token/signature query parameters.
+    # Do not run the broad embedded-HLS regex against those URLs, because it can
+    # strip required query strings from legitimate stream URLs.
+    if _STREAM_EXTENSIONS.search(parsed.path or ""):
+        return url
     if not parsed.query:
         return url
 

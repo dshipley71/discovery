@@ -158,10 +158,7 @@ inurl:webcam OR inurl:livecam [city] filetype:html
 
 **Responsibilities:**
 - Accept validated records and insert into the master catalog
-- Deduplicate using the following priority order:
-  1. Normalize and match on canonical URL (strip tracking params, trailing slashes)
-  2. Match on lat/lon coordinates if available (within 50m radius = same camera)
-  3. Fuzzy match on label + city if no URL/geo match
+- Deduplicate using normalized direct stream URL or stable source-provided camera identity when available. Do **not** collapse cameras solely because they share approximate coordinates, city names, labels, source pages, CDN hostnames, or cloud regions.
 - Consolidate duplicate entries: keep one canonical record, log all source URLs in `source_refs[]`
 - Organize output by: `continent → country → city → camera`
 - Maintain `last_verified` timestamp and `status` field per record
@@ -318,3 +315,12 @@ Any publicly accessible feed found via search that passes validation, regardless
 - Optional `VideoSummarizationAgent` generates bounded visual and optional audio summaries from real stream samples.
 - New command: `webcam-discovery run-agentic "<natural language query>"`.
 - New logs: `planner_runs.jsonl`, `visual_stream_analysis.jsonl`, `video_summaries.jsonl`, `memory_updates.jsonl`.
+
+
+## Agentic Validation Handoff Requirements
+
+The agentic workflow uses `candidates/agentic_candidates.jsonl` as the primary durable handoff between discovery and validation once direct HLS candidates are found. Page-level scope gates are discovery boundaries: they decide whether a search result should be expanded, but `logs/search_result_scope_decisions.jsonl` is not final truth for whether an already-discovered direct stream should be validated.
+
+Stream-candidate scope gates review direct HLS candidates using the full evidence package: direct URL, source page, source query, title/snippet where available, lineage, source metadata, labels, coordinates, and the LLM-inferred user scope. HLS URL formats are source-specific; agents must not require any fixed camera-ID format, CDN path, agency prefix, or location token. When a stream-scope LLM call times out or fails, plausible direct HLS candidates default to `review`/validation-allowed behavior, with the fallback clearly written to `logs/stream_candidate_scope_decisions.jsonl`.
+
+Validation must classify each unique direct HLS candidate that is not skipped by policy, safety, or configured caps. Status vocabulary includes `live`, `dead`, `unknown`, `restricted`, `timeout`, `offline_http`, and `decode_failed`, with richer substatus values preserved where available. Geocoding must preserve source coordinates first, then candidate/page metadata, nearby labels/text, LLM candidate context, and only then clearly-labeled scope-level fallbacks. Do not invent coordinates.

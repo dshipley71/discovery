@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     scope_gate_total_timeout_seconds: float = 120.0
     max_scope_gate_batches: int = 5
     scope_decision_failure_mode: str = "reject"  # review | reject
+    stream_scope_decision_failure_mode: str = "review"  # review | reject | accept_for_validation
     disable_llm_search_result_scope_gate: bool = False
     disable_llm_stream_scope_gate: bool = False
 

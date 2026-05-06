@@ -7,7 +7,7 @@ Every camera in the catalog must be viewable by anyone, right now, with no strin
 
 ## Install
 ```bash
-pip install -e ".[dev]"          # local dev + tests
+pip install -e ".[dev]"          # local development dependencies
 pip install -e ".[notebooks]"    # Colab / SageMaker
 ```
 
@@ -33,11 +33,11 @@ wcd-catalog  --input candidates/validated.jsonl
 wcd-maintain --catalog camera.geojson
 ```
 
-## Verify generated code
+## Verify generated code for this phase
 ```bash
-pytest tests/ -q
-pytest tests/skills/test_feed_validation.py -v
-pytest tests/ -k "dedup" -v
+python -m compileall -q src
+python -m json.tool notebooks/camera_discovery.ipynb >/dev/null
+# Functional validation is performed in Colab against real public data.
 ```
 
 ## Key output files (project root — map.html and camera.geojson must stay co-located)
@@ -103,3 +103,12 @@ from pydantic import BaseModel
 - `SKILLS.md`  — all 13 skills, interfaces, async patterns
 - `SOURCES.md` — source allow/block lists (Tier 1–5 + blocked)
 - `MAPS.md`    — map spec, GeoJSON format, field requirements
+
+
+## Current agentic handoff rules
+
+- `candidates/agentic_candidates.jsonl` is the primary validation handoff after discovery.
+- Search-result scope decisions only gate page expansion; they must not be treated as final camera truth for direct HLS candidates already discovered.
+- Stream-candidate fallback should default to review/validation-allowed for plausible direct `.m3u8` streams and must be auditable in `logs/stream_candidate_scope_decisions.jsonl`.
+- Deduplicate cameras by normalized stream URL or stable source-provided camera identity, never by approximate coordinates alone.
+- Keep the app location-agnostic: infer scope from the user query and never special-case a test location or HLS URL pattern.

@@ -19,7 +19,7 @@
 2. Reject any URL that does not point to `.m3u8`.
 3. GET the first bytes of the playlist and confirm HLS markers such as `#EXTM3U`.
 4. Classify the playlist as `HLS_master` or `HLS_stream`.
-5. Reject any HTML response, login redirect, auth wall, or ambiguous public access pattern.
+5. Classify failures as `restricted`, `timeout`, `offline_http`, `decode_failed`, `dead`, or `unknown` rather than silently discarding them.
 
 ## FeedTypeClassificationSkill
 
@@ -48,3 +48,21 @@ Export only direct HLS camera records. `properties.url` is the playback URL and 
 
 Generate `map.html` for HLS playback only. Use HTML5 `<video>` + `hls.js` (or native Safari HLS)
 for modal playback and do not render alternate player types.
+
+
+## AgenticCandidateHandoffSkill
+
+**Purpose:** Preserve discovered direct HLS candidates as the authoritative discovery-to-validation handoff.
+
+**Process:**
+1. Write all discovered candidate evidence to `candidates/agentic_candidates.jsonl`.
+2. Load direct `.m3u8` candidates from that artifact dynamically; never assume a fixed count.
+3. Normalize stream URLs while preserving playback-critical query parameters.
+4. Deduplicate by normalized stream URL or stable source-provided camera identity when available.
+5. Write `candidates/agentic_candidates_unique.jsonl` and `candidates/agentic_candidates_validation_handoff.jsonl` so the operator can audit exactly what proceeded to validation and why.
+
+Page-level scope decisions are not final camera inclusion/exclusion decisions. Candidate-level scope decisions must use the full evidence package and tolerate review/fallback decisions for plausible direct HLS streams.
+
+## Geocoding and Coordinate Precision
+
+Camera coordinates must be derived from evidence, not invented. Prefer source/API coordinates, then page/listing metadata, nearby labels/text, existing source page coordinates, LLM candidate context, and finally explicitly labeled scope-level fallback coordinates. Records include `geocode_source`, `geocode_confidence`, `geocode_precision`, and `geocode_reason` when available.
