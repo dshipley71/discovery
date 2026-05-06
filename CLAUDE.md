@@ -112,3 +112,12 @@ from pydantic import BaseModel
 - Stream-candidate fallback should default to review/validation-allowed for plausible direct `.m3u8` streams and must be auditable in `logs/stream_candidate_scope_decisions.jsonl`.
 - Deduplicate cameras by normalized stream URL or stable source-provided camera identity, never by approximate coordinates alone.
 - Keep the app location-agnostic: infer scope from the user query and never special-case a test location or HLS URL pattern.
+
+## Current implementation notes — clarification and reporting
+
+- Add or preserve LLM clarification preflight before discovery. Do not implement ambiguous-place handling as a hardcoded parser; the LLM decides whether clarification is needed.
+- Clarification is a single turn only. If no answer is supplied, write `logs/query_clarification.json` and `run_summary.json` with `status=needs_clarification`, then stop before discovery.
+- `--clarification-answer` supplies the one answer for non-interactive Colab runs. `--disable-clarification` is debug-only.
+- Keep `http_hls_probe_results.jsonl` separate from final `validation_results.jsonl`.
+- Ensure `camera_status_summary.json`, `run_summary.json.validation`, and `camera.geojson` feature counts reconcile after final status classification and caps.
+- Add provider/model/raw response metadata to all LLM scope-decision artifacts.

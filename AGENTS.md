@@ -324,3 +324,19 @@ The agentic workflow uses `candidates/agentic_candidates.jsonl` as the primary d
 Stream-candidate scope gates review direct HLS candidates using the full evidence package: direct URL, source page, source query, title/snippet where available, lineage, source metadata, labels, coordinates, and the LLM-inferred user scope. HLS URL formats are source-specific; agents must not require any fixed camera-ID format, CDN path, agency prefix, or location token. When a stream-scope LLM call times out or fails, plausible direct HLS candidates default to `review`/validation-allowed behavior, with the fallback clearly written to `logs/stream_candidate_scope_decisions.jsonl`.
 
 Validation must classify each unique direct HLS candidate that is not skipped by policy, safety, or configured caps. Status vocabulary includes `live`, `dead`, `unknown`, `restricted`, `timeout`, `offline_http`, and `decode_failed`, with richer substatus values preserved where available. Geocoding must preserve source coordinates first, then candidate/page metadata, nearby labels/text, LLM candidate context, and only then clearly-labeled scope-level fallbacks. Do not invent coordinates.
+
+## One-Time Clarification Agent Rules
+
+Before any search, feed discovery, deep discovery, validation, cataloging, or map generation, the workflow must run an LLM-based clarification preflight unless explicitly disabled for debugging. This is not a heuristic location parser. It asks for clarification only when the query is ambiguous, conflicting, or lacks a specific searchable scope.
+
+Examples:
+
+- `Get me all traffic cameras from Paris` is ambiguous and should ask one concise question, such as whether the user means Paris, France, Paris, Texas, or another Paris.
+- `Get me all traffic camera` is underspecified and should ask for a place, landmark, coordinates, IP address, hostname, agency, or public website.
+- `Get me public live HLS traffic cameras from Paris, France` is sufficiently scoped and should proceed to normal LLM scope enforcement.
+
+The clarification agent may ask only one turn and must provide no more than three questions. If an answer is provided via the CLI or interactive input, the agent must construct a clarified query and continue to planner/scope enforcement. If no answer is available in a non-interactive environment, stop before discovery, write `logs/query_clarification.json`, and write `logs/run_summary.json` with `status=needs_clarification`. If the answer is still insufficient, do not ask again; continue to normal scope enforcement and let the existing insufficient-scope rules stop discovery.
+
+## Validation Reporting Consistency Rules
+
+Agents must keep validation reporting internally consistent. `http_hls_probe_results.jsonl` is the early HTTP/HLS probe artifact; it is not final camera truth. `validation_results.jsonl`, `camera_status_summary.json`, and `run_summary.json.validation` must represent final status after playlist, ffprobe, visual analysis, capping, and catalog selection. If a candidate or record is removed by a validation/catalog cap, write a durable row with the URL, stage, cap, before/after counts, and reason. Scope-decision rows must include provider, model, raw LLM response, fallback metadata, and whether validation was allowed.

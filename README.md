@@ -191,3 +191,26 @@ Writes `logs/video_summaries.jsonl` from bounded frame/audio samples.
 - `logs/visual_stream_analysis.jsonl`
 - `logs/video_summaries.jsonl`
 - `logs/memory_updates.jsonl`
+
+## One-Time Query Clarification Preflight
+
+`webcam-discovery run-agentic` now performs an LLM-based clarification preflight before discovery. The preflight is designed for ambiguous or underspecified natural-language requests, not for broad heuristic parsing. For example, `Get me all traffic cameras from Paris` should stop and ask one concise clarification question such as whether the user means Paris, France, Paris, Texas, or another Paris. A query such as `Get me all traffic camera` should stop and ask for a specific place, landmark, agency, coordinates, hostname, IP address, or public website.
+
+Clarification is asked only once. In an interactive terminal, the CLI prompts for one answer. In Colab or other non-interactive runs, the app writes `logs/query_clarification.json` and `logs/run_summary.json` with `status=needs_clarification`, then exits before search/feed discovery. To run non-interactively with the answer already supplied, pass:
+
+```bash
+webcam-discovery run-agentic "Get me all traffic cameras from Paris" \
+  --clarification-answer "Paris, France"
+```
+
+If the single clarification answer is still insufficient, the normal LLM scope enforcement rules apply and discovery stops before broad search. Use `--disable-clarification` only for developer/debug validation of the underlying scope enforcement behavior.
+
+## Validation Status Accounting
+
+Final validation artifacts are now separated from early HTTP/HLS probe artifacts:
+
+- `logs/http_hls_probe_results.jsonl` and `logs/http_hls_probe_summary.json` capture the initial HTTP/HLS probe only.
+- `logs/validation_results.jsonl` and `logs/camera_status_summary.json` capture final stream status after playlist/ffprobe/visual classification and any configured caps.
+- `logs/run_summary.json`, `logs/camera_status_summary.json`, and `camera.geojson` should reconcile: final validation counts should match run-summary validation counts, and catalog feature counts should match GeoJSON feature counts.
+
+Validation caps are applied before validation. If `--max-validation-candidates` is not set, `--max-streams` is used as the validation handoff cap for this debug path. Dropped candidates are written to `candidates/agentic_candidates_validation_dropped.jsonl` or `candidates/catalog_cap_dropped.jsonl` with explicit cap/drop reasons.

@@ -431,3 +431,18 @@ names and relative paths. With this layout, all paths resolve as follows:
 | `maintenance_log.jsonl` | `webcam-discovery/logs/maintenance_log.jsonl` |
 | `candidates.jsonl` | `webcam-discovery/candidates/candidates.jsonl` |
 | `validated.jsonl` | `webcam-discovery/candidates/validated.jsonl` |
+
+## Added clarification and validation artifacts
+
+```text
+logs/query_clarification.json                 # one-time LLM clarification preflight result
+logs/query_clarification_response.json        # supplied clarification answer and clarified query
+logs/http_hls_probe_results.jsonl             # early HTTP/HLS probe rows, not final camera truth
+logs/http_hls_probe_summary.json              # early HTTP/HLS probe counts
+logs/validation_results.jsonl                 # final validation status rows after all classification/caps
+logs/camera_status_summary.json               # final status counts matching run_summary validation counts
+candidates/agentic_candidates_validation_dropped.jsonl  # validation handoff rows dropped by cap
+candidates/catalog_cap_dropped.jsonl          # records dropped before catalog by max-streams cap
+```
+
+`agentic_candidates_unique.jsonl` contains all unique direct HLS candidates found in the handoff. `agentic_candidates_validation_handoff.jsonl` includes rows allowed to scope/validation review plus any cap-skipped rows with explicit reasons.
