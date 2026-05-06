@@ -84,6 +84,71 @@ def _validation_status_counts(records) -> dict[str, int]:
     return counts
 
 
+def _decision_counts_for_run(path: Path, run_id: str) -> tuple[dict[str, int], int]:
+    """Count scope decisions for the current run only.
+
+    Output directories are often reused in Colab.  Scope JSONL files therefore
+    must be counted by run_id, not by total rows on disk.
+    """
+    counts = {"accept": 0, "reject": 0, "review": 0}
+    parse_errors = 0
+    if not path.exists():
+        return counts, parse_errors
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if row.get("run_id") != run_id:
+            continue
+        decision = str(row.get("decision") or "").strip().lower()
+        if decision in counts:
+            counts[decision] += 1
+        if row.get("fallback_used") and row.get("fallback_reason") == "scope_decision_parse_error":
+            parse_errors += 1
+    return counts, parse_errors
+
+
+def _scope_gate_counts_for_run(run_id: str) -> tuple[dict[str, int], dict[str, int], int, int]:
+    search_counts, search_parse_errors = _decision_counts_for_run(settings.log_dir / "search_result_scope_decisions.jsonl", run_id)
+    stream_counts, stream_parse_errors = _decision_counts_for_run(settings.log_dir / "stream_candidate_scope_decisions.jsonl", run_id)
+    return search_counts, stream_counts, search_parse_errors, stream_parse_errors
+
+
+def _normalize_scope_bbox_metadata(scope) -> dict:
+    """Return bbox metadata with LLM bboxes treated as unverified audit hints.
+
+    The app is location-agnostic and must not reject candidates solely because a
+    model-generated bbox is narrow or wrong.  Only geocoder/source metadata can
+    mark a bbox as verified.
+    """
+    bbox = getattr(scope, "bbox", None)
+    source = getattr(scope, "bbox_source", None)
+    verified_sources = {"geocoder", "source_metadata", "camera_source_metadata", "page_metadata"}
+    verified = bool(getattr(scope, "bbox_verified", False) and source in verified_sources)
+    warning = getattr(scope, "bbox_warning", None)
+    if bbox and not verified:
+        source = source or "llm_unverified"
+        warning = warning or "Bounding box is an unverified audit hint and must not be used as an authoritative rejection rule."
+        try:
+            scope.bbox_source = source
+            scope.bbox_verified = False
+            scope.bbox_warning = warning
+        except Exception:
+            pass
+    return {
+        "bbox": bbox,
+        "bbox_source": source,
+        "bbox_verified": verified,
+        "bbox_confidence": getattr(scope, "bbox_confidence", None),
+        "bbox_warning": warning,
+        "bbox_usage": "audit_hint_only" if bbox and not verified else ("verified_scope_audit" if bbox else "none"),
+    }
+
+
 def _write_final_validation_artifacts(records) -> None:
     """Overwrite final validation artifacts so status counts match run_summary/catalog."""
     rows = []
@@ -346,9 +411,14 @@ async def run_agentic(args: argparse.Namespace) -> None:
         (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": "scope_inference", "query": args.query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": type(exc).__name__, "message": str(exc)}}, indent=2), encoding="utf-8")
         raise SystemExit(2) from exc
     llm_metadata = {"provider": settings.planner_provider, "model": settings.planner_model}
-    scope_payload = {**scope.model_dump(), **llm_metadata}
+    bbox_metadata = _normalize_scope_bbox_metadata(scope)
+    if bbox_metadata.get("bbox") and not bbox_metadata.get("bbox_verified"):
+        logger.warning("Scope bbox is unverified and will be used for audit/warnings only, not as a hard rejection rule.")
+        (settings.log_dir / "bbox_audit_warning.json").write_text(json.dumps({"run_id": run_id, **bbox_metadata}, ensure_ascii=False, indent=2), encoding="utf-8")
+    scope_payload = {**scope.model_dump(), **llm_metadata, "bbox_metadata": bbox_metadata}
     (settings.log_dir / "scope_inference.json").write_text(json.dumps(scope_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     (settings.log_dir / "scope_summary.json").write_text(json.dumps({
+        "run_id": run_id,
         "query": args.query,
         "plan_summary": getattr(plan, "summary", None),
         "provider": settings.planner_provider,
@@ -358,6 +428,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "scope_type": scope.scope_type,
         "confidence": scope.confidence,
         "normalized_scope_payload": scope.model_dump(),
+        "bbox_metadata": bbox_metadata,
         "raw_llm_response": scope.raw_llm_response,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     if not scope.has_sufficient_scope:
@@ -365,9 +436,10 @@ async def run_agentic(args: argparse.Namespace) -> None:
         logger.warning("Insufficient scope: {}", message)
         for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
             (settings.log_dir / rel).touch()
-        scope_summary = {"scope": {**scope.model_dump(), **llm_metadata, "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "search_result_decision_parse_errors": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0, "stream_candidate_decision_parse_errors": 0}}
+        scope_summary = {"run_id": run_id, "bbox_metadata": bbox_metadata, "scope": {**scope.model_dump(), **llm_metadata, "bbox_metadata": bbox_metadata, "search_results_accepted": 0, "search_results_rejected": 0, "search_results_review": 0, "search_result_decision_parse_errors": 0, "stream_candidates_accepted": 0, "stream_candidates_rejected": 0, "stream_candidates_review": 0, "stream_candidate_decision_parse_errors": 0}}
         (settings.log_dir / "scope_summary.json").write_text(json.dumps(scope_summary, ensure_ascii=False, indent=2), encoding="utf-8")
         run_summary = {
+            "run_id": run_id,
             "query": args.query,
             "targets": [],
             "scope": scope_summary["scope"],
@@ -474,50 +546,9 @@ async def run_agentic(args: argparse.Namespace) -> None:
     gated_pages: list[PageCandidate] = []
     page_counts = {"accept": 0, "reject": 0, "review": 0}
     search_result_decision_parse_errors = 0
-    for page in page_candidates:
-        decision = await scope_agent.evaluate_search_result(page, scope)
-        fallback_used = "scope_decision_parse_error" in (decision.risk_flags or [])
-        normalized = not fallback_used
-        if fallback_used:
-            search_result_decision_parse_errors += 1
-            logger.warning("Scope gate warning: malformed search-result decision for {}; rejected to prevent out-of-scope expansion.", page.url)
-            try:
-                _append_jsonl(settings.log_dir / "search_result_scope_decision_errors.jsonl", {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "stage": "search_result_scope_gate",
-                    "query": page.source_query,
-                    "scope_label": scope.scope_label,
-                    "scope_type": scope.scope_type,
-                    "url": page.url,
-                    "title": page.title,
-                    "snippet": page.snippet,
-                    "decision_fallback": decision.decision,
-                    "error_type": "ScopeDecisionParseError",
-                    "error": decision.reason,
-                    "raw_llm_response": decision.raw_llm_response,
-                })
-            except Exception as exc:
-                logger.warning("Failed to write search-result scope decision error artifact: {}", exc)
-        page_counts[decision.decision] = page_counts.get(decision.decision, 0) + 1
-        _append_jsonl(settings.log_dir / "search_result_scope_decisions.jsonl", {
-            "run_id": run_id,
-            "query": page.source_query,
-            "result_url": page.url,
-            "result_title": page.title,
-            "result_snippet": page.snippet,
-            "decision": decision.decision,
-            "confidence": decision.confidence,
-            "reason": decision.reason,
-            "risk_flags": decision.risk_flags,
-            "provider": settings.planner_provider,
-            "model": settings.planner_model,
-            "raw_llm_response": decision.raw_llm_response,
-            "normalized": normalized,
-            "fallback_used": fallback_used,
-            "fallback_reason": "scope_decision_parse_error" if fallback_used else None,
-        })
-        if decision.decision == "accept":
-            gated_pages.append(page)
+    # Search-result scope decisions are written exactly once by the active
+    # gate below. Keeping this pre-gate block side-effect free prevents stale
+    # or duplicate JSONL rows from contaminating current-run counts.
     if stop_file.exists():
         logger.warning("Manual stop file detected before search-result scope gate: {}", stop_file)
         (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "stopped_by_user", "query": args.query}, indent=2), encoding="utf-8")
@@ -541,7 +572,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
         total_batches = min(settings.max_scope_gate_batches, max(1, math.ceil(len(capped_pages) / settings.scope_batch_size)))
         gated_pages = []
         page_counts = {"accept": 0, "reject": 0, "review": 0}
-        search_scope_summary = {"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_search_results, "timeout_seconds": settings.scope_decision_timeout_seconds, "total_timeout_seconds": settings.scope_gate_total_timeout_seconds, "max_batches": settings.max_scope_gate_batches, "failure_mode": settings.scope_decision_failure_mode, "total_seen": len(page_candidates), "search_results_raw": len(page_candidates), "search_results_unique": len(unique_pages), "search_results_duplicates_dropped": max(0, len(page_candidates)-len(unique_pages)), "total_evaluated": 0, "total_skipped_due_to_cap": max(0, len(unique_pages) - len(capped_pages)), "accepted": 0, "rejected": 0, "review": 0, "timeouts": 0, "parse_errors": 0, "fallback_decisions": 0, "elapsed_seconds": 0.0}
+        search_scope_summary = {"run_id": run_id, "enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_search_results, "timeout_seconds": settings.scope_decision_timeout_seconds, "total_timeout_seconds": settings.scope_gate_total_timeout_seconds, "max_batches": settings.max_scope_gate_batches, "failure_mode": settings.scope_decision_failure_mode, "total_seen": len(page_candidates), "search_results_raw": len(page_candidates), "search_results_unique": len(unique_pages), "search_results_duplicates_dropped": max(0, len(page_candidates)-len(unique_pages)), "total_evaluated": 0, "total_skipped_due_to_cap": max(0, len(unique_pages) - len(capped_pages)), "accepted": 0, "rejected": 0, "review": 0, "timeouts": 0, "parse_errors": 0, "fallback_decisions": 0, "elapsed_seconds": 0.0}
         gate_started = time.monotonic()
         logger.info("SearchResultScopeGate: starting raw={} unique={} max_eval={} batch_size={} max_batches={} total_timeout={}s", len(page_candidates), len(unique_pages), len(capped_pages), settings.scope_batch_size, settings.max_scope_gate_batches, settings.scope_gate_total_timeout_seconds)
         for idx in range(0, min(len(capped_pages), settings.max_scope_gate_batches * settings.scope_batch_size), settings.scope_batch_size):
@@ -693,7 +724,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
                 else:
                     _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.reason, "stage": "stream_scope_gate", "fallback_used": fallback_used})
             logger.info("ScopeEnforcementAgent: stream candidate scope gate batch {}/{} done accepted={} rejected={} review={} elapsed={:.1f}s", batch_no, total_batches, stream_counts.get('accept',0), stream_counts.get('reject',0), stream_counts.get('review',0), 0.0)
-        (settings.log_dir / "stream_candidate_scope_gate_summary.json").write_text(json.dumps({"enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_stream_candidates, "timeout_seconds": settings.scope_decision_timeout_seconds, "failure_mode": settings.stream_scope_decision_failure_mode, "total_seen": len(stream_candidates), "total_evaluated": len(stream_candidates), "total_skipped_due_to_cap": 0, "accepted": stream_counts.get("accept",0), "rejected": stream_counts.get("reject",0), "review": stream_counts.get("review",0), "timeouts": 0, "parse_errors": stream_candidate_decision_parse_errors, "fallback_allowed_for_validation": stream_candidates_allowed_after_fallback, "elapsed_seconds": (datetime.utcnow()-gate_started).total_seconds()}, indent=2), encoding="utf-8")
+        (settings.log_dir / "stream_candidate_scope_gate_summary.json").write_text(json.dumps({"run_id": run_id, "enabled": True, "batch_size": settings.scope_batch_size, "max_items": settings.max_scope_stream_candidates, "timeout_seconds": settings.scope_decision_timeout_seconds, "failure_mode": settings.stream_scope_decision_failure_mode, "total_seen": len(stream_candidates), "total_evaluated": len(stream_candidates), "total_skipped_due_to_cap": 0, "accepted": stream_counts.get("accept",0), "rejected": stream_counts.get("reject",0), "review": stream_counts.get("review",0), "timeouts": 0, "parse_errors": stream_candidate_decision_parse_errors, "fallback_allowed_for_validation": stream_candidates_allowed_after_fallback, "elapsed_seconds": (datetime.utcnow()-gate_started).total_seconds()}, indent=2), encoding="utf-8")
     stream_candidates = scoped_stream_candidates
     logger.info("Stream candidate scope gate: accepted={} rejected={} review={}", stream_counts.get("accept",0), stream_counts.get("reject",0), stream_counts.get("review",0))
 
@@ -706,6 +737,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
     dedup = {s.candidate_url: s for s in stream_candidates}
     decisions = CandidatePriorityScorer().score(list(dedup.values()), target_locations, location_search_plan.agencies, camera_types)
     validation_candidates = []
+    validation_handoff_rows = []
     extractor = URLMetadataExtractor()
     for sc, decision in decisions:
         _append_jsonl(settings.log_dir / "candidate_priority.jsonl", decision.model_dump())
@@ -722,12 +754,29 @@ async def run_agentic(args: argparse.Namespace) -> None:
             if hints.get("has_location_hint"):
                 funnel["url_metadata_extraction"]["with_location_hint"] += 1
             validation_candidates.append(base)
-            _append_jsonl(settings.candidates_dir / "agentic_candidates_validation_handoff.jsonl", {"candidate_url": base.url, "normalized_stream_url": normalize_stream_url(base.url), "sent_to_validation": True, "priority": decision.priority, "priority_reason": decision.priority_reason, "source_page": base.source_page, "source_query": base.source_query})
+            validation_handoff_rows.append({
+                "run_id": run_id,
+                "candidate_url": base.url,
+                "normalized_stream_url": normalize_stream_url(base.url),
+                "sent_to_validation": True,
+                "priority": decision.priority,
+                "priority_reason": decision.priority_reason,
+                "source_page": base.source_page,
+                "source_query": base.source_query,
+                "target_locations": list(base.target_locations or []),
+            })
             _append_jsonl(settings.candidates_dir / ("prioritized_candidates.jsonl" if decision.priority in {"high", "medium"} else "deprioritized_candidates.jsonl"), {**decision.model_dump(), "sent_to_validation": True})
         else:
             rejection_reasons[decision.priority_reason] = rejection_reasons.get(decision.priority_reason, 0) + 1
             _append_jsonl(settings.candidates_dir / "rejected_candidates.jsonl", {"candidate_url": sc.candidate_url, "reason": decision.priority_reason, "stage": "malformed_url" if decision.priority_reason == "malformed_url" else "policy"})
         funnel["candidate_priority"][decision.priority] = funnel["candidate_priority"].get(decision.priority, 0) + 1
+
+    # Overwrite the handoff after candidate priority so this artifact contains
+    # exactly the candidates that are actually sent to ValidationAgent.
+    (settings.candidates_dir / "agentic_candidates_validation_handoff.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in validation_handoff_rows),
+        encoding="utf-8",
+    )
 
     funnel["candidate_generation"]["stream_candidates_sent_to_validation"] = len(validation_candidates)
     funnel["validation"]["received"] = len(validation_candidates)
@@ -823,7 +872,15 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "city_area_precision": len([r for r in records if getattr(r, "geocode_precision", None) in {"city_area", "city_centroid"}]),
         "fallback_precision": len([r for r in records if getattr(r, "geocode_source", None) == "scope_fallback"]),
     }
+    artifact_page_counts, artifact_stream_counts, artifact_search_errors, artifact_stream_errors = _scope_gate_counts_for_run(run_id)
+    # Use current-run artifact counts for summaries so reused Colab output dirs
+    # or duplicate JSONL writes cannot contaminate the visible run summary.
+    page_counts_for_summary = artifact_page_counts if sum(artifact_page_counts.values()) else page_counts
+    stream_counts_for_summary = artifact_stream_counts if sum(artifact_stream_counts.values()) else stream_counts
+    search_errors_for_summary = artifact_search_errors if artifact_search_errors else search_result_decision_parse_errors
+    stream_errors_for_summary = artifact_stream_errors if artifact_stream_errors else stream_candidate_decision_parse_errors
     run_summary = {
+        "run_id": run_id,
         "status": "completed",
         "query": args.query,
         "targets": target_locations,
@@ -835,15 +892,15 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "sent_to_validation": len(validation_candidates),
         },
         "scope_gates": {
-            "search_results_accepted": page_counts.get("accept", 0),
-            "search_results_rejected": page_counts.get("reject", 0),
-            "search_results_review": page_counts.get("review", 0),
-            "stream_candidates_accepted": stream_counts.get("accept", 0),
-            "stream_candidates_rejected": stream_counts.get("reject", 0),
-            "stream_candidates_review": stream_counts.get("review", 0),
+            "search_results_accepted": page_counts_for_summary.get("accept", 0),
+            "search_results_rejected": page_counts_for_summary.get("reject", 0),
+            "search_results_review": page_counts_for_summary.get("review", 0),
+            "stream_candidates_accepted": stream_counts_for_summary.get("accept", 0),
+            "stream_candidates_rejected": stream_counts_for_summary.get("reject", 0),
+            "stream_candidates_review": stream_counts_for_summary.get("review", 0),
             "stream_candidates_allowed_for_validation_after_fallback": stream_candidates_allowed_after_fallback,
-            "search_result_decision_parse_errors": search_result_decision_parse_errors,
-            "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
+            "search_result_decision_parse_errors": search_errors_for_summary,
+            "stream_candidate_decision_parse_errors": stream_errors_for_summary,
         },
         "validation": {
             **validation_counts,
@@ -859,6 +916,7 @@ async def run_agentic(args: argparse.Namespace) -> None:
             "scope_type": scope.scope_type,
             "provider": settings.planner_provider,
             "model": settings.planner_model,
+            "bbox_metadata": bbox_metadata,
         },
         "candidate_counts": {
             "raw": len(stream_candidates),
@@ -889,20 +947,21 @@ async def run_agentic(args: argparse.Namespace) -> None:
         validation_counts.get("skipped", 0),
     )
     (settings.log_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
-    (settings.log_dir / "scope_summary.json").write_text(json.dumps({"scope": {
+    (settings.log_dir / "scope_summary.json").write_text(json.dumps({"run_id": run_id, "scope": {
         "has_sufficient_scope": scope.has_sufficient_scope,
         "scope_label": scope.scope_label,
         "scope_type": scope.scope_type,
         "provider": settings.planner_provider,
         "model": settings.planner_model,
-        "search_results_accepted": page_counts.get("accept", 0),
-        "search_results_rejected": page_counts.get("reject", 0),
-        "search_results_review": page_counts.get("review", 0),
-        "search_result_decision_parse_errors": search_result_decision_parse_errors,
-        "stream_candidates_accepted": stream_counts.get("accept", 0),
-        "stream_candidates_rejected": stream_counts.get("reject", 0),
-        "stream_candidates_review": stream_counts.get("review", 0),
-        "stream_candidate_decision_parse_errors": stream_candidate_decision_parse_errors,
+        "bbox_metadata": bbox_metadata,
+        "search_results_accepted": page_counts_for_summary.get("accept", 0),
+        "search_results_rejected": page_counts_for_summary.get("reject", 0),
+        "search_results_review": page_counts_for_summary.get("review", 0),
+        "search_result_decision_parse_errors": search_errors_for_summary,
+        "stream_candidates_accepted": stream_counts_for_summary.get("accept", 0),
+        "stream_candidates_rejected": stream_counts_for_summary.get("reject", 0),
+        "stream_candidates_review": stream_counts_for_summary.get("review", 0),
+        "stream_candidate_decision_parse_errors": stream_errors_for_summary,
     }}, indent=2), encoding="utf-8")
     funnel["rejections"]["total"] = sum(rejection_reasons.values())
     funnel["rejections"]["by_reason"] = rejection_reasons

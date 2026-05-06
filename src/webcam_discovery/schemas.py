@@ -68,6 +68,14 @@ class ScopeEnforcementResult(BaseModel):
     excluded_sources: list[str] = Field(default_factory=list)
     agency_or_owners: list[str] = Field(default_factory=list)
     coordinates: list[dict[str, float]] = Field(default_factory=list)
+    # Optional bbox metadata is an audit hint only unless verified by a
+    # geocoder/source metadata. LLM-created bboxes must not be used as
+    # authoritative rejection criteria.
+    bbox: dict[str, Any] | None = None
+    bbox_source: str | None = None
+    bbox_verified: bool = False
+    bbox_confidence: float | None = None
+    bbox_warning: str | None = None
     hostnames: list[str] = Field(default_factory=list)
     ip_addresses: list[str] = Field(default_factory=list)
     camera_types: list[str] = Field(default_factory=list)

@@ -270,7 +270,11 @@ def load_agentic_candidate_handoff(
         })
     if handoff_output_path:
         handoff_output_path.parent.mkdir(parents=True, exist_ok=True)
-        handoff_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in [*handoff_rows, *dropped_rows]), encoding="utf-8")
+        # This artifact is the actual validation handoff: one row per unique
+        # direct HLS candidate that will proceed to stream-scope review /
+        # validation.  Duplicates and cap drops are written to separate audit
+        # artifacts so the handoff row count matches sent_to_validation.
+        handoff_output_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in handoff_rows), encoding="utf-8")
         if dropped_rows:
             drop_path = handoff_output_path.parent / "agentic_candidates_validation_dropped.jsonl"
             drop_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in dropped_rows), encoding="utf-8")
