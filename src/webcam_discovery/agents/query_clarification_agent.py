@@ -90,6 +90,44 @@ class QueryClarificationAgent:
             values = values[:limit]
         return values
 
+    @staticmethod
+    def _query_has_explicit_disambiguation(query: str, candidates: list[str]) -> bool:
+        """Return True when the original query names a full candidate or disambiguating qualifier.
+
+        This is a safety check around the LLM result, not a location parser. It uses
+        only candidate interpretations already provided by the LLM. For example, if
+        the LLM says the candidates are Paris, France and Paris, Texas, then a query
+        containing "Paris, France", "France", "Paris, Texas", or "Texas" is
+        considered explicitly disambiguated. A bare "Paris" is not.
+        """
+        q = f" {query.casefold()} "
+        for candidate in candidates:
+            cand = str(candidate or "").strip()
+            if not cand:
+                continue
+            cand_cf = cand.casefold()
+            if cand_cf in q:
+                return True
+            # Use only qualifiers after separators from LLM-provided candidate names,
+            # e.g. France/Texas/Ontario in "Paris, France".
+            parts = [part.strip().casefold() for part in cand.replace("/", ",").split(",") if part.strip()]
+            for qualifier in parts[1:]:
+                if len(qualifier) >= 3 and f" {qualifier} " in q:
+                    return True
+        return False
+
+    @staticmethod
+    def _looks_like_same_name_ambiguity(candidates: list[str]) -> bool:
+        named = [str(c or "").strip() for c in candidates if str(c or "").strip()]
+        if len(named) < 2:
+            return False
+        bases = []
+        for cand in named:
+            base = cand.split(",", 1)[0].strip().casefold()
+            if base:
+                bases.append(base)
+        return len(set(bases)) == 1 and len(bases) >= 2
+
     @classmethod
     def _normalize(cls, payload: dict[str, Any], *, original_query: str) -> dict[str, Any]:
         normalized = dict(payload or {})
@@ -101,10 +139,33 @@ class QueryClarificationAgent:
         adjusted_query = normalized.get("adjusted_query")
         if adjusted_query is not None:
             adjusted_query = str(adjusted_query).strip() or None
+
+        candidate_interpretations = cls._as_str_list(normalized.get("candidate_interpretations"))
+        # Some LLMs may return ambiguity evidence under alternate keys. Preserve and
+        # enforce it instead of letting a high-confidence guessed bbox/location proceed.
+        for key in ("ambiguous_same_name_terms", "ambiguous_candidates", "same_name_candidates"):
+            for value in cls._as_str_list(normalized.get(key)):
+                if value not in candidate_interpretations:
+                    candidate_interpretations.append(value)
+
+        same_name_ambiguity = cls._looks_like_same_name_ambiguity(candidate_interpretations)
+        has_disambiguation = cls._query_has_explicit_disambiguation(original_query, candidate_interpretations)
+        if same_name_ambiguity and not has_disambiguation:
+            needs = True
+            clarification_type = "ambiguous_place"
+            adjusted_query = None
+            if not normalized.get("reason"):
+                normalized["reason"] = "The query names a place that has multiple plausible same-name interpretations and does not include a country, state, province, landmark, coordinates, or other disambiguating context."
+            if not questions:
+                options = ", ".join(candidate_interpretations[:3])
+                questions = [f"Which place do you mean — {options}, or another same-name place? Rerun the command with the clarified location."]
+
         if needs and not questions:
-            questions = ["What specific place, location, landmark, agency, or public website should I use for this camera search?"]
+            questions = ["What specific place, location, landmark, agency, coordinates, IP address, hostname, or public website should I use for this camera search? Rerun the command with the clarified query."]
         if not needs and not adjusted_query:
             adjusted_query = original_query
+        if needs:
+            adjusted_query = None
         try:
             confidence = float(normalized.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -114,8 +175,8 @@ class QueryClarificationAgent:
             "needs_clarification": needs,
             "clarification_type": clarification_type,
             "reason": str(normalized.get("reason") or "").strip(),
-            "questions": questions,
-            "candidate_interpretations": cls._as_str_list(normalized.get("candidate_interpretations")),
+            "questions": questions[:3],
+            "candidate_interpretations": candidate_interpretations,
             "adjusted_query": adjusted_query,
             "confidence": confidence,
         }

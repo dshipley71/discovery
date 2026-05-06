@@ -9,7 +9,6 @@ from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from pathlib import Path
 import math
-import sys
 
 from loguru import logger
 
@@ -184,7 +183,6 @@ async def run_agentic(args: argparse.Namespace) -> None:
         "geocoding_results.jsonl",
         "camera_status_summary.json",
         "query_clarification.json",
-        "query_clarification_response.json",
         "run_summary.json",
     ]:
         try:
@@ -254,8 +252,8 @@ async def run_agentic(args: argparse.Namespace) -> None:
 
     # One-time LLM clarification preflight. This runs before scope enforcement and
     # before any discovery so ambiguous places (for example "Paris") or missing
-    # scope can be resolved without broad searches. If the user does not provide
-    # an answer, normal scope enforcement remains responsible for stopping the run.
+    # scope stop without broad searches. The CLI does not accept a separate
+    # clarification-answer flag; users rerun with a clearer natural-language query.
     clarification_result = None
     if not getattr(args, "disable_clarification", False):
         try:
@@ -284,65 +282,26 @@ async def run_agentic(args: argparse.Namespace) -> None:
         )
         if clarification_result.needs_clarification:
             questions = clarification_result.questions[:3]
-            answer = (getattr(args, "clarification_answer", None) or "").strip()
-            if not answer and sys.stdin is not None and sys.stdin.isatty():
-                logger.warning("Query clarification required before discovery: {}", clarification_result.reason)
-                for idx, question in enumerate(questions, start=1):
-                    print(f"Clarification {idx}: {question}")
-                answer = input("Answer once, or leave blank to stop before discovery: ").strip()
-            if answer:
-                original_query = args.query
-                clarified_query = f"{original_query} Clarification answer: {answer}"
-                args.query = clarified_query
-                logger.info("Using clarified query: {}", args.query)
-                (settings.log_dir / "query_clarification_response.json").write_text(
-                    json.dumps({
-                        "run_id": run_id,
-                        "original_query": original_query,
-                        "questions": questions,
-                        "answer": answer,
-                        "clarified_query": clarified_query,
-                        "provider": settings.planner_provider,
-                        "model": settings.planner_model,
-                    }, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                try:
-                    plan = await planner.plan(args.query, context=PlannerContext(memory_hints=memory_hints))
-                    _append_jsonl(settings.log_dir / "planner_runs.jsonl", {
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "run_id": run_id,
-                        "query": args.query,
-                        "original_query": original_query,
-                        "clarified": True,
-                        "plan": plan.model_dump(),
-                        "memory_hints": memory_hints,
-                    })
-                except LLMRequestError as exc:
-                    logger.error("Planner failed after clarification before discovery started.")
-                    payload = {"status": "failed_before_discovery", "failed_stage": exc.stage, "provider": exc.provider, "model": exc.model, "attempts": exc.attempts, "error_type": exc.error_type, "message": exc.message, "query": args.query, "original_query": original_query}
-                    (settings.log_dir / "planner_error.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                    (settings.log_dir / "run_summary.json").write_text(json.dumps({"status": "failed_before_discovery", "failed_stage": exc.stage, "query": args.query, "original_query": original_query, "discovery_started": False, "search_started": False, "feed_discovery_started": False, "deep_discovery_started": False, "validation_started": False, "catalog_started": False, "mapped": 0, "error": {"type": exc.error_type, "message": exc.message}}, indent=2), encoding="utf-8")
-                    raise SystemExit(2) from exc
-            else:
-                logger.warning("Clarification required; no clarification answer provided. Discovery will not run.")
-                for question in questions:
-                    logger.warning("Clarification question: {}", question)
-                for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
-                    (settings.log_dir / rel).touch()
-                summary = _empty_run_summary(args.query, status="needs_clarification", reason=clarification_result.reason)
-                summary["clarification"] = {
-                    "needed": True,
-                    "clarification_type": clarification_result.clarification_type,
-                    "questions": questions,
-                    "candidate_interpretations": clarification_result.candidate_interpretations,
-                    "provider": settings.planner_provider,
-                    "model": settings.planner_model,
-                    "asked_once": True,
-                    "discovery_started": False,
-                }
-                (settings.log_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                return
+            logger.warning("Clarification required before discovery: {}", clarification_result.reason)
+            for question in questions:
+                logger.warning("Clarification question: {}", question)
+            logger.warning("Discovery will not run. Rerun with a clearer query that includes the clarified place/location/source.")
+            for rel in ["search_result_scope_decisions.jsonl", "stream_candidate_scope_decisions.jsonl", "search_result_scope_decision_errors.jsonl", "stream_candidate_scope_decision_errors.jsonl"]:
+                (settings.log_dir / rel).touch()
+            summary = _empty_run_summary(args.query, status="needs_clarification", reason=clarification_result.reason)
+            summary["clarification"] = {
+                "needed": True,
+                "clarification_type": clarification_result.clarification_type,
+                "questions": questions,
+                "candidate_interpretations": clarification_result.candidate_interpretations,
+                "provider": settings.planner_provider,
+                "model": settings.planner_model,
+                "asked_once": True,
+                "discovery_started": False,
+                "rerun_required": True,
+            }
+            (settings.log_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            return
 
     scope_agent = ScopeEnforcementAgent()
     try:
@@ -1052,7 +1011,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--enable-video-summary", action="store_true")
     run.add_argument("--llm-provider", type=str, choices=["ollama", "openai-compatible"])
     run.add_argument("--llm-model", type=str)
-    run.add_argument("--clarification-answer", type=str, default=None, help="One-time answer to an LLM clarification question for ambiguous or underspecified queries")
     run.add_argument("--disable-clarification", action="store_true", help="Developer/debug: skip one-time LLM clarification preflight and rely on scope enforcement only")
     run.add_argument("--scope-batch-size", type=int, default=settings.scope_batch_size)
     run.add_argument("--max-scope-search-results", type=int, default=settings.max_scope_search_results)
